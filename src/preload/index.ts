@@ -16,7 +16,8 @@ const api: GroveApi = {
   compactSession: (id: string) => ipcRenderer.invoke('grove:compact', { id }),
   setLoop: (id: string, enabled: boolean) => ipcRenderer.invoke('grove:setLoop', { id, enabled }),
   listAccounts: () => ipcRenderer.invoke('grove:listAccounts'),
-  addAccount: (label: string, token: string) => ipcRenderer.invoke('grove:addAccount', { label, token }),
+  addAccount: (label: string, token: string, plan?: number) =>
+    ipcRenderer.invoke('grove:addAccount', { label, token, plan }),
   deleteAccount: (id: string) => ipcRenderer.invoke('grove:deleteAccount', { id }),
   setSessionAccount: (id: string, accountId: string | null) =>
     ipcRenderer.invoke('grove:setSessionAccount', { id, accountId }),

@@ -94,7 +94,8 @@ export class Board {
       `ALTER TABLE board ADD COLUMN percent INTEGER`,
       `ALTER TABLE sessions ADD COLUMN order_index INTEGER`,
       `ALTER TABLE chat_messages ADD COLUMN detail TEXT`,
-      `ALTER TABLE sessions ADD COLUMN account_id TEXT`
+      `ALTER TABLE sessions ADD COLUMN account_id TEXT`,
+      `ALTER TABLE accounts ADD COLUMN plan INTEGER`
     ]) {
       try {
         this.db.run(sql)
@@ -206,17 +207,27 @@ export class Board {
 
   // ---- accounts (token TIDAK diekspos ke UI) & settings --------------------
 
-  addAccount(id: string, label: string, token: string, ts: number): void {
-    this.run(`INSERT INTO accounts (id, label, token, created_at) VALUES (?,?,?,?)`, [id, label, token, ts])
+  addAccount(id: string, label: string, token: string, ts: number, plan?: number): void {
+    this.run(`INSERT INTO accounts (id, label, token, created_at, plan) VALUES (?,?,?,?,?)`, [
+      id, label, token, ts, plan ?? null
+    ])
   }
+
+  /** Ubah ukuran paket sebuah akun (mis. 20 untuk Max 20x). */
+  setAccountPlan(id: string, plan: number | null): void {
+    this.run(`UPDATE accounts SET plan=? WHERE id=?`, [plan, id])
+  }
+
   deleteAccount(id: string): void {
     this.run(`DELETE FROM accounts WHERE id=?`, [id])
   }
-  /** Daftar akun TANPA token (aman dikirim ke renderer). */
+
+  /** Daftar akun TANPA token (aman dikirim ke renderer), termasuk ukuran paket. */
   getAccounts(): Account[] {
-    return this.all(`SELECT id, label, created_at FROM accounts ORDER BY created_at ASC`).map((r) => ({
+    return this.all(`SELECT id, label, created_at, plan FROM accounts ORDER BY created_at ASC`).map((r) => ({
       id: String(r.id),
       label: String(r.label),
+      plan: r.plan == null ? undefined : Number(r.plan),
       createdAt: Number(r.created_at)
     }))
   }

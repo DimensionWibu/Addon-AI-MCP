@@ -17,7 +17,7 @@ import type {
 } from '../../shared/types'
 import { Board } from './db'
 import { Session } from './Session'
-import type { GroveHost } from './mcpTools'
+import { cap, CAP_MESSAGE, CAP_PROGRESS, type GroveHost } from './mcpTools'
 import { contextPercent, contextWindowFor } from './contextWindows'
 
 const MAX_WORKERS_PER_TREE = 12
@@ -28,6 +28,7 @@ const ROOT_STATUS_DEBOUNCE_MS = 60_000
 const LOOP_INTERVAL_MS = 10 * 60_000 // auto-check "udah sampe mana?" tiap 10 menit (bisa diubah)
 const IDLE_CHECK_LIMIT = 3 // auto-check beruntun tanpa perubahan → stop loop (cegah bakar usage)
 const LIMIT_COOLDOWN_MS = 30 * 60_000 // akun yang kena limit dianggap "tak tersedia" selama ini
+export const USAGE_SWITCH_PCT = 90 // ambang: pindah akun SEBELUM kena limit (bukan setelah)
 const DEFAULT_ACCT_KEY = '__default__' // penanda sesi yang memakai login CLI (bukan akun tersimpan)
 
 // Prompt auto-ping dibangun DINAMIS (lihat rootStatusPrompt/loopCheckPrompt) dengan ringkasan
@@ -159,12 +160,13 @@ export class SessionManager implements GroveHost {
     return { accounts: this.db.getAccounts(), autoSwitch: this.autoSwitch, autoResume: this.autoResume }
   }
 
-  addAccount(label: string, token: string): Account {
+  addAccount(label: string, token: string, plan?: number): Account {
     const id = randomUUID()
     const now = Date.now()
-    this.db.addAccount(id, label.trim() || 'Akun', token.trim(), now)
+    const clean = label.trim() || 'Akun'
+    this.db.addAccount(id, clean, token.trim(), now, plan)
     this.emitAccounts()
-    return { id, label: label.trim() || 'Akun', createdAt: now }
+    return { id, label: clean, plan, createdAt: now }
   }
 
   deleteAccount(id: string): void {
@@ -235,6 +237,60 @@ export class SessionManager implements GroveHost {
     return this.db.getAccounts().find((a) => a.id !== currentKey && !this.isAccountLimited(a.id))
   }
 
+  /**
+   * Cadangan saat SEMUA akun sudah menembus ambang: pilih yang paketnya TERBESAR (mis. Max 20x
+   * sebelum Max 5x) supaya kerja tetap jalan, bukan terkunci menunggu semua turun di bawah ambang.
+   * Akun tanpa info paket dianggap 1.
+   */
+  pickLargestPlanAccount(currentKey: string): Account | undefined {
+    return this.db
+      .getAccounts()
+      .filter((a) => a.id !== currentKey)
+      .sort((x, y) => (y.plan ?? 1) - (x.plan ?? 1))[0]
+  }
+
+  /** Akun tujuan pindah: yang belum limit; kalau semua limit → yang paketnya terbesar. */
+  private pickSwitchTarget(currentKey: string): { acct: Account; fallback: boolean } | undefined {
+    const free = this.pickAvailableAccount(currentKey)
+    if (free) return { acct: free, fallback: false }
+    const big = this.pickLargestPlanAccount(currentKey)
+    return big ? { acct: big, fallback: true } : undefined
+  }
+
+  /**
+   * Kuota sebuah akun menembus ambang (mis. 90%) → PINDAHKAN sesi-sesinya SEBELUM kena limit,
+   * bukan menunggu error. Sesi yang sedang jalan langsung didorong melanjutkan di akun baru.
+   * Catatan: hanya bisa dipicu untuk akun yang endpoint usage-nya terbaca (login default);
+   * token `setup-token` membalas 403 sehingga persentasenya tak bisa dipantau siapa pun.
+   * Mengembalikan jumlah sesi yang dipindah.
+   */
+  onUsageHigh(accountId: string | null, pct: number): number {
+    if (!this.autoSwitch) return 0
+    const key = accountId ?? DEFAULT_ACCT_KEY
+    if (this.isAccountLimited(key)) return 0 // sudah ditandai → jangan pindah berulang
+    const target = this.pickSwitchTarget(key)
+    if (!target) return 0
+    const next = target.acct
+    const targets = [...this.sessions.values()].filter((s) => (s.meta.accountId ?? null) === accountId)
+    if (!targets.length) return 0
+    this.markAccountLimited(key) // anggap tak tersedia selama cooldown
+    for (const s of targets) {
+      const wasRunning = s.meta.status === 'running'
+      this.setSessionAccount(s.meta.id, next.id)
+      s.systemNote(
+        target.fallback
+          ? `🔀 Semua akun ≥${USAGE_SWITCH_PCT}% → pindah ke paket TERBESAR "${next.label}"${next.plan ? ` (Max ${next.plan}x)` : ''} agar kerja tetap jalan.`
+          : `🔀 Kuota akun ${Math.round(pct)}% (ambang ${USAGE_SWITCH_PCT}%) → pindah ke "${next.label}".`
+      )
+      if (wasRunning) {
+        s.injectAutoTask(
+          `[GROVE] Akun dipindah ke "${next.label}" karena kuota hampir habis. Lanjutkan pekerjaan sebelumnya dari titik terakhir, jangan mengulang dari awal.`
+        )
+      }
+    }
+    return targets.length
+  }
+
   onLimitHit(sessionId: string): void {
     const s = this.sessions.get(sessionId)
     if (!s) return
@@ -263,7 +319,7 @@ export class SessionManager implements GroveHost {
     // langsung ke akun yang benar-benar bisa dipakai, bukan rotasi buta.
     const curKey = s.meta.accountId ?? DEFAULT_ACCT_KEY
     this.markAccountLimited(curKey)
-    const next = this.pickAvailableAccount(curKey)
+    const next = this.pickSwitchTarget(curKey)?.acct
     if (!next) {
       s.systemNote(`🚫 Semua akun sedang kena limit. Coba lagi setelah limitnya reset.`)
       s.markLimited()
@@ -556,14 +612,54 @@ export class SessionManager implements GroveHost {
     if (!parent || parent.meta.treeId !== from.meta.treeId) return
     const pct = opts.percent == null ? '' : `${Math.max(0, Math.min(100, Math.round(opts.percent)))}% · `
     this.sendMessage(fromId, parentId, `[progress] ${pct}${opts.status}`)
+    // Worker sudah melapor TUNTAS sendiri → tandai, agar auto-report di akhir turn tidak dobel.
+    if (opts.percent != null && opts.percent >= 100) from.markFinalReported()
     this.scheduleRootStatus(from.meta.treeId) // treeId = id root pohon INI → hanya membangunkan root sendiri
   }
 
-  /** Safety-net: begitu satu turn worker selesai, bangunkan root untuk merangkum ke user. */
-  notifyTurnEnd(sessionId: string): void {
+  /**
+   * Safety-net: begitu satu turn worker selesai, bangunkan root untuk merangkum ke user.
+   * `outcome` hanya diisi Session bila turn berakhir WAJAR dan worker belum melapor final →
+   * runtime yang melapor, jadi hasil kerja tak pernah lagi nyangkut di transcript worker.
+   */
+  notifyTurnEnd(sessionId: string, outcome?: { finalText: string }): void {
     const s = this.sessions.get(sessionId)
     if (!s || s.meta.role !== 'sub') return // hanya sub-worker; root menyelesaikan turn ≠ pemicu
+    if (outcome) this.autoReportFinal(s, outcome.finalText)
     this.scheduleRootStatus(s.meta.treeId)
+  }
+
+  /**
+   * Laporan otomatis "worker menutup turn" ke parent — pengganti report_to_parent yang lupa dipanggil.
+   * Sengaja TIDAK memalsukan percent 100: yang kita tahu pasti hanyalah turn-nya berakhir, bukan
+   * bahwa tugasnya tuntas. Board tetap memakai percent lama; status 'idle' + teks hasil inilah yang
+   * dibaca root (prompt auto-check-nya sudah menangani "idle tapi belum selesai" → dorong lanjut).
+   * Tidak membangunkan parent secara langsung: hanya scheduleRootStatus (dipanggil pemanggilnya)
+   * yang membangunkan ROOT, sehingga tidak ada kaskade bangun-membangunkan antar sub-worker.
+   */
+  private autoReportFinal(from: Session, finalText: string): void {
+    const parentId = from.meta.parentId
+    if (!parentId) return // tanpa parent (root) → no-op, cegah wake diri sendiri
+    // ISOLASI: sama seperti reportToParent — laporan tak boleh nyasar ke pohon lain.
+    const parent = this.sessions.get(parentId)
+    if (!parent || parent.meta.treeId !== from.meta.treeId) return
+    const text = finalText.replace(/\s+/g, ' ').trim()
+    // HORMATI CAP: board pakai batas progress (200), pesan pakai batas message (1200) —
+    // sama dengan yang ditegakkan mcpTools untuk teks buatan agent, agar konteks root tak banjir.
+    this.db.setProgress(
+      from.meta.id,
+      cap(text || '(menutup turn tanpa teks jawaban)', CAP_PROGRESS),
+      Date.now()
+    ) // percent sengaja dibiarkan apa adanya (undefined = kolom percent tak diubah)
+    this.emitBoard(from.meta.id)
+    this.sendMessage(
+      from.meta.id,
+      parentId,
+      cap(
+        `[auto] Worker "${from.meta.title}" menutup turn-nya tanpa memanggil report_to_parent, jadi Grove yang melaporkan. Jawaban terakhirnya:\n${text || '(tidak ada teks jawaban)'}`,
+        CAP_MESSAGE
+      )
+    )
   }
 
   /** Ringkasan board 1-baris/sesi untuk pohon ini — disuntik ke ping (ganti read_board = hemat konteks). */

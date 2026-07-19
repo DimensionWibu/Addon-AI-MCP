@@ -641,6 +641,7 @@ export class Session {
     this.resetCtx() // ctx% turun ke 0 seketika → bukti reset jalan
     this.db.upsertSession(this.meta)
     const prompt = `${seed}Lanjutkan pekerjaan.${this.lastUserPrompt ? ` Instruksi terakhir dari user: ${this.lastUserPrompt}` : ''}`
+    this.beginTurn() // recycle = giliran baru → pelacak laporan-final direset
     this.start() // fresh (started sudah false dari finally)
     this.setStatus('running')
     this.emitActivity(`recycle #${this.apiRetries}…`)
@@ -649,6 +650,9 @@ export class Session {
 
   /** Interupsi turn yang sedang berjalan TANPA menutup session (masih bisa lanjut chat). */
   async interruptTurn(): Promise<void> {
+    // Ditandai SEBELUM interrupt: kalau SDK sempat memancarkan `result` sebagai akibat interupsi,
+    // handler 'result' sudah melihat flag ini → Stop All TIDAK memicu laporan "selesai" palsu.
+    this.interrupting = true
     try {
       await this.q?.interrupt?.()
     } catch {
@@ -728,6 +732,7 @@ export class Session {
         }[]) {
           if (block.type === 'text' && block.text?.trim()) {
             this.record({ role: 'assistant', text: block.text, ts: Date.now() })
+            this.lastAssistantText = block.text // hasil kerja worker → isi auto-report saat turn selesai
             if (isApiBlock(block.text)) this.flagApiBlock() // API blokir pesan → recycle di akhir turn
             // Limit langganan sering datang sebagai TEKS ("You've hit your session limit · resets …"),
             // bukan exception/field error → deteksi di sini agar auto-switch akun ikut kepicu.
@@ -790,7 +795,20 @@ export class Session {
         this.setStatus('idle') // menunggu input berikutnya
         this.emitActivity('idle')
         // Turn selesai → beri tahu orkestrator (root akan dibangunkan untuk lapor ke user).
-        this.host.notifyTurnEnd(this.meta.id)
+        // JAMINAN RUNTIME: bila turn ini berakhir WAJAR dan worker TIDAK melapor final sendiri,
+        // sertakan teks jawaban terakhirnya supaya host yang melaporkannya ke parent. Turn yang
+        // berakhir karena interupsi (Stop All/compact/ganti akun), limit, blokir API, atau result
+        // non-sukses TIDAK dikirimi outcome → tak ada laporan "selesai" palsu.
+        const cleanEnd =
+          subtype === 'success' &&
+          !this.interrupting &&
+          !this.stopped &&
+          !this.apiBlockPending &&
+          !this.limitHitPending
+        this.host.notifyTurnEnd(
+          this.meta.id,
+          cleanEnd && !this.finalReportSent ? { finalText: this.lastAssistantText } : undefined
+        )
         // Bila ada permintaan compact tertunda, padatkan konteks sekarang (turn sudah selesai).
         if (this.pendingCompactSeed) this.doCompact()
         else {

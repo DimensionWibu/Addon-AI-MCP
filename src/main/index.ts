@@ -2,11 +2,11 @@
 import { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage } from 'electron'
 import { join } from 'node:path'
 import { Board } from './orchestrator/db'
-import { SessionManager } from './orchestrator/SessionManager'
+import { SessionManager, USAGE_SWITCH_PCT } from './orchestrator/SessionManager'
 import { registerIpc } from './ipc'
-import { fetchUsage, peekUsage } from './usage'
+import { fetchAccountEmail, fetchUsage, peekAccountEmail, peekUsage } from './usage'
 import { loadWindowState, trackWindowState } from './windowState'
-import type { GroveEvent } from '../shared/types'
+import type { GroveEvent, UsageSnapshot } from '../shared/types'
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
@@ -124,13 +124,29 @@ app.whenReady().then(async () => {
   const usageTarget = (): { id: string | null; label: string; token: string | null } =>
     manager.getSessionAccountInfo(usageSessionId)
 
+  /** Snapshot lengkap untuk akun yang sedang dipilih: identitas + angka (atau alasan kosongnya). */
+  const snapshotFor = async (
+    t: { id: string | null; label: string; token: string | null },
+    live: boolean
+  ): Promise<UsageSnapshot> => {
+    const acct = { id: t.id, token: t.token }
+    const r = live ? await fetchUsage(acct) : peekUsage(t.id)
+    // Email diambil dari /oauth/profile (endpoint usage tak memuat identitas). Hasilnya di-cache
+    // per akun; akun yang tokennya tak ber-scope user:profile permanen null → UI pakai label saja.
+    const email = live ? await fetchAccountEmail(acct) : peekAccountEmail(t.id)
+    return { accountId: t.id, accountLabel: t.label, accountEmail: email, usage: r.usage, reason: r.reason }
+  }
+
   const loopUsage = async (gen: number): Promise<void> => {
     const t = usageTarget()
     const key = t.id ?? 'default'
-    const usage = await fetchUsage({ id: t.id, token: t.token })
+    const snap = await snapshotFor(t, true)
     if (gen !== usageGen) return // akun terlanjur berganti → hasil ini basi, jangan ditampilkan
-    emit({ channel: 'usage:update', payload: { accountId: t.id, accountLabel: t.label, usage } })
-    const delay = usage && !usage.stale ? 60_000 : Math.min((usageDelays.get(key) ?? 60_000) * 2, 300_000)
+    emit({ channel: 'usage:update', payload: snap })
+    const ok = snap.usage && !snap.usage.stale
+    // Akun yang ditolak permanen (scope/no-token) tak perlu dipoll cepat — langsung jeda maksimum.
+    const permanent = snap.reason === 'scope' || snap.reason === 'no-token'
+    const delay = ok ? 60_000 : permanent ? 300_000 : Math.min((usageDelays.get(key) ?? 60_000) * 2, 300_000)
     usageDelays.set(key, delay)
     usageTimer = setTimeout(() => void loopUsage(gen), delay)
   }
@@ -144,22 +160,40 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('grove:getUsage', async (_e, arg?: { sessionId?: string | null }) => {
     if (arg && 'sessionId' in arg) usageSessionId = arg.sessionId ?? null
-    const t = usageTarget()
-    return { accountId: t.id, accountLabel: t.label, usage: await fetchUsage({ id: t.id, token: t.token }) }
+    return snapshotFor(usageTarget(), true)
   })
 
   // Renderer memberi tahu sesi mana yang dipilih. Balasannya dari cache (instan, tanpa nunggu
   // jaringan) supaya label+angka di header langsung jadi milik akun yang benar; fetch segarnya
   // menyusul lewat event usage:update. Kalau akunnya sama, jangan restart poll (hemat rate-limit).
-  ipcMain.handle('grove:setUsageSession', (_e, { sessionId }: { sessionId: string | null }) => {
+  ipcMain.handle('grove:setUsageSession', async (_e, { sessionId }: { sessionId: string | null }) => {
     const before = usageTarget().id
     usageSessionId = sessionId ?? null
     const t = usageTarget()
     if (t.id !== before) restartUsage()
-    return { accountId: t.id, accountLabel: t.label, usage: peekUsage(t.id) }
+    return snapshotFor(t, false) // dari cache → header langsung benar tanpa nunggu jaringan
   })
 
   void loopUsage(usageGen)
+
+  // Watchdog kuota: pantau akun DEFAULT (satu-satunya yang endpoint usage-nya bisa dibaca —
+  // token `setup-token` membalas 403) lalu pindahkan sesinya ke akun lain SEBELUM kena limit.
+  // Akun setup-token tetap terlindungi jalur reaktif onLimitHit (pindah begitu limit terdeteksi).
+  const USAGE_WATCH_MS = 120_000
+  const watchUsage = async (): Promise<void> => {
+    try {
+      const u = await fetchUsage({ id: null, token: null })
+      const pct = u.usage?.fiveHour?.utilization ?? null
+      if (pct != null && pct >= USAGE_SWITCH_PCT) {
+        const moved = manager.onUsageHigh(null, pct)
+        if (moved) console.log(`[usage] akun default ${Math.round(pct)}% → ${moved} sesi dipindah akun`)
+      }
+    } catch {
+      /* jaringan gagal → coba lagi siklus berikutnya */
+    }
+    setTimeout(() => void watchUsage(), USAGE_WATCH_MS)
+  }
+  void watchUsage()
 
   app.on('before-quit', () => {
     // JANGAN stopAll di sini: itu mengubah status running→idle & menghapus info "sesi ini tadi kerja"

@@ -9,6 +9,7 @@ import type {
   SessionMeta,
   TreeNode,
   UsageSnapshot,
+  UsageUnavailable,
   UsageWindow
 } from '../shared/types'
 
@@ -77,30 +78,53 @@ function fmtResetIn(iso: string | null): string {
   const m = mins % 60
   return h > 0 ? `reset ${h}j ${m}m` : `reset ${m}m`
 }
+/** Penjelasan jujur kenapa angka akun ini kosong (bukan diam-diam menampilkan akun lain). */
+function usageReasonText(r?: UsageUnavailable): string {
+  switch (r) {
+    case 'no-token':
+      return 'Akun ini belum punya token tersimpan.'
+    case 'scope':
+      return 'Token akun ini (hasil `claude setup-token`) tidak punya scope user:profile, jadi endpoint limit menolaknya (403). Pemakaian akun ini memang tidak bisa dibaca dari Grove.'
+    case 'unauthorized':
+      return 'Token akun ini ditolak (401) — kemungkinan sudah kedaluwarsa.'
+    case 'rate-limited':
+      return 'Server sedang membatasi permintaan (429). Dicoba lagi otomatis.'
+    default:
+      return 'Gagal menghubungi server limit. Dicoba lagi otomatis.'
+  }
+}
+
 /**
- * Angka usage SELALU diberi label akun pemiliknya — tanpa itu user tak bisa tahu
- * "5-jam 19%" itu milik akun mana. usage null = tak diketahui untuk akun tsb; kita
- * tampilkan "—", BUKAN angka akun sebelumnya (itu bug lamanya).
+ * Angka usage SELALU diberi identitas akun pemiliknya (email kalau bisa didapat, kalau
+ * tidak label) — tanpa itu user tak bisa tahu "5-jam 19%" milik akun mana. usage null =
+ * tak diketahui untuk akun tsb; kita tampilkan "—" + alasannya, BUKAN angka akun
+ * sebelumnya (itu bug lamanya).
  */
 function renderUsage(snap: UsageSnapshot): void {
   const box = $('usage')
   const panel = $('usage-panel')
   const u = snap.usage
   const label = escapeHtml(snap.accountLabel)
-  const acct = `<span class="uacct">${label}</span>`
+  // Email lebih informatif daripada label bebas; kalau tak bisa didapat untuk akun ini,
+  // JANGAN pakai email login utama — mundur ke label saja.
+  const who = escapeHtml(snap.accountEmail ?? snap.accountLabel)
+  const whoTitle = snap.accountEmail
+    ? `${snap.accountLabel} · ${snap.accountEmail}`
+    : `${snap.accountLabel} — email tak tersedia untuk akun ini`
+  const acct = `<span class="uacct" title="${escapeHtml(whoTitle)}">${who}</span>`
   box.classList.toggle('stale', !!u?.stale)
 
   if (!u) {
-    box.title = `Usage akun "${snap.accountLabel}" belum bisa dibaca. Klik untuk detail.`
+    box.title = `${whoTitle} — pemakaian tak bisa dibaca. Klik untuk detail.`
     box.innerHTML = `${acct}<span class="ubar-mini"><span class="ulabel">usage</span><span class="uval">—</span></span>`
     panel.innerHTML =
-      `<div class="up-title">BATAS PEMAKAIAN · ${label}</div>` +
-      `<div class="up-empty">Belum bisa dibaca untuk akun ini (token belum ada / ditolak server). Angka akun lain sengaja tidak ditampilkan agar tidak menyesatkan.</div>`
+      `<div class="up-title">BATAS PEMAKAIAN · ${who}</div>` +
+      `<div class="up-empty">${escapeHtml(usageReasonText(snap.reason))}<br><br>Angka akun lain sengaja TIDAK ditampilkan di sini agar tidak menyesatkan.</div>`
     return
   }
   box.title = u.stale
-    ? `Akun "${snap.accountLabel}" — data terakhir (refresh gagal, token mungkin sedang di-refresh). Klik untuk detail.`
-    : `Akun "${snap.accountLabel}" — klik untuk detail limit`
+    ? `${whoTitle} — data terakhir (refresh gagal, token mungkin sedang di-refresh). Klik untuk detail.`
+    : `${whoTitle} — klik untuk detail limit`
   // top bar: label akun + mini bars 5-jam + minggu
   const mini = (label: string, w?: UsageWindow): string => {
     const v = w?.utilization ?? null
@@ -858,7 +882,8 @@ function renderAccountsPanel(): void {
       del.addEventListener('click', () => {
         if (confirm(`Hapus akun "${a.label}"?`)) void window.grove.deleteAccount(a.id).catch((e) => alert(String(e)))
       })
-      panel.append(el('div', { class: 'ap-item' }, el('span', { class: 'ap-label' }, a.label), del))
+      const planTag = a.plan ? el('span', { class: 'ap-plan' }, `Max ${a.plan}x`) : el('span', {})
+      panel.append(el('div', { class: 'ap-item' }, el('span', { class: 'ap-label' }, a.label), planTag, del))
     }
   }
 
@@ -870,20 +895,28 @@ function renderAccountsPanel(): void {
   token.className = 'ap-input ap-token'
   token.placeholder = 'Token dari `claude setup-token`'
   token.rows = 2
+  // Ukuran paket dipakai saat SEMUA akun sudah menembus ambang kuota → yang terbesar dipilih.
+  const plan = document.createElement('input')
+  plan.className = 'ap-input'
+  plan.type = 'number'
+  plan.min = '1'
+  plan.placeholder = 'Ukuran paket, mis. 20 untuk Max 20x (opsional)'
   const add = el('button', { class: 'ap-add' }, '+ Tambah akun')
   add.addEventListener('click', () => {
     const l = label.value.trim()
     const t = token.value.trim()
+    const p = Number(plan.value) > 0 ? Number(plan.value) : undefined
     if (!l || !t) return alert('Isi label & token dulu.')
     void window.grove
-      .addAccount(l, t)
+      .addAccount(l, t, p)
       .then(() => {
         label.value = ''
         token.value = ''
+        plan.value = ''
       })
       .catch((e) => alert(`Gagal tambah: ${String(e)}`))
   })
-  panel.append(label, token, add)
+  panel.append(label, token, plan, add)
 
   const node = activeId ? nodes.get(activeId) : null
   if (node) {

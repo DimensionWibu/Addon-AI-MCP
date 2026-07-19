@@ -46,8 +46,8 @@ export function registerIpc(manager: SessionManager): void {
   )
 
   ipcMain.handle('grove:listAccounts', () => manager.listAccounts())
-  ipcMain.handle('grove:addAccount', (_e, { label, token }: { label: string; token: string }) =>
-    manager.addAccount(label, token)
+  ipcMain.handle('grove:addAccount', (_e, { label, token, plan }: { label: string; token: string; plan?: number }) =>
+    manager.addAccount(label, token, plan)
   )
   ipcMain.handle('grove:deleteAccount', (_e, { id }: { id: string }) => manager.deleteAccount(id))
   ipcMain.handle('grove:setSessionAccount', (_e, { id, accountId }: { id: string; accountId: string | null }) =>

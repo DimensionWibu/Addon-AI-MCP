@@ -73,6 +73,13 @@ button, input { font-family: var(--mono); }
 .ap-row select { flex: 1; }
 .usage { margin-left: auto; display: flex; align-items: center; gap: 12px; font-size: 11px; cursor: pointer; }
 .usage.stale { opacity: .5; } /* nilai last-good saat refresh gagal (token mungkin sedang refresh) */
+/* Identitas akun pemilik angka usage (email bila bisa didapat, kalau tidak label akun).
+   Tanpa ini user tak bisa tahu angka di header itu milik akun mana. */
+.uacct {
+  max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--accent); font-weight: 600; border: 1px solid var(--border);
+  border-radius: 10px; padding: 1px 8px; background: rgba(217, 119, 87, .10);
+}
 .ubar-mini { display: flex; align-items: center; gap: 5px; }
 .ubar-mini .ulabel { color: var(--text-dim); }
 .ubar-mini .uval { color: var(--text); font-variant-numeric: tabular-nums; }
@@ -88,6 +95,7 @@ button, input { font-family: var(--mono); }
 }
 .usage-panel.show { display: block; }
 .up-title { font-weight: 700; color: #e6e2d6; margin-bottom: 12px; font-size: 12px; letter-spacing: .5px; }
+.up-empty { color: var(--text-dim); font-size: 11px; line-height: 1.5; }
 .up-row { margin-bottom: 13px; }
 .up-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 5px; }
 .up-name { color: #f0ede2; font-size: 12px; font-weight: 600; }
@@ -306,3 +314,4 @@ body.reordering .node { cursor: grabbing; }
 ::-webkit-scrollbar-thumb { background: #333; border-radius: 0; }
 ::-webkit-scrollbar-thumb:hover { background: #444; }
 ::-webkit-scrollbar-track { background: var(--bg); }
+.ap-plan { font-size: 10px; color: var(--ok); border: 1px solid var(--ok); border-radius: 8px; padding: 0 6px; }

@@ -50,6 +50,9 @@ export interface InboxMessage {
 export interface Account {
   id: string
   label: string
+  /** Ukuran paket (mis. 20 untuk Max 20x, 5 untuk Max 5x). Dipakai memilih akun terbesar
+   *  sebagai cadangan saat SEMUA akun sudah menembus ambang kuota — agar kerja tak terkunci. */
+  plan?: number
   createdAt: number
 }
 
@@ -114,16 +117,26 @@ export interface UsageInfo {
   stale?: boolean // true = fetch terakhir gagal, ini nilai last-good (token mungkin sedang refresh)
 }
 
+/** Kenapa usage sebuah akun tak bisa ditampilkan — supaya UI jujur, bukan diam-diam kosong. */
+export type UsageUnavailable =
+  | 'no-token' // akun tak punya token tersimpan
+  | 'scope' // 403: token `claude setup-token` tak punya scope user:profile (kasus paling umum)
+  | 'unauthorized' // 401: token ditolak/kedaluwarsa
+  | 'rate-limited' // 429
+  | 'error' // jaringan/lainnya
+
 /**
  * Usage SELALU dibawa bersama identitas akun pemiliknya. Tanpa ini angka jadi ambigu:
- * user tak bisa tahu 19% itu milik akun mana (bug lama: selalu akun login utama).
- * usage = null berarti "belum/tak bisa diketahui untuk akun ini" — JANGAN tampilkan
- * angka akun lain sebagai gantinya.
+ * user tak bisa tahu "5-jam 19%" itu milik akun mana (bug lama: selalu akun login utama).
+ * usage null = tak bisa diketahui untuk akun INI — UI menampilkan alasannya, dan JANGAN
+ * pernah menggantinya dengan angka akun lain.
  */
 export interface UsageSnapshot {
   accountId: string | null // null = login utama (~/.claude/.credentials.json)
   accountLabel: string
+  accountEmail: string | null // hanya bisa didapat bila token punya scope user:profile
   usage: UsageInfo | null
+  reason?: UsageUnavailable // terisi saat usage null
 }
 
 /** Event yang dikirim main → renderer lewat channel 'grove:event'. */
@@ -163,7 +176,7 @@ export interface GroveApi {
   compactSession: (id: string) => Promise<void>
   setLoop: (id: string, enabled: boolean) => Promise<void>
   listAccounts: () => Promise<{ accounts: Account[]; autoSwitch: boolean; autoResume: boolean }>
-  addAccount: (label: string, token: string) => Promise<Account>
+  addAccount: (label: string, token: string, plan?: number) => Promise<Account>
   deleteAccount: (id: string) => Promise<void>
   setSessionAccount: (id: string, accountId: string | null) => Promise<void>
   setAutoSwitch: (on: boolean) => Promise<void>
