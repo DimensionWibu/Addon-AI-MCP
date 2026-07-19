@@ -622,6 +622,11 @@ async function selectSession(id: string): Promise<void> {
   log.textContent = ''
   toolDetailEls.clear() // panel detail milik sesi lama tak relevan lagi
   const history = await window.grove.getChat(id)
+  // Balapan async: kalau pilihan berubah selama getChat berjalan (klik sesi lain, ATAU sesi ini
+  // dihapus lalu applyRemoved auto-pindah ke sesi lain), JANGAN tempel riwayat basi ke chat-log
+  // yang kini menampilkan sesi berbeda. Tanpa guard ini, menghapus sesi (yang memicu auto-pindah)
+  // bisa "menyuntik" riwayat sesi lama/terhapus ke chat sesi aktif → chat tampak rusak lintas-sesi.
+  if (activeId !== id) return
   for (const m of history.slice(-MAX_CHAT_DOM)) appendChatMessage(m, false) // hanya N terakhir → anti-lag
   log.scrollTop = log.scrollHeight
   updateActiveHighlight()
