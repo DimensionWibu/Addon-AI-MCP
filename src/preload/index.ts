@@ -14,6 +14,7 @@ const api: GroveApi = {
   stopAll: () => ipcRenderer.invoke('grove:stopAll'),
   reorderSessions: (orderedIds: string[]) => ipcRenderer.invoke('grove:reorder', { ids: orderedIds }),
   compactSession: (id: string) => ipcRenderer.invoke('grove:compact', { id }),
+  setLoop: (id: string, enabled: boolean) => ipcRenderer.invoke('grove:setLoop', { id, enabled }),
   interruptSession: (id: string) => ipcRenderer.invoke('grove:interruptSession', { id }),
   deleteSession: (id: string) => ipcRenderer.invoke('grove:deleteSession', { id }),
   getSnapshot: () => ipcRenderer.invoke('grove:getSnapshot'),

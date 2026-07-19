@@ -22,13 +22,19 @@ import { contextPercent, contextWindowFor } from './contextWindows'
 const MAX_WORKERS_PER_TREE = 12
 const DEFAULT_MODEL: string | undefined = undefined // undefined = ikut default Claude Code
 const ROOT_STATUS_DEBOUNCE_MS = 3000 // gabung beberapa laporan worker jadi 1 giliran root
+const LOOP_INTERVAL_MS = 10 * 60_000 // auto-check "udah sampe mana?" tiap 10 menit (bisa diubah)
 
 // Instruksi yang di-inject ke root saat worker melapor → root merangkum ke user.
 const ROOT_STATUS_REQUEST = `[GROVE AUTO] One or more sub-workers in your tree just reported progress. Do NOT do their work. Call mcp__grove__read_board (scope "tree") and mcp__grove__list_workers, then send the USER ONE short, consolidated status update: for each worker its percent + state, what is finished, what is still running, and the overall progress. If every worker is done, give the final synthesized answer instead.`
 
+// Ping auto-check berkala ke root (thread loop): dorong worker mangkrak, lapor ke user, stop bila selesai.
+const LOOP_CHECK_PROMPT = `[GROVE AUTO-CHECK] Pengecekan berkala — udah sampai mana? Panggil mcp__grove__read_board (scope "tree") + mcp__grove__list_workers. Jika ADA worker idle padahal tugasnya BELUM tuntas, dorong dia lanjut (mcp__grove__assign_worker) supaya tidak mangkrak. Beri user update singkat progres saat ini. Jika SELURUH pekerjaan pohon sudah SELESAI, panggil mcp__grove__task_done untuk menghentikan pengecekan berkala ini (menyala lagi otomatis saat user memberi tugas baru).`
+
 export class SessionManager implements GroveHost {
   private readonly sessions = new Map<string, Session>()
   private readonly rootStatusTimers = new Map<string, NodeJS.Timeout>() // treeId → debounce timer
+  private readonly loopTimers = new Map<string, NodeJS.Timeout>() // rootId → timer auto-check berkala
+  private readonly loopEnabled = new Set<string>() // rootId dengan auto-check aktif
 
   constructor(
     private readonly db: Board,
@@ -156,6 +162,8 @@ export class SessionManager implements GroveHost {
     // Auto-title dari pesan pertama bila judul masih default "Chat baru".
     if (s.meta.title === 'Chat baru' && text.trim()) this.setTitle(id, deriveTitle(text))
     s.sendUserMessage(text, images)
+    // Tugas baru ke root → (re)nyalakan thread auto-check "udah sampe mana?".
+    if (s.meta.role === 'root') this.enableLoop(id)
   }
 
   async stopSession(id: string): Promise<void> {
@@ -227,6 +235,62 @@ export class SessionManager implements GroveHost {
     s.scheduleCompact(summary) // konteks dipadatkan saat turn ini selesai
   }
 
+  // ---- auto-check berkala (thread loop "udah sampe mana?") -------------------
+
+  private enableLoop(rootId: string): void {
+    const root = this.sessions.get(rootId)
+    if (!root || root.meta.role !== 'root') return
+    const wasOff = !this.loopEnabled.has(rootId)
+    this.loopEnabled.add(rootId)
+    this.scheduleLoop(rootId)
+    if (wasOff) this.emit({ channel: 'session:update', payload: { id: rootId, loopActive: true } })
+  }
+
+  private stopLoop(rootId: string): void {
+    this.clearLoopTimer(rootId)
+    if (this.loopEnabled.delete(rootId)) {
+      this.emit({ channel: 'session:update', payload: { id: rootId, loopActive: false } })
+    }
+  }
+
+  private clearLoopTimer(rootId: string): void {
+    const t = this.loopTimers.get(rootId)
+    if (t) clearTimeout(t)
+    this.loopTimers.delete(rootId)
+  }
+
+  private scheduleLoop(rootId: string): void {
+    this.clearLoopTimer(rootId)
+    this.loopTimers.set(rootId, setTimeout(() => this.runLoopCheck(rootId), LOOP_INTERVAL_MS))
+  }
+
+  /** Tiap interval: dorong root idle untuk cek worker; skip bila root running / belum ada worker. */
+  private runLoopCheck(rootId: string): void {
+    this.loopTimers.delete(rootId)
+    if (!this.loopEnabled.has(rootId)) return
+    const root = this.sessions.get(rootId)
+    if (!root || root.meta.role !== 'root') {
+      this.stopLoop(rootId)
+      return
+    }
+    const treeSize = [...this.sessions.values()].filter((s) => s.meta.treeId === rootId).length
+    if (root.meta.status !== 'running' && treeSize > 1) root.autoCheck(LOOP_CHECK_PROMPT)
+    this.scheduleLoop(rootId) // ulangi sampai task_done / dimatikan manual
+  }
+
+  /** Toggle dari UI. */
+  setLoop(rootId: string, enabled: boolean): void {
+    if (enabled) this.enableLoop(rootId)
+    else this.stopLoop(rootId)
+  }
+
+  /** GroveHost.taskDone — root menandai seluruh tugas selesai → hentikan loop. */
+  taskDone(sessionId: string): void {
+    const s = this.sessions.get(sessionId)
+    if (!s || s.meta.role !== 'root') return
+    this.stopLoop(sessionId)
+  }
+
   /** Stop All: interupsi turn SEMUA session (jadi idle) tanpa menutup — masih bisa dilanjut. */
   async stopAll(): Promise<number> {
     const running = [...this.sessions.values()].filter((s) => s.meta.status === 'running')
@@ -245,6 +309,8 @@ export class SessionManager implements GroveHost {
     collect(id)
     for (const sid of toDelete) {
       await this.sessions.get(sid)?.stop()
+      this.clearLoopTimer(sid)
+      this.loopEnabled.delete(sid)
       this.sessions.delete(sid)
       this.db.deleteSession(sid)
     }
@@ -398,6 +464,7 @@ export class SessionManager implements GroveHost {
         ...m,
         ctxPercent: contextPercent(m.ctxInput, m.ctxWindow),
         board: boardMap.get(m.id),
+        loopActive: this.loopEnabled.has(m.id),
         children: []
       })
     }

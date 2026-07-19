@@ -152,6 +152,13 @@ body.reordering .node { cursor: grabbing; }
   cursor: pointer; font-family: var(--mono);
 }
 .compact-btn:hover { background: rgba(217, 119, 87, .15); }
+.loop-btn {
+  display: none; margin-left: auto; background: transparent; color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 3px; padding: 2px 8px; font-size: 11px;
+  cursor: pointer; font-family: var(--mono);
+}
+.loop-btn:hover { border-color: var(--accent); color: var(--accent); }
+.loop-btn.on { color: var(--ok); border-color: var(--ok); background: rgba(143, 181, 115, .12); }
 /* ---- panel MEMORI ---- */
 .mem-list { overflow: auto; padding: 8px; max-height: 220px; display: flex; flex-direction: column; gap: 6px; }
 .mem-empty { color: var(--text-dim); font-size: 11px; }

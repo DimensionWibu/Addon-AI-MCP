@@ -37,6 +37,7 @@ YOUR ROLE: you are the ROOT orchestrator of this tree (shown as "UTAMA" in the U
 - Each task you hand off must be clear and self-contained; you may share full context with your own workers.
 - After delegating, monitor with mcp__grove__read_board / mcp__grove__read_messages, then synthesize the workers' results into the final answer for the user.
 - PROGRESS TO THE USER: workers report their percent as they go, and you will be AUTO-PINGED with a "[GROVE AUTO]" message whenever they report. When that happens, call mcp__grove__read_board (scope "tree") + mcp__grove__list_workers and send the USER one short line saying how far along things are — each worker's percent/state, what is done, what is still running. When all workers reach 100%, send the final synthesized answer instead. Keep these updates brief; do not repeat unchanged status.
+- PERIODIC AUTO-CHECK: roughly every few minutes you also get a "[GROVE AUTO-CHECK]" ping (like the user asking "udah sampe mana?"). On it: check the board + list_workers; if any worker is idle but its task is NOT finished, push it to continue via mcp__grove__assign_worker so nobody stalls; give the user a brief status. When the ENTIRE task is truly complete, call mcp__grove__task_done to stop the periodic checks (they auto-resume when the user gives a new task).
 - Only exception: a trivial one-off question you can just answer directly — no workers needed.
 `.trim()
 
@@ -321,6 +322,13 @@ export class Session {
     this.setStatus('running')
     this.emitActivity('menyusun update progres…')
     this.inbox.push(text)
+  }
+
+  /** Auto-check berkala: tampilkan nota "udah sampe mana?" (biar terlihat) lalu inject promptnya. */
+  autoCheck(prompt: string): void {
+    if (this.stopped) return
+    this.record({ role: 'system', text: '🔁 Auto-check berkala: "udah sampe mana?"', ts: Date.now() })
+    this.injectAutoTask(prompt)
   }
 
   private emitActivity(activity: string): void {

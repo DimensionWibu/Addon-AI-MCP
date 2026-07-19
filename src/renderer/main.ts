@@ -14,7 +14,7 @@ import type {
 let pendingImages: ImageAttachment[] = []
 let pendingRefs: string[] = [] // path file/folder referensi
 
-type Node = SessionMeta & { ctxPercent: number; tokensTotal: number }
+type Node = SessionMeta & { ctxPercent: number; tokensTotal: number; loopActive?: boolean }
 
 const turnStart = new Map<string, number>() // kapan turn 'running' dimulai
 const lastElapsed = new Map<string, number>() // durasi turn terakhir (ms)
@@ -547,16 +547,21 @@ function updateChatHeader(): void {
   const telem = $('chat-telem')
   const stopBtn = $('btn-stop')
   const compactBtn = $('btn-compact')
+  const loopBtn = $('btn-loop')
   if (node) {
     const act = activities.get(activeId!) || node.status
     const elapsed = fmtDuration(lastElapsed.get(activeId!) ?? 0)
     telem.textContent = `⏱ ${elapsed} · ↓ ${fmtTokens(node.tokensTotal ?? 0)} tokens · ${act}`
     stopBtn.style.display = node.status === 'running' ? 'inline-block' : 'none'
     compactBtn.style.display = node.role === 'root' ? 'inline-block' : 'none' // hanya UTAMA
+    loopBtn.style.display = node.role === 'root' ? 'inline-block' : 'none' // hanya UTAMA
+    loopBtn.classList.toggle('on', !!node.loopActive)
+    loopBtn.textContent = node.loopActive ? '🔁 Auto ON' : '🔁 Auto'
   } else {
     telem.textContent = ''
     stopBtn.style.display = 'none'
     compactBtn.style.display = 'none'
+    loopBtn.style.display = 'none'
   }
 }
 
@@ -924,6 +929,16 @@ async function init(): Promise<void> {
     if (node?.role !== 'root') return
     if (!confirm('Compact UTAMA: ringkas laporan semua sub → simpan ke Memori & PADATKAN konteks root (detail mentah lama dilepas). Lanjut?')) return
     void window.grove.compactSession(activeId).catch((err) => alert(`Gagal compact: ${String(err)}`))
+  })
+
+  $('btn-loop').addEventListener('click', () => {
+    if (!activeId) return
+    const node = nodes.get(activeId)
+    if (node?.role !== 'root') return
+    const next = !node.loopActive
+    node.loopActive = next // optimistis
+    updateChatHeader()
+    void window.grove.setLoop(activeId, next).catch((err) => alert(`Gagal set auto-check: ${String(err)}`))
   })
 
   $('btn-stop-all').addEventListener('click', () => {

@@ -16,6 +16,7 @@ export interface GroveHost {
   reportProgress(sessionId: string, progress: string, percent?: number): void
   reportToParent(fromId: string, opts: { status: string; percent?: number }): void
   saveCompaction(sessionId: string, summary: string): void
+  taskDone(sessionId: string): void
   readBoard(sessionId: string, scope: 'tree' | 'all'): (BoardEntry & { title: string; treeId: string; role: string; status: string })[]
   sendMessage(fromId: string, to: string | null, body: string): void
   readMessages(sessionId: string, unreadOnly: boolean): InboxMessage[]
@@ -120,6 +121,16 @@ export function buildGroveServer(sessionId: string, host: GroveHost) {
     }
   )
 
+  const taskDone = tool(
+    'task_done',
+    'Call this ONLY when the ENTIRE task for your tree is fully complete (all workers finished, nothing left to do). It stops the periodic auto-check ("udah sampe mana?") loop for this session. It will restart automatically when the user sends a new task.',
+    {},
+    async () => {
+      host.taskDone(sessionId)
+      return ok('Marked task complete. Periodic auto-check stopped.')
+    }
+  )
+
   const readBoard = tool(
     'read_board',
     'Read the shared board (summary/todo/progress) of sessions. scope "all" (default) shows every session across all trees; "tree" shows only your tree. Read-only awareness — do NOT work on another tree\'s task.',
@@ -162,6 +173,6 @@ export function buildGroveServer(sessionId: string, host: GroveHost) {
   return createSdkMcpServer({
     name: 'grove',
     version: '0.1.0',
-    tools: [spawnWorker, assignWorker, setTitle, updateSummary, updateTodo, reportProgress, reportToParent, saveCompaction, readBoard, sendMessage, readMessages, listWorkers]
+    tools: [spawnWorker, assignWorker, setTitle, updateSummary, updateTodo, reportProgress, reportToParent, saveCompaction, taskDone, readBoard, sendMessage, readMessages, listWorkers]
   })
 }

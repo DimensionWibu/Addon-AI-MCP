@@ -73,6 +73,7 @@ export interface ImageAttachment {
 export interface TreeNode extends SessionMeta {
   ctxPercent: number
   board?: BoardEntry
+  loopActive?: boolean // auto-check berkala ("udah sampe mana?") aktif (root saja)
   children: TreeNode[]
 }
 
@@ -110,7 +111,11 @@ export type GroveEvent =
   | { channel: 'session:new'; payload: SessionMeta & { ctxPercent: number } }
   | {
       channel: 'session:update'
-      payload: { id: string } & Partial<SessionMeta> & { ctxPercent?: number; tokensTotal?: number }
+      payload: { id: string } & Partial<SessionMeta> & {
+          ctxPercent?: number
+          tokensTotal?: number
+          loopActive?: boolean
+        }
     }
   | { channel: 'chat:delta'; payload: { id: string; delta: string } }
   | { channel: 'chat:message'; payload: { id: string; message: ChatMessage } }
@@ -133,6 +138,7 @@ export interface GroveApi {
   stopAll: () => Promise<number>
   reorderSessions: (orderedIds: string[]) => Promise<void>
   compactSession: (id: string) => Promise<void>
+  setLoop: (id: string, enabled: boolean) => Promise<void>
   interruptSession: (id: string) => Promise<void>
   deleteSession: (id: string) => Promise<string[]>
   getSnapshot: () => Promise<GroveSnapshot>

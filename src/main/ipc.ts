@@ -41,6 +41,10 @@ export function registerIpc(manager: SessionManager): void {
 
   ipcMain.handle('grove:compact', (_e, { id }: { id: string }) => manager.compactSession(id))
 
+  ipcMain.handle('grove:setLoop', (_e, { id, enabled }: { id: string; enabled: boolean }) =>
+    manager.setLoop(id, enabled)
+  )
+
   ipcMain.handle('grove:interruptSession', (_e, { id }: { id: string }) => manager.interruptSession(id))
 
   ipcMain.handle('grove:deleteSession', (_e, { id }: { id: string }) => manager.deleteSession(id))
