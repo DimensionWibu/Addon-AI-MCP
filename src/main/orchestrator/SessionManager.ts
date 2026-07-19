@@ -22,8 +22,11 @@ import { contextPercent, contextWindowFor } from './contextWindows'
 
 const MAX_WORKERS_PER_TREE = 12
 const DEFAULT_MODEL: string | undefined = undefined // undefined = ikut default Claude Code
-const ROOT_STATUS_DEBOUNCE_MS = 3000 // gabung beberapa laporan worker jadi 1 giliran root
+// Tiap wake = SATU giliran root penuh (konteks root dikirim ulang → biaya usage nyata).
+// Debounce panjang menggabungkan banyak laporan worker jadi 1 giliran saja (hemat besar).
+const ROOT_STATUS_DEBOUNCE_MS = 60_000
 const LOOP_INTERVAL_MS = 10 * 60_000 // auto-check "udah sampe mana?" tiap 10 menit (bisa diubah)
+const IDLE_CHECK_LIMIT = 3 // auto-check beruntun tanpa perubahan → stop loop (cegah bakar usage)
 
 // Prompt auto-ping dibangun DINAMIS (lihat rootStatusPrompt/loopCheckPrompt) dengan ringkasan
 // board disuntik langsung → root tak perlu memanggil read_board tiap ping (hemat konteks besar).
@@ -31,6 +34,9 @@ const LOOP_INTERVAL_MS = 10 * 60_000 // auto-check "udah sampe mana?" tiap 10 me
 export class SessionManager implements GroveHost {
   private readonly sessions = new Map<string, Session>()
   private readonly rootStatusTimers = new Map<string, NodeJS.Timeout>() // treeId → debounce timer
+  private readonly lastPingSummary = new Map<string, string>() // treeId → board saat ping terakhir (dedupe)
+  private readonly lastLoopSummary = new Map<string, string>() // rootId → board saat auto-check terakhir
+  private readonly loopIdleStreak = new Map<string, number>() // rootId → auto-check beruntun tanpa perubahan
   private readonly loopTimers = new Map<string, NodeJS.Timeout>() // rootId → timer auto-check berkala
   private readonly loopEnabled = new Set<string>() // rootId dengan auto-check aktif
   private autoSwitch = false // pindah akun otomatis saat kena limit
@@ -366,6 +372,8 @@ export class SessionManager implements GroveHost {
     if (!root || root.meta.role !== 'root') return
     const wasOff = !this.loopEnabled.has(rootId)
     this.loopEnabled.add(rootId)
+    this.loopIdleStreak.delete(rootId) // tugas baru → rantai "tanpa perubahan" direset
+    this.lastLoopSummary.delete(rootId)
     this.scheduleLoop(rootId)
     if (wasOff) this.emit({ channel: 'session:update', payload: { id: rootId, loopActive: true } })
   }
@@ -405,6 +413,22 @@ export class SessionManager implements GroveHost {
     const subs = [...this.sessions.values()].filter((s) => s.meta.treeId === rootId && s.meta.role === 'sub')
     const anyStalled = subs.some((s) => s.meta.status !== 'running') // ada worker yg tak sedang kerja
     if (root.meta.status !== 'running' && subs.length > 0 && anyStalled) {
+      // HEMAT USAGE: kalau board tak berubah sejak cek terakhir, artinya dorongan sebelumnya tak
+      // menghasilkan apa-apa (kemungkinan pekerjaan memang sudah selesai tapi task_done lupa
+      // dipanggil). Setelah IDLE_CHECK_LIMIT kali berturut tanpa perubahan → stop loop, jangan
+      // bakar giliran selamanya.
+      const summary = this.treeBoardSummary(rootId)
+      const unchanged = this.lastLoopSummary.get(rootId) === summary
+      const streak = unchanged ? (this.loopIdleStreak.get(rootId) ?? 0) + 1 : 0
+      this.loopIdleStreak.set(rootId, streak)
+      this.lastLoopSummary.set(rootId, summary)
+      if (streak >= IDLE_CHECK_LIMIT) {
+        root.systemNote(
+          `⏹ Auto-check dihentikan: ${IDLE_CHECK_LIMIT}× berturut tak ada perubahan (kemungkinan sudah selesai). Nyala lagi otomatis saat kamu kirim tugas baru.`
+        )
+        this.stopLoop(rootId)
+        return
+      }
       root.autoCheck(this.loopCheckPrompt(rootId))
     }
     this.scheduleLoop(rootId) // ulangi sampai task_done / dimatikan manual
@@ -537,7 +561,15 @@ export class SessionManager implements GroveHost {
       setTimeout(() => {
         this.rootStatusTimers.delete(treeId)
         const root = this.sessions.get(treeId)
-        if (root && root.meta.role === 'root') root.injectAutoTask(this.rootStatusPrompt(treeId))
+        if (!root || root.meta.role !== 'root') return
+        // HEMAT USAGE: root sedang jalan → jangan antrekan giliran ekstra (nanti dia lihat
+        // kondisi terbaru sendiri); dan bila board TIDAK berubah sejak ping terakhir, tak ada
+        // info baru untuk dilaporkan → lewati (giliran nol = biaya nol).
+        if (root.meta.status === 'running') return
+        const summary = this.treeBoardSummary(treeId)
+        if (this.lastPingSummary.get(treeId) === summary) return
+        this.lastPingSummary.set(treeId, summary)
+        root.injectAutoTask(this.rootStatusPrompt(treeId))
       }, ROOT_STATUS_DEBOUNCE_MS)
     )
   }
