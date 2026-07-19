@@ -802,13 +802,19 @@ function renderAccountsPanel(): void {
   const cb = document.createElement('input')
   cb.type = 'checkbox'
   cb.checked = autoSwitch
-  cb.addEventListener('change', () => void window.grove.setAutoSwitch(cb.checked).catch(() => {}))
+  cb.addEventListener('change', () => {
+    autoSwitch = cb.checked // simpan lokal langsung → tetap kecentang saat panel dibuka ulang
+    void window.grove.setAutoSwitch(cb.checked).catch(() => {})
+  })
   panel.append(el('label', { class: 'ap-toggle' }, cb, el('span', {}, ' Auto-switch akun saat kena limit')))
 
   const cr = document.createElement('input')
   cr.type = 'checkbox'
   cr.checked = autoResume
-  cr.addEventListener('change', () => void window.grove.setAutoResume(cr.checked).catch(() => {}))
+  cr.addEventListener('change', () => {
+    autoResume = cr.checked // simpan lokal langsung
+    void window.grove.setAutoResume(cr.checked).catch(() => {})
+  })
   panel.append(el('label', { class: 'ap-toggle' }, cr, el('span', {}, ' Lanjutkan sesi yang tadi kerja saat app dibuka')))
 
   panel.append(el('div', { class: 'ap-head' }, 'Tersimpan'))
