@@ -15,6 +15,12 @@ const api: GroveApi = {
   reorderSessions: (orderedIds: string[]) => ipcRenderer.invoke('grove:reorder', { ids: orderedIds }),
   compactSession: (id: string) => ipcRenderer.invoke('grove:compact', { id }),
   setLoop: (id: string, enabled: boolean) => ipcRenderer.invoke('grove:setLoop', { id, enabled }),
+  listAccounts: () => ipcRenderer.invoke('grove:listAccounts'),
+  addAccount: (label: string, token: string) => ipcRenderer.invoke('grove:addAccount', { label, token }),
+  deleteAccount: (id: string) => ipcRenderer.invoke('grove:deleteAccount', { id }),
+  setSessionAccount: (id: string, accountId: string | null) =>
+    ipcRenderer.invoke('grove:setSessionAccount', { id, accountId }),
+  setAutoSwitch: (on: boolean) => ipcRenderer.invoke('grove:setAutoSwitch', { on }),
   interruptSession: (id: string) => ipcRenderer.invoke('grove:interruptSession', { id }),
   deleteSession: (id: string) => ipcRenderer.invoke('grove:deleteSession', { id }),
   getSnapshot: () => ipcRenderer.invoke('grove:getSnapshot'),

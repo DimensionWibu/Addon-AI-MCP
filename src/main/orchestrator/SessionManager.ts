@@ -3,6 +3,7 @@
 
 import { randomUUID } from 'node:crypto'
 import type {
+  Account,
   BoardEntry,
   ChatMessage,
   GroveEvent,
@@ -35,6 +36,7 @@ export class SessionManager implements GroveHost {
   private readonly rootStatusTimers = new Map<string, NodeJS.Timeout>() // treeId → debounce timer
   private readonly loopTimers = new Map<string, NodeJS.Timeout>() // rootId → timer auto-check berkala
   private readonly loopEnabled = new Set<string>() // rootId dengan auto-check aktif
+  private autoSwitch = false // pindah akun otomatis saat kena limit
 
   constructor(
     private readonly db: Board,
@@ -81,6 +83,7 @@ export class SessionManager implements GroveHost {
       cwd: parent.meta.cwd, // worker default kerja di folder yang sama
       model: opts.model ?? parent.meta.model
     })
+    meta.accountId = parent.meta.accountId // worker pakai akun yang sama dgn parent
     this.db.upsertSession(meta)
     this.registerSession(meta, { emit: true, start: true, task: opts.task })
     return id
@@ -121,10 +124,72 @@ export class SessionManager implements GroveHost {
   /** Muat ulang session dari DB saat startup (dormant; resume saat di-chat lagi). */
   loadFromDisk(): void {
     this.db.normalizeStaleStatuses()
+    this.autoSwitch = this.db.getSetting('autoSwitch') === '1'
     for (const meta of this.db.getAllSessions()) {
       if (this.sessions.has(meta.id)) continue
       this.registerSession(meta, { emit: false, start: false })
     }
+  }
+
+  // ---- akun (multi-account) -------------------------------------------------
+
+  private emitAccounts(): void {
+    this.emit({ channel: 'accounts:update', payload: { accounts: this.db.getAccounts(), autoSwitch: this.autoSwitch } })
+  }
+
+  listAccounts(): { accounts: Account[]; autoSwitch: boolean } {
+    return { accounts: this.db.getAccounts(), autoSwitch: this.autoSwitch }
+  }
+
+  addAccount(label: string, token: string): Account {
+    const id = randomUUID()
+    const now = Date.now()
+    this.db.addAccount(id, label.trim() || 'Akun', token.trim(), now)
+    this.emitAccounts()
+    return { id, label: label.trim() || 'Akun', createdAt: now }
+  }
+
+  deleteAccount(id: string): void {
+    this.db.deleteAccount(id)
+    this.emitAccounts()
+  }
+
+  setAutoSwitch(on: boolean): void {
+    this.autoSwitch = on
+    this.db.setSetting('autoSwitch', on ? '1' : '0')
+    this.emitAccounts()
+  }
+
+  // GroveHost.getAccountToken
+  getAccountToken(accountId?: string): string | null {
+    return accountId ? this.db.getAccountToken(accountId) : null
+  }
+
+  /** Set akun sebuah session (null = login default); berlaku pada start/resume berikutnya. */
+  setSessionAccount(sessionId: string, accountId: string | null): void {
+    const s = this.sessions.get(sessionId)
+    if (!s) throw new Error(`Session ${sessionId} tidak ditemukan`)
+    s.meta.accountId = accountId ?? undefined
+    s.meta.updatedAt = Date.now()
+    this.db.upsertSession(s.meta)
+    this.emit({ channel: 'session:update', payload: { id: sessionId, accountId: s.meta.accountId } })
+    s.applyAccountChange() // kalau sedang jalan → henti; pesan berikutnya resume dgn token baru
+  }
+
+  /** GroveHost.onLimitHit — auto-switch akun bila aktif & ada akun lain, lalu lanjutkan. */
+  onLimitHit(sessionId: string): void {
+    if (!this.autoSwitch) return
+    const s = this.sessions.get(sessionId)
+    if (!s) return
+    const accts = this.db.getAccounts()
+    if (accts.length < 2) return // butuh ≥2 akun untuk rotasi
+    const curIdx = accts.findIndex((a) => a.id === s.meta.accountId)
+    const next = accts[(curIdx + 1) % accts.length]
+    if (!next || next.id === s.meta.accountId) return
+    this.setSessionAccount(sessionId, next.id)
+    s.injectAutoTask(
+      `[GROVE] Akun sebelumnya kena limit — sudah dipindah ke akun "${next.label}". Lanjutkan pekerjaan sebelumnya.`
+    )
   }
 
   private newMeta(p: {

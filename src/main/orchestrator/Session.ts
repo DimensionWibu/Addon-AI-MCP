@@ -143,6 +143,11 @@ function extractResultText(content: unknown): string {
   return content == null ? '' : JSON.stringify(content)
 }
 
+/** Apakah error menandakan batas pemakaian/rate-limit (pemicu auto-switch akun). */
+function isLimitError(raw: string): boolean {
+  return /rate_limit|429|usage|quota|exceed|limit reached|out of/i.test(raw)
+}
+
 /** Ubah error/subtype mentah jadi pesan ramah + apakah masih bisa dilanjut. */
 function friendlyError(raw: string): string {
   const s = raw.toLowerCase()
@@ -232,6 +237,7 @@ export class Session {
     }
     this.started = true
     const server = buildGroveServer(this.meta.id, this.host)
+    const token = this.host.getAccountToken(this.meta.accountId) // akun per-session (opsional)
     this.q = query({
       prompt: this.inbox,
       options: {
@@ -242,6 +248,8 @@ export class Session {
         allowDangerouslySkipPermissions: true,
         systemPrompt: { type: 'preset', preset: 'claude_code', append: groveAppend(this.meta.role) },
         mcpServers: { grove: server },
+        // Token akun → CLI subprocess pakai akun itu. Wajib spread process.env (opsi env MENGGANTInya).
+        ...(token ? { env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: token } as Record<string, string> } : {}),
         resume: this.meta.sdkSessionId // lanjut konteks bila session dimuat ulang dari DB
       }
     })
@@ -365,6 +373,7 @@ export class Session {
 
   private async consume(): Promise<void> {
     if (!this.q) return
+    let limitHit = false
     try {
       for await (const msg of this.q) {
         this.handle(msg as Record<string, unknown> & { type: string })
@@ -378,6 +387,7 @@ export class Session {
           ts: Date.now()
         })
         this.setStatus('error')
+        if (isLimitError(String(e))) limitHit = true
       }
     } finally {
       // Query mati (error/blokir/selesai). Bila bukan karena stop manual, izinkan
@@ -387,7 +397,28 @@ export class Session {
         this.q = null
         if (this.meta.status === 'running') this.setStatus('idle')
       }
+      // Setelah state di-reset: bila kena limit, minta orkestrator auto-switch akun (bila aktif).
+      if (limitHit && !this.stopped) this.host.onLimitHit(this.meta.id)
     }
+  }
+
+  /**
+   * Ganti akun berlaku efektif: token dibaca saat start(). Kalau session sedang jalan,
+   * hentikan query lama (konteks/sdkSessionId dipertahankan) → pesan berikutnya resume
+   * dengan token akun baru. Kalau sudah dormant, tak perlu apa-apa (start berikutnya sudah pakai baru).
+   */
+  applyAccountChange(): void {
+    if (!this.started) return
+    this.started = false
+    const q = this.q
+    this.q = null
+    try {
+      void q?.interrupt?.()
+    } catch {
+      /* abaikan */
+    }
+    this.setStatus('idle')
+    this.emitActivity('idle')
   }
 
   /** Interupsi turn yang sedang berjalan TANPA menutup session (masih bisa lanjut chat). */

@@ -4,7 +4,7 @@
 import initSqlJs, { type Database } from 'sql.js'
 import { readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import type { BoardEntry, ChatMessage, InboxMessage, Memory, SessionMeta, TodoItem } from '../../shared/types'
+import type { Account, BoardEntry, ChatMessage, InboxMessage, Memory, SessionMeta, TodoItem } from '../../shared/types'
 
 const require = createRequire(import.meta.url)
 
@@ -55,6 +55,16 @@ CREATE TABLE IF NOT EXISTS memories (
   content TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS accounts (
+  id TEXT PRIMARY KEY,
+  label TEXT NOT NULL,
+  token TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 `
 
 export class Board {
@@ -83,7 +93,8 @@ export class Board {
     for (const sql of [
       `ALTER TABLE board ADD COLUMN percent INTEGER`,
       `ALTER TABLE sessions ADD COLUMN order_index INTEGER`,
-      `ALTER TABLE chat_messages ADD COLUMN detail TEXT`
+      `ALTER TABLE chat_messages ADD COLUMN detail TEXT`,
+      `ALTER TABLE sessions ADD COLUMN account_id TEXT`
     ]) {
       try {
         this.db.run(sql)
@@ -141,16 +152,17 @@ export class Board {
     this.run(
       `INSERT INTO sessions
         (id, sdk_session_id, tree_id, parent_id, role, title, cwd, model, status,
-         ctx_input, ctx_output, ctx_window, order_index, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ctx_input, ctx_output, ctx_window, order_index, account_id, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(id) DO UPDATE SET
          sdk_session_id=excluded.sdk_session_id, title=excluded.title, model=excluded.model,
          status=excluded.status, ctx_input=excluded.ctx_input, ctx_output=excluded.ctx_output,
-         ctx_window=excluded.ctx_window, order_index=excluded.order_index, updated_at=excluded.updated_at`,
+         ctx_window=excluded.ctx_window, order_index=excluded.order_index,
+         account_id=excluded.account_id, updated_at=excluded.updated_at`,
       [
         m.id, m.sdkSessionId ?? null, m.treeId, m.parentId, m.role, m.title, m.cwd,
         m.model ?? null, m.status, m.ctxInput, m.ctxOutput, m.ctxWindow,
-        m.orderIndex ?? null, m.createdAt, m.updatedAt
+        m.orderIndex ?? null, m.accountId ?? null, m.createdAt, m.updatedAt
       ]
     )
     this.run(
@@ -190,6 +202,38 @@ export class Board {
       content: String(r.content),
       createdAt: Number(r.created_at)
     }))
+  }
+
+  // ---- accounts (token TIDAK diekspos ke UI) & settings --------------------
+
+  addAccount(id: string, label: string, token: string, ts: number): void {
+    this.run(`INSERT INTO accounts (id, label, token, created_at) VALUES (?,?,?,?)`, [id, label, token, ts])
+  }
+  deleteAccount(id: string): void {
+    this.run(`DELETE FROM accounts WHERE id=?`, [id])
+  }
+  /** Daftar akun TANPA token (aman dikirim ke renderer). */
+  getAccounts(): Account[] {
+    return this.all(`SELECT id, label, created_at FROM accounts ORDER BY created_at ASC`).map((r) => ({
+      id: String(r.id),
+      label: String(r.label),
+      createdAt: Number(r.created_at)
+    }))
+  }
+  /** Token satu akun — hanya dipakai di main-process (inject ke query env). */
+  getAccountToken(id: string): string | null {
+    const r = this.all(`SELECT token FROM accounts WHERE id=?`, [id])[0]
+    return r ? String(r.token) : null
+  }
+
+  getSetting(key: string): string | null {
+    const r = this.all(`SELECT value FROM settings WHERE key=?`, [key])[0]
+    return r ? String(r.value) : null
+  }
+  setSetting(key: string, value: string): void {
+    this.run(`INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, [
+      key, value
+    ])
   }
 
   setTitle(id: string, title: string, ts: number): void {
@@ -303,6 +347,7 @@ function rowToSession(r: Record<string, unknown>): SessionMeta {
     ctxOutput: Number(r.ctx_output) || 0,
     ctxWindow: Number(r.ctx_window) || 200000,
     orderIndex: r.order_index == null ? undefined : Number(r.order_index),
+    accountId: r.account_id == null ? undefined : String(r.account_id),
     createdAt: Number(r.created_at),
     updatedAt: Number(r.updated_at)
   }

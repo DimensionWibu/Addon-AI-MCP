@@ -45,6 +45,16 @@ export function registerIpc(manager: SessionManager): void {
     manager.setLoop(id, enabled)
   )
 
+  ipcMain.handle('grove:listAccounts', () => manager.listAccounts())
+  ipcMain.handle('grove:addAccount', (_e, { label, token }: { label: string; token: string }) =>
+    manager.addAccount(label, token)
+  )
+  ipcMain.handle('grove:deleteAccount', (_e, { id }: { id: string }) => manager.deleteAccount(id))
+  ipcMain.handle('grove:setSessionAccount', (_e, { id, accountId }: { id: string; accountId: string | null }) =>
+    manager.setSessionAccount(id, accountId)
+  )
+  ipcMain.handle('grove:setAutoSwitch', (_e, { on }: { on: boolean }) => manager.setAutoSwitch(on))
+
   ipcMain.handle('grove:interruptSession', (_e, { id }: { id: string }) => manager.interruptSession(id))
 
   ipcMain.handle('grove:deleteSession', (_e, { id }: { id: string }) => manager.deleteSession(id))

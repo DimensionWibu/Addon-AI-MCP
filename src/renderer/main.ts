@@ -1,4 +1,5 @@
 import type {
+  Account,
   BoardEntry,
   ChatMessage,
   GroveEvent,
@@ -32,6 +33,8 @@ function fmtDuration(ms: number): string {
 const nodes = new Map<string, Node>()
 const board = new Map<string, BoardEntry>()
 const memories: Memory[] = [] // hasil compact per pohon
+let accounts: Account[] = [] // akun Claude tersimpan (tanpa token)
+let autoSwitch = false // pindah akun otomatis saat limit
 let activeId: string | null = null
 let pendingEl: HTMLElement | null = null
 let pendingText = '' // target teks penuh yang terkumpul
@@ -762,6 +765,79 @@ function renderMemories(): void {
   }
 }
 
+/** Panel kelola akun: auto-switch, daftar akun, tambah (token setup-token), akun sesi aktif. */
+function renderAccountsPanel(): void {
+  const panel = $('acct-panel')
+  panel.textContent = ''
+  panel.append(el('div', { class: 'ap-title' }, 'AKUN CLAUDE'))
+
+  const cb = document.createElement('input')
+  cb.type = 'checkbox'
+  cb.checked = autoSwitch
+  cb.addEventListener('change', () => void window.grove.setAutoSwitch(cb.checked).catch(() => {}))
+  panel.append(el('label', { class: 'ap-toggle' }, cb, el('span', {}, ' Auto-switch akun saat kena limit')))
+
+  panel.append(el('div', { class: 'ap-head' }, 'Tersimpan'))
+  if (!accounts.length) {
+    panel.append(el('div', { class: 'ap-empty' }, 'Belum ada akun.'))
+  } else {
+    for (const a of accounts) {
+      const del = el('button', { class: 'ap-del', title: 'Hapus akun' }, '×')
+      del.addEventListener('click', () => {
+        if (confirm(`Hapus akun "${a.label}"?`)) void window.grove.deleteAccount(a.id).catch((e) => alert(String(e)))
+      })
+      panel.append(el('div', { class: 'ap-item' }, el('span', { class: 'ap-label' }, a.label), del))
+    }
+  }
+
+  panel.append(el('div', { class: 'ap-head' }, 'Tambah akun'))
+  const label = document.createElement('input')
+  label.className = 'ap-input'
+  label.placeholder = 'Label (mis. Kantor Max20)'
+  const token = document.createElement('textarea')
+  token.className = 'ap-input ap-token'
+  token.placeholder = 'Token dari `claude setup-token`'
+  token.rows = 2
+  const add = el('button', { class: 'ap-add' }, '+ Tambah akun')
+  add.addEventListener('click', () => {
+    const l = label.value.trim()
+    const t = token.value.trim()
+    if (!l || !t) return alert('Isi label & token dulu.')
+    void window.grove
+      .addAccount(l, t)
+      .then(() => {
+        label.value = ''
+        token.value = ''
+      })
+      .catch((e) => alert(`Gagal tambah: ${String(e)}`))
+  })
+  panel.append(label, token, add)
+
+  const node = activeId ? nodes.get(activeId) : null
+  if (node) {
+    panel.append(el('div', { class: 'ap-head' }, `Sesi aktif: ${node.title}`))
+    const sel = document.createElement('select')
+    sel.className = 'ap-input'
+    const def = document.createElement('option')
+    def.value = ''
+    def.textContent = 'Default (login utama)'
+    sel.append(def)
+    for (const a of accounts) {
+      const o = document.createElement('option')
+      o.value = a.id
+      o.textContent = a.label
+      sel.append(o)
+    }
+    sel.value = node.accountId ?? ''
+    sel.addEventListener('change', () => {
+      void window.grove
+        .setSessionAccount(node.id, sel.value || null)
+        .catch((e) => alert(`Gagal ganti akun: ${String(e)}`))
+    })
+    panel.append(el('div', { class: 'ap-row' }, el('span', {}, 'Akun sesi: '), sel))
+  }
+}
+
 // ---- events ----------------------------------------------------------------
 
 function onEvent(ev: GroveEvent): void {
@@ -835,6 +911,12 @@ function onEvent(ev: GroveEvent): void {
       memories.push(ev.payload)
       const tree = activeId ? nodes.get(activeId)?.treeId : null
       if (ev.payload.treeId === tree) renderMemories()
+      break
+    }
+    case 'accounts:update': {
+      accounts = ev.payload.accounts
+      autoSwitch = ev.payload.autoSwitch
+      if ($('acct-panel').classList.contains('show')) renderAccountsPanel()
       break
     }
     case 'session:activity': {
@@ -969,7 +1051,17 @@ async function init(): Promise<void> {
     e.stopPropagation()
     $('usage-panel').classList.toggle('show')
   })
-  document.addEventListener('click', () => $('usage-panel').classList.remove('show'))
+  document.addEventListener('click', () => {
+    $('usage-panel').classList.remove('show')
+    $('acct-panel').classList.remove('show')
+  })
+
+  $('btn-accounts').addEventListener('click', (e) => {
+    e.stopPropagation()
+    const p = $('acct-panel')
+    if (p.classList.toggle('show')) renderAccountsPanel()
+  })
+  $('acct-panel').addEventListener('click', (e) => e.stopPropagation()) // klik di dalam panel jangan menutup
 
   // Drag-reorder sidebar (dengar global agar terus terlacak walau kursor keluar node).
   document.addEventListener('pointermove', onDragMove)
@@ -1083,6 +1175,13 @@ async function init(): Promise<void> {
 
   window.grove.onEvent(onEvent)
   void window.grove.getUsage().then(renderUsage).catch(() => {})
+  void window.grove
+    .listAccounts()
+    .then((r) => {
+      accounts = r.accounts
+      autoSwitch = r.autoSwitch
+    })
+    .catch(() => {})
 
   const snap = await window.grove.getSnapshot()
   const flatten = (n: TreeNode): void => {

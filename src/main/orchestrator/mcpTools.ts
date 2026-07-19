@@ -23,6 +23,10 @@ export interface GroveHost {
   listWorkers(sessionId: string): { id: string; title: string; role: string; status: string }[]
   /** Dipanggil Session saat satu turn selesai — dipakai membangunkan root untuk lapor ke user. */
   notifyTurnEnd(sessionId: string): void
+  /** Token akun untuk di-inject ke query (null → pakai login default). */
+  getAccountToken(accountId?: string): string | null
+  /** Dipanggil Session saat turn gagal karena limit — untuk auto-switch akun bila aktif. */
+  onLimitHit(sessionId: string): void
 }
 
 const ok = (text: string) => ({ content: [{ type: 'text' as const, text }] })

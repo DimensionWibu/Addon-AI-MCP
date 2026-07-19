@@ -45,6 +45,32 @@ button, input { font-family: var(--mono); }
   cursor: pointer; font-family: var(--mono); letter-spacing: .3px;
 }
 .stop-all-btn:hover { background: rgba(224, 108, 108, .16); }
+.acct-btn {
+  margin-left: 12px; align-self: center; background: transparent; color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 3px; padding: 3px 10px; font-size: 11px;
+  cursor: pointer; font-family: var(--mono);
+}
+.acct-btn:hover { border-color: var(--accent); color: var(--accent); }
+.acct-panel {
+  position: absolute; top: 46px; right: 12px; z-index: 60; width: 320px;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+  padding: 12px 14px; display: none; box-shadow: 0 10px 30px rgba(0, 0, 0, .55);
+}
+.acct-panel.show { display: block; }
+.ap-title { font-weight: 700; color: #e6e2d6; margin-bottom: 10px; font-size: 12px; letter-spacing: .5px; }
+.ap-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text); cursor: pointer; margin-bottom: 6px; }
+.ap-head { color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: .5px; margin: 12px 0 5px; }
+.ap-empty { color: var(--text-dim); font-size: 11px; }
+.ap-item { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+.ap-label { flex: 1; color: var(--text); font-size: 12px; }
+.ap-del { background: transparent; color: var(--err); border: 1px solid var(--err); border-radius: 3px; cursor: pointer; font-size: 11px; padding: 0 7px; }
+.ap-del:hover { background: rgba(224, 108, 108, .15); }
+.ap-input { width: 100%; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 3px; padding: 5px 7px; font-size: 12px; font-family: var(--mono); margin-bottom: 6px; }
+.ap-token { resize: vertical; word-break: break-all; }
+.ap-add { width: 100%; background: var(--accent); color: #1a0e08; border: none; border-radius: 3px; padding: 6px; font-size: 12px; font-weight: 700; cursor: pointer; }
+.ap-add:hover { background: var(--accent-2); }
+.ap-row { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text); }
+.ap-row select { flex: 1; }
 .usage { margin-left: auto; display: flex; align-items: center; gap: 12px; font-size: 11px; cursor: pointer; }
 .usage.stale { opacity: .5; } /* nilai last-good saat refresh gagal (token mungkin sedang refresh) */
 .ubar-mini { display: flex; align-items: center; gap: 5px; }
