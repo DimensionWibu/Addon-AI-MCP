@@ -501,7 +501,39 @@ function confirmDelete(id: string): void {
   const kids = countDescendants(id)
   const extra = kids ? ` beserta ${kids} sub-session` : ''
   if (!confirm(`Hapus session "${n?.title ?? id}"${extra}?`)) return
-  window.grove.deleteSession(id).catch((err) => alert(`Gagal hapus: ${String(err)}`))
+  // Terapkan segera dari id yang dikembalikan (jangan tunggu event) → tutup race "target basi".
+  window.grove
+    .deleteSession(id)
+    .then(applyRemoved)
+    .catch((err) => alert(`Gagal hapus: ${String(err)}`))
+}
+
+/** Bersihkan sesi yang dihapus dari state; bila sesi AKTIF ikut terhapus, pindah ke sesi lain. */
+function applyRemoved(ids: string[]): void {
+  let activeRemoved = false
+  for (const id of ids) {
+    nodes.delete(id)
+    board.delete(id)
+    nodeEls.delete(id)
+    activities.delete(id)
+    lastActive.delete(id)
+    if (id === activeId) activeRemoved = true
+  }
+  renderTree()
+  scheduleBoard()
+  if (!activeRemoved) return
+  activeId = null
+  const next = [...nodes.values()].sort(orderCmp)[0] // auto-pilih sesi tersisa biar bisa lanjut chat
+  if (next) {
+    void selectSession(next.id)
+  } else {
+    pendingEl = null
+    pendingText = ''
+    $('chat-log').textContent = ''
+    toolDetailEls.clear()
+    renderMemories()
+    updateChatHeader()
+  }
 }
 
 // ---- chat ------------------------------------------------------------------
@@ -817,24 +849,7 @@ function onEvent(ev: GroveEvent): void {
       break
     }
     case 'session:removed': {
-      let activeRemoved = false
-      for (const id of ev.payload.ids) {
-        nodes.delete(id)
-        board.delete(id)
-        nodeEls.delete(id)
-        activities.delete(id)
-        if (id === activeId) activeRemoved = true
-      }
-      if (activeRemoved) {
-        activeId = null
-        pendingEl = null
-        pendingText = ''
-        $('chat-log').textContent = ''
-        toolDetailEls.clear()
-        updateChatHeader()
-      }
-      renderTree()
-      scheduleBoard()
+      applyRemoved(ev.payload.ids) // idempoten dgn confirmDelete; tangani hapus dari sumber lain
       break
     }
   }
@@ -975,23 +990,31 @@ async function init(): Promise<void> {
     const refBlock = refs.length
       ? `Referensi (baca file/folder ini untuk konteks):\n${refs.map((p) => `- ${p}`).join('\n')}\n\n`
       : ''
+    const freshChat = async (): Promise<string> => {
+      const meta = await window.grove.newChat()
+      ensureNode(meta)
+      activeId = meta.id // set aktif langsung (tanpa await getChat) supaya kirim tidak terhambat
+      $('chat-log').textContent = ''
+      toolDetailEls.clear()
+      pendingEl = null
+      pendingText = ''
+      updateChatHeader()
+      updateActiveHighlight()
+      return meta.id
+    }
     try {
       // Target = session aktif yang MASIH ADA. Bila null/stale (mis. baru dihapus) → buat baru.
-      let targetId = activeId
-      if (!targetId || !nodes.has(targetId)) {
-        const meta = await window.grove.newChat()
-        targetId = meta.id
-        ensureNode(meta)
-        // set aktif langsung (tanpa await getChat) supaya kirim tidak terhambat
-        activeId = meta.id
-        $('chat-log').textContent = ''
-        toolDetailEls.clear()
-        pendingEl = null
-        pendingText = ''
-        updateChatHeader()
-        updateActiveHighlight()
+      const targetId = activeId && nodes.has(activeId) ? activeId : await freshChat()
+      try {
+        await window.grove.sendChat(targetId, refBlock + text, images)
+      } catch (err) {
+        // Sesi target ternyata sudah tak ada (race dgn hapus) → buat chat baru & kirim ulang sekali.
+        if (String(err).includes('tidak ditemukan')) {
+          await window.grove.sendChat(await freshChat(), refBlock + text, images)
+        } else {
+          throw err
+        }
       }
-      await window.grove.sendChat(targetId, refBlock + text, images)
     } catch (err) {
       const m: ChatMessage = { role: 'system', text: `⚠️ Gagal kirim: ${String(err)}`, ts: Date.now() }
       appendChatMessage(m)
