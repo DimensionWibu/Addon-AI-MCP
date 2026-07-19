@@ -1,0 +1,20 @@
+# deps & build output
+node_modules/
+out/
+dist/
+release/
+
+# logs & temp
+*.log
+.tmp*/
+.tmptest/
+.tmpiso/
+.tmprepro/
+
+# env & secrets
+.env
+.env.*
+
+# OS
+Thumbs.db
+.DS_Store

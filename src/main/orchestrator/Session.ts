@@ -1,0 +1,541 @@
+// Satu Session = satu query() SDK berumur panjang (streaming input multi-turn).
+// Bertanggung jawab: kirim pesan user, streaming output ke UI, hitung token/context,
+// simpan riwayat chat, update status di DB.
+
+import { query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
+import type {
+  ChatMessage,
+  GroveEvent,
+  ImageAttachment,
+  SessionMeta,
+  SessionRole,
+  SessionStatus
+} from '../../shared/types'
+import type { Board } from './db'
+import { buildGroveServer, type GroveHost } from './mcpTools'
+import { contextPercent, contextWindowFor } from './contextWindows'
+
+// Bagian prompt yang SAMA untuk root & sub: cara melapor ke papan tulis + koordinasi.
+const GROVE_COMMON = `
+--- GROVE MULTI-AGENT PROTOCOL ---
+You run inside "Grove", a multi-agent orchestrator GUI. Keep the dashboard live and coordinate through the shared board:
+- EARLY (once you understand the request) call mcp__grove__set_title with a concise 3-6 word title for this session.
+- mcp__grove__update_summary — a 1-3 sentence summary of your goal + current result. Call it early.
+- mcp__grove__update_todo — maintain your task checklist.
+- mcp__grove__report_progress — one sentence on what you are doing RIGHT NOW; call it whenever you switch activity.
+- mcp__grove__read_board — read-only awareness of what sessions are doing (scope "tree" = your tree only; "all" = every tree, read-only — you must NEVER act on another tree's task).
+- mcp__grove__send_message — leave a coordination note; ISOLATED to your OWN tree only (you cannot message another root/UTAMA or its workers). It is only a note, not a task.
+- mcp__grove__list_workers — list the sessions in YOUR tree.
+ISOLATION: every action you take (messages, progress reports, spawning, assigning) stays inside YOUR OWN tree; you can never send work or notes into another root/UTAMA tree or its sub-workers.
+`.trim()
+
+// Root (UTAMA) = orchestrator. Tugasnya MENDISTRIBUSI, bukan mengeksekusi sendiri.
+const GROVE_ROOT = `
+YOUR ROLE: you are the ROOT orchestrator of this tree (shown as "UTAMA" in the UI). Your job is to COORDINATE and DISTRIBUTE the work — NOT to do the heavy lifting yourself.
+- Decompose the user's request into self-contained sub-tasks and DELEGATE each one to a sub-worker. Do NOT personally read many files, run the deep analysis, or write the large fixes — hand that to workers. Stay light so you can distribute, monitor, and synthesize.
+- REUSE workers before creating new ones. FIRST call mcp__grove__list_workers. If a worker is idle, give it the next task with mcp__grove__assign_worker (it keeps its full prior context and is cheaper). Only call mcp__grove__spawn_worker when there is no suitable idle worker, or you genuinely need more parallelism at once.
+- Each task you hand off must be clear and self-contained; you may share full context with your own workers.
+- After delegating, monitor with mcp__grove__read_board / mcp__grove__read_messages, then synthesize the workers' results into the final answer for the user.
+- PROGRESS TO THE USER: workers report their percent as they go, and you will be AUTO-PINGED with a "[GROVE AUTO]" message whenever they report. When that happens, call mcp__grove__read_board (scope "tree") + mcp__grove__list_workers and send the USER one short line saying how far along things are — each worker's percent/state, what is done, what is still running. When all workers reach 100%, send the final synthesized answer instead. Keep these updates brief; do not repeat unchanged status.
+- Only exception: a trivial one-off question you can just answer directly — no workers needed.
+`.trim()
+
+// Sub = pekerja. Kerjakan tugasnya sampai tuntas; boleh terima tugas baru lagi (konteks tersimpan).
+const GROVE_SUB = `
+YOUR ROLE: you are a SUB-WORKER. Focus on completing the specific task you were assigned, thoroughly and directly, then report the result.
+- Do the work yourself. Only spawn your OWN sub-workers with mcp__grove__spawn_worker if your task is itself genuinely parallelizable; otherwise just do it.
+- REPORT PROGRESS UP so the user can see how far along you are: call mcp__grove__report_to_parent with a one-line status AND a rough percent at meaningful milestones (roughly every 25%) and again with percent 100 when you finish. Keep mcp__grove__report_progress (with percent) updated too for the live board.
+- When finished, put the outcome in mcp__grove__update_summary. You may be handed a NEW task later on this same session — your prior context is kept, so build on it.
+`.trim()
+
+function groveAppend(role: SessionRole): string {
+  return `${GROVE_COMMON}\n\n${role === 'root' ? GROVE_ROOT : GROVE_SUB}`
+}
+
+/** Potong string 1-baris agar rapi di daftar chat. */
+function short(v: unknown, max = 140): string {
+  if (v == null) return ''
+  const t = (typeof v === 'string' ? v : JSON.stringify(v)).replace(/\s+/g, ' ').trim()
+  return t.length > max ? t.slice(0, max - 1) + '…' : t
+}
+
+/**
+ * Ringkas satu tool_use jadi baris informatif untuk chat, mis:
+ *   → Read src/main/orchestrator/Session.ts
+ *   → Grep "spawnWorker" (*.ts)
+ *   → grove:report_progress Membaca prefs engine…
+ * Supaya user tahu persis session lagi ngapain, bukan cuma nama tool.
+ */
+function summarizeTool(name = 'tool', input?: Record<string, unknown>): string {
+  const i = input ?? {}
+  const label = name.startsWith('mcp__grove__') ? `grove:${name.slice('mcp__grove__'.length)}` : name
+  let detail = ''
+  switch (name) {
+    case 'Read':
+    case 'Edit':
+    case 'Write':
+    case 'MultiEdit':
+    case 'NotebookEdit':
+      detail = short(i.file_path ?? i.path ?? i.notebook_path)
+      break
+    case 'Grep':
+      detail = short(i.pattern) + (i.glob ? ` (${short(i.glob, 40)})` : i.path ? ` in ${short(i.path, 60)}` : '')
+      break
+    case 'Glob':
+      detail = short(i.pattern) + (i.path ? ` in ${short(i.path, 60)}` : '')
+      break
+    case 'Bash':
+      detail = short(i.command, 160)
+      break
+    case 'Task':
+    case 'Agent':
+      detail = short(i.description ?? i.subagent_type)
+      break
+    case 'WebFetch':
+    case 'WebSearch':
+      detail = short(i.url ?? i.query)
+      break
+    default:
+      if (name.startsWith('mcp__grove__')) {
+        // Untuk tool Grove, tampilkan field paling informatif (progress/summary/title/…).
+        detail = short(
+          i.progress ?? i.summary ?? i.title ?? i.task ?? i.body ?? i.worker_id ?? i.scope ?? ''
+        )
+      } else {
+        detail = short(i.file_path ?? i.path ?? i.command ?? i.pattern ?? i.query ?? i.description ?? '')
+      }
+  }
+  return detail ? `→ ${label} ${detail}` : `→ ${label}`
+}
+
+/** Potong string panjang dengan penanda. */
+function clip(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max) + `\n… (${s.length - max} char dipotong)` : s
+}
+
+/** Input tool lengkap, dirapikan untuk panel expand (string multi-baris tetap apa adanya). */
+function formatToolInput(input?: Record<string, unknown>): string {
+  const entries = Object.entries(input ?? {})
+  if (!entries.length) return '(tanpa argumen)'
+  return entries
+    .map(([k, v]) => {
+      if (typeof v === 'string') return v.includes('\n') ? `${k}:\n${clip(v, 6000)}` : `${k}: ${clip(v, 2000)}`
+      return `${k}: ${clip(JSON.stringify(v), 2000)}`
+    })
+    .join('\n')
+}
+
+/** Ambil teks dari content tool_result (string, array blok teks/gambar, atau objek). */
+function extractResultText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .map((c) => {
+        if (typeof c === 'string') return c
+        const o = c as { type?: string; text?: string }
+        if (o?.type === 'text') return o.text ?? ''
+        if (o?.type === 'image') return '[image]'
+        return JSON.stringify(c)
+      })
+      .join('\n')
+  }
+  return content == null ? '' : JSON.stringify(content)
+}
+
+/** Ubah error/subtype mentah jadi pesan ramah + apakah masih bisa dilanjut. */
+function friendlyError(raw: string): string {
+  const s = raw.toLowerCase()
+  if (s.includes('rate_limit') || s.includes('429'))
+    return 'Kena rate limit. Tunggu sebentar, lalu kirim pesan lagi.'
+  if (s.includes('overloaded') || s.includes('529'))
+    return 'Server Claude sedang overload. Coba kirim lagi sebentar lagi.'
+  if (s.includes('roles must alternate'))
+    return 'Urutan pesan sempat tak sinkron. Kirim pesan lagi — akan disusun ulang & lanjut.'
+  if (s.includes('authentication') || s.includes('401'))
+    return 'Autentikasi bermasalah. Pastikan Claude Code masih login (jalankan `claude` sekali).'
+  if (s.includes('permission') || s.includes('403'))
+    return 'Akses ditolak (model/fitur tidak tersedia untuk akunmu). Coba ganti model.'
+  if (s.includes('refus'))
+    return 'Claude menolak permintaan ini (kebijakan konten). Ubah/rephrase lalu kirim lagi.'
+  if (s.includes('max_turns')) return 'Turn mencapai batas maksimum langkah.'
+  if (s.includes('budget')) return 'Batas biaya turn tercapai.'
+  if (s.includes('invalid_request')) return 'Request tidak valid. Kirim pesan lagi.'
+  return `Error: ${raw}`
+}
+
+/** Antrian async untuk streaming input: user mengetik → dorong ke query yang sedang jalan. */
+class AsyncMessageQueue implements AsyncIterable<SDKUserMessage> {
+  private queue: SDKUserMessage[] = []
+  private resolvers: ((r: IteratorResult<SDKUserMessage>) => void)[] = []
+  private closed = false
+
+  push(content: string | unknown[]): void {
+    const msg: SDKUserMessage = {
+      type: 'user',
+      message: { role: 'user', content: content as never },
+      parent_tool_use_id: null
+    }
+    const r = this.resolvers.shift()
+    if (r) r({ value: msg, done: false })
+    else this.queue.push(msg)
+  }
+
+  close(): void {
+    this.closed = true
+    let r
+    while ((r = this.resolvers.shift())) r({ value: undefined as never, done: true })
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
+    return {
+      next: (): Promise<IteratorResult<SDKUserMessage>> => {
+        const item = this.queue.shift()
+        if (item) return Promise.resolve({ value: item, done: false })
+        if (this.closed) return Promise.resolve({ value: undefined as never, done: true })
+        return new Promise((resolve) => this.resolvers.push(resolve))
+      }
+    }
+  }
+}
+
+export class Session {
+  readonly meta: SessionMeta
+  private readonly inbox = new AsyncMessageQueue()
+  private readonly history: ChatMessage[] = []
+  private q: ReturnType<typeof query> | null = null
+  private stopped = false
+  private started = false
+  private tokensTotal = 0 // token output kumulatif (ala counter CLI)
+  private toolRows = new Map<string, { rowId: number; input: string }>() // tool_use_id → baris + input
+  private pendingCompactSeed: string | null = null // ringkasan compact, dieksekusi saat turn selesai
+  private reseedText: string | null = null // disisipkan ke pesan berikutnya setelah konteks dipadatkan
+
+  constructor(
+    meta: SessionMeta,
+    private readonly db: Board,
+    private readonly host: GroveHost,
+    private readonly emit: (ev: GroveEvent) => void
+  ) {
+    this.meta = meta
+  }
+
+  getHistory(): ChatMessage[] {
+    return this.history
+  }
+
+  /** Mulai query berumur panjang (lazy). Bila meta.sdkSessionId ada → resume (lanjut konteks). */
+  start(initialTask?: string): void {
+    if (this.started) {
+      if (initialTask) this.sendUserMessage(initialTask)
+      return
+    }
+    this.started = true
+    const server = buildGroveServer(this.meta.id, this.host)
+    this.q = query({
+      prompt: this.inbox,
+      options: {
+        model: this.meta.model,
+        cwd: this.meta.cwd,
+        includePartialMessages: true,
+        permissionMode: 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
+        systemPrompt: { type: 'preset', preset: 'claude_code', append: groveAppend(this.meta.role) },
+        mcpServers: { grove: server },
+        resume: this.meta.sdkSessionId // lanjut konteks bila session dimuat ulang dari DB
+      }
+    })
+    if (initialTask) this.sendUserMessage(initialTask)
+    void this.consume()
+  }
+
+  /** Tandai untuk compact: konteks dipadatkan saat turn berjalan selesai (dari tool save_compaction). */
+  scheduleCompact(summary: string): void {
+    this.pendingCompactSeed = summary
+  }
+
+  /**
+   * Padatkan konteks: lepas sesi SDK lama (drop resume) & siapkan ringkasan untuk disisipkan
+   * ke pesan berikutnya. Dipanggil di akhir turn agar tidak memutus turn yang berjalan.
+   */
+  private doCompact(): void {
+    const summary = this.pendingCompactSeed
+    this.pendingCompactSeed = null
+    if (!summary) return
+    this.reseedText = summary
+    this.meta.sdkSessionId = undefined // start berikutnya FRESH (tanpa resume) → konteks lama dilepas
+    this.db.upsertSession(this.meta)
+    this.started = false
+    const q = this.q
+    this.q = null
+    try {
+      void q?.interrupt?.()
+    } catch {
+      /* abaikan */
+    }
+    this.record({
+      role: 'system',
+      text: '🗜️ Konteks dipadatkan (compact). Ringkasan disimpan ke Memori — pesan berikutnya melanjutkan dari ringkasan itu.',
+      ts: Date.now()
+    })
+    this.setStatus('idle')
+    this.emitActivity('idle')
+  }
+
+  /** Sisipkan ringkasan memori (sekali) di depan teks setelah compact, agar konteks nyambung. */
+  private withReseed(text: string): string {
+    if (!this.reseedText) return text
+    const seed = this.reseedText
+    this.reseedText = null
+    return `[MEMORI TERKOMPAK — ringkasan konteks sebelumnya]\n${seed}\n\n---\n${text}`
+  }
+
+  /** Kirim pesan user (opsional dengan gambar); start otomatis bila dormant. */
+  sendUserMessage(text: string, images?: ImageAttachment[]): void {
+    text = this.withReseed(text)
+    if (!this.started) this.start()
+    const dataUrls = (images ?? []).map((im) => `data:${im.mediaType};base64,${im.data}`)
+    this.record({ role: 'user', text, ts: Date.now(), images: dataUrls.length ? dataUrls : undefined })
+    this.setStatus('running')
+    this.emitActivity('berpikir…')
+    if (images?.length) {
+      const content: unknown[] = []
+      if (text) content.push({ type: 'text', text })
+      for (const im of images) {
+        content.push({ type: 'image', source: { type: 'base64', media_type: im.mediaType, data: im.data } })
+      }
+      this.inbox.push(content)
+    } else {
+      this.inbox.push(text)
+    }
+  }
+
+  /**
+   * Inject instruksi otomatis (mis. permintaan rangkuman progres dari worker) ke query.
+   * Masuk konteks SDK sebagai giliran user, TAPI tidak direkam ke chat/DB agar UI tetap bersih —
+   * yang tampil ke user cukup BALASAN root-nya. Start bila dormant (resume, konteks nyambung).
+   */
+  injectAutoTask(text: string): void {
+    if (this.stopped) return
+    text = this.withReseed(text)
+    if (!this.started) this.start()
+    this.setStatus('running')
+    this.emitActivity('menyusun update progres…')
+    this.inbox.push(text)
+  }
+
+  private emitActivity(activity: string): void {
+    this.emit({ channel: 'session:activity', payload: { id: this.meta.id, activity } })
+  }
+
+  /** Simpan ke riwayat in-memory + DB + kirim ke UI. Kembalikan rowid DB. (Gambar tak dipersist.) */
+  private record(m: ChatMessage): number {
+    this.history.push(m)
+    const dbText = m.text || (m.images?.length ? '🖼️ [gambar]' : '')
+    const rowId = this.db.addChatMessage(this.meta.id, m.role, dbText, m.ts, m.detail)
+    this.emit({ channel: 'chat:message', payload: { id: this.meta.id, message: m } })
+    return rowId
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true
+    this.inbox.close()
+    try {
+      await this.q?.interrupt?.()
+    } catch {
+      /* abaikan */
+    }
+    this.setStatus('done')
+  }
+
+  private setStatus(status: SessionStatus): void {
+    if (this.meta.status === status) return
+    this.meta.status = status
+    this.meta.updatedAt = Date.now()
+    this.db.upsertSession(this.meta)
+    this.emit({ channel: 'session:update', payload: { id: this.meta.id, status } })
+  }
+
+  private async consume(): Promise<void> {
+    if (!this.q) return
+    try {
+      for await (const msg of this.q) {
+        this.handle(msg as Record<string, unknown> & { type: string })
+      }
+    } catch (e) {
+      if (!this.stopped) {
+        console.error(`[Session ${this.meta.id}] error:`, e)
+        this.record({
+          role: 'system',
+          text: `⚠️ ${friendlyError(String(e))}  (session tetap bisa dilanjut — kirim pesan lagi)`,
+          ts: Date.now()
+        })
+        this.setStatus('error')
+      }
+    } finally {
+      // Query mati (error/blokir/selesai). Bila bukan karena stop manual, izinkan
+      // restart: pesan berikutnya akan start() ulang dengan resume → konteks nyambung.
+      if (!this.stopped) {
+        this.started = false
+        this.q = null
+        if (this.meta.status === 'running') this.setStatus('idle')
+      }
+    }
+  }
+
+  /** Interupsi turn yang sedang berjalan TANPA menutup session (masih bisa lanjut chat). */
+  async interruptTurn(): Promise<void> {
+    try {
+      await this.q?.interrupt?.()
+    } catch {
+      /* abaikan */
+    }
+    this.setStatus('idle')
+    this.emitActivity('idle')
+  }
+
+  private handle(msg: Record<string, unknown> & { type: string }): void {
+    switch (msg.type) {
+      case 'system': {
+        if (msg.subtype === 'init') {
+          const sid = msg.session_id as string
+          const model = msg.model as string | undefined
+          let changed = false
+          if (sid && this.meta.sdkSessionId !== sid) {
+            this.meta.sdkSessionId = sid
+            changed = true
+          }
+          // Model aktual baru diketahui saat init → set ctxWindow yang benar (mis. [1m] = 1jt).
+          if (model && this.meta.model !== model) {
+            this.meta.model = model
+            this.meta.ctxWindow = contextWindowFor(model)
+            changed = true
+          }
+          if (changed) {
+            this.meta.updatedAt = Date.now()
+            this.db.upsertSession(this.meta)
+            this.emit({
+              channel: 'session:update',
+              payload: {
+                id: this.meta.id,
+                sdkSessionId: this.meta.sdkSessionId,
+                model: this.meta.model,
+                ctxWindow: this.meta.ctxWindow,
+                ctxPercent: contextPercent(this.meta.ctxInput, this.meta.ctxWindow)
+              }
+            })
+          }
+          this.setStatus('running')
+        }
+        break
+      }
+      case 'stream_event': {
+        const ev = (
+          msg as {
+            event?: {
+              type?: string
+              delta?: { type?: string; text?: string }
+              content_block?: { type?: string; name?: string }
+            }
+          }
+        ).event
+        if (ev?.type === 'content_block_delta' && ev.delta?.type === 'text_delta' && ev.delta.text) {
+          this.emit({ channel: 'chat:delta', payload: { id: this.meta.id, delta: ev.delta.text } })
+        } else if (ev?.type === 'content_block_start' && ev.content_block?.type === 'tool_use') {
+          this.emitActivity(`🔧 ${ev.content_block.name ?? 'tool'}`)
+        }
+        break
+      }
+      case 'assistant': {
+        const message = (msg as { message?: { content?: unknown[]; usage?: Record<string, number> } }).message
+        this.applyUsage(message?.usage)
+        for (const block of (message?.content ?? []) as {
+          type: string
+          id?: string
+          text?: string
+          name?: string
+          input?: Record<string, unknown>
+        }[]) {
+          if (block.type === 'text' && block.text?.trim()) {
+            this.record({ role: 'assistant', text: block.text, ts: Date.now() })
+          } else if (block.type === 'tool_use') {
+            const input = formatToolInput(block.input)
+            const rowId = this.record({
+              role: 'tool',
+              text: summarizeTool(block.name, block.input),
+              ts: Date.now(),
+              detail: input,
+              toolUseId: block.id
+            })
+            if (block.id) this.toolRows.set(block.id, { rowId, input })
+          }
+        }
+        break
+      }
+      case 'user': {
+        // Pesan 'user' dari SDK membawa hasil tool (tool_result) → tempelkan ke baris tool-nya.
+        const content = (msg as { message?: { content?: unknown } }).message?.content
+        if (!Array.isArray(content)) break // content string biasa (bukan tool_result) → abaikan
+        for (const b of content as {
+          type?: string
+          tool_use_id?: string
+          content?: unknown
+          is_error?: boolean
+        }[]) {
+          if (b.type !== 'tool_result' || !b.tool_use_id) continue
+          const rec = this.toolRows.get(b.tool_use_id)
+          if (!rec) continue
+          const out = clip(extractResultText(b.content), 6000)
+          const merged = `${rec.input}\n\n--- OUTPUT${b.is_error ? ' (error)' : ''} ---\n${out}`
+          this.db.updateChatDetail(rec.rowId, merged)
+          this.emit({ channel: 'chat:detail', payload: { id: this.meta.id, toolUseId: b.tool_use_id, detail: merged } })
+          this.toolRows.delete(b.tool_use_id)
+        }
+        break
+      }
+      case 'result': {
+        const subtype = (msg as { subtype?: string }).subtype
+        if (subtype && subtype !== 'success') {
+          this.record({
+            role: 'system',
+            text: `⚠️ ${friendlyError(subtype)}  (session tetap bisa dilanjut — kirim pesan lagi)`,
+            ts: Date.now()
+          })
+        }
+        this.setStatus('idle') // menunggu input berikutnya
+        this.emitActivity('idle')
+        // Turn selesai → beri tahu orkestrator (root akan dibangunkan untuk lapor ke user).
+        this.host.notifyTurnEnd(this.meta.id)
+        // Bila ada permintaan compact tertunda, padatkan konteks sekarang (turn sudah selesai).
+        if (this.pendingCompactSeed) this.doCompact()
+        break
+      }
+      default:
+        break
+    }
+  }
+
+  private applyUsage(usage?: Record<string, number>): void {
+    if (!usage) return
+    const ctxInput =
+      (usage.input_tokens ?? 0) +
+      (usage.cache_read_input_tokens ?? 0) +
+      (usage.cache_creation_input_tokens ?? 0)
+    const ctxOutput = usage.output_tokens ?? 0
+    if (ctxInput <= 0 && ctxOutput <= 0) return
+    this.meta.ctxInput = ctxInput
+    this.meta.ctxOutput = ctxOutput
+    this.tokensTotal += ctxOutput
+    this.meta.updatedAt = Date.now()
+    this.db.upsertSession(this.meta)
+    this.emit({
+      channel: 'session:update',
+      payload: {
+        id: this.meta.id,
+        ctxInput,
+        ctxOutput,
+        ctxPercent: contextPercent(ctxInput, this.meta.ctxWindow),
+        tokensTotal: this.tokensTotal
+      }
+    })
+  }
+}

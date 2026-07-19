@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss: http:; img-src 'self' data:"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Grove — Multi-Agent Claude Orchestrator</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">Grove</div>
+      <div class="brand-sub">multi-agent Claude orchestrator</div>
+      <div id="usage" class="usage" title="Klik untuk detail limit"></div>
+      <div id="usage-panel" class="usage-panel"></div>
+      <div class="legend">
+        <span class="dot s-running"></span>running
+        <span class="dot s-idle"></span>idle
+        <span class="dot s-done"></span>done
+        <span class="dot s-error"></span>error
+      </div>
+      <button id="btn-stop-all" class="stop-all-btn" title="Hentikan turn semua sesi yang sedang berjalan">■ Stop All</button>
+    </header>
+
+    <main class="layout">
+      <aside class="panel sidebar">
+        <div class="panel-head sidebar-head">
+          <span>SESSIONS</span>
+          <div class="head-actions">
+            <button id="btn-new-chat" class="mini-btn primary" title="Mulai chat tanpa folder (tanya-tanya)">+ Chat</button>
+            <button id="btn-open-folder" class="mini-btn" title="Buka folder proyek">+ Folder</button>
+          </div>
+        </div>
+        <div id="tree" class="tree"></div>
+      </aside>
+
+      <section class="panel chat" id="chat">
+        <div class="panel-head" id="chat-head">
+          <span id="chat-title">Belum ada session</span>
+          <span id="chat-badge" class="badge"></span>
+          <span id="chat-telem" class="telem"></span>
+          <button id="btn-compact" class="compact-btn" title="Ringkas laporan sub/sub-sub → simpan ke Memori & padatkan konteks (hanya UTAMA)">🗜 Compact</button>
+          <button id="btn-stop" class="stop-btn" title="Interupsi turn yang sedang berjalan">⏹ Stop</button>
+        </div>
+        <div id="chat-log" class="chat-log"></div>
+        <div class="composer">
+          <div id="chat-attach" class="chat-attach"></div>
+          <form id="chat-form" class="chat-form">
+            <textarea
+              id="chat-input"
+              rows="1"
+              placeholder="Ketik pesan…  (Enter kirim · Shift+Enter baris baru · tempel gambar dari clipboard)"
+            ></textarea>
+            <button id="chat-send" type="submit">Kirim</button>
+          </form>
+        </div>
+      </section>
+
+      <aside class="panel board">
+        <div class="panel-head">PAPAN TULIS</div>
+        <div id="board" class="board-list"></div>
+        <div class="panel-head">PESAN</div>
+        <div id="inbox" class="inbox"></div>
+        <div class="panel-head">MEMORI</div>
+        <div id="memories" class="mem-list"></div>
+      </aside>
+    </main>
+
+    <div id="drop-overlay" class="drop-overlay">
+      <div class="drop-inner">📎 Lepas file/folder → jadi referensi chat ini · gambar → lampiran</div>
+    </div>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
