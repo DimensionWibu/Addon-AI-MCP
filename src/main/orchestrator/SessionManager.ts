@@ -330,6 +330,26 @@ export class SessionManager implements GroveHost {
     root.compactWith(summary) // reset konteks seketika + seed ringkasan untuk pesan berikutnya
   }
 
+  /** GroveHost.notifyHighContext — ctx% ≥ ambang → auto-compact sesi ini (root=pohon, sub=diri). */
+  notifyHighContext(sessionId: string): void {
+    const s = this.sessions.get(sessionId)
+    if (!s) return
+    if (s.meta.role === 'root') {
+      this.compactSession(sessionId) // ringkasan dari seluruh board pohon
+      return
+    }
+    // Sub: ringkasan dari board sub sendiri.
+    const b = this.db.getBoardEntry(sessionId)
+    const parts = [`Tugas: ${s.meta.title}`]
+    if (b?.summary) parts.push(`Ringkasan: ${b.summary}`)
+    if (b?.progress) parts.push(`Progres terakhir: ${b.progress}`)
+    if (b?.todo?.length) parts.push(`Todo: ${b.todo.map((t) => `${t.done ? '✓' : '○'} ${t.text}`).join('; ')}`)
+    const summary = `Ringkasan tugasmu (auto-compact karena konteks nyaris penuh):\n${parts.join('\n')}`
+    const mem = this.db.addMemory(s.meta.treeId, sessionId, summary, Date.now())
+    this.emit({ channel: 'memory:new', payload: mem })
+    s.compactWith(summary)
+  }
+
   /** GroveHost.saveCompaction — dipanggil tool save_compaction: simpan memori + padatkan konteks. */
   saveCompaction(sessionId: string, summary: string): void {
     const s = this.sessions.get(sessionId)

@@ -143,6 +143,8 @@ function extractResultText(content: unknown): string {
   return content == null ? '' : JSON.stringify(content)
 }
 
+const AUTO_COMPACT_PCT = 88 // ctx% ambang auto-compact (cegah freeze saat konteks nyaris penuh)
+
 /** Apakah error menandakan batas pemakaian/rate-limit (pemicu auto-switch akun). */
 function isLimitError(raw: string): boolean {
   return /rate_limit|429|usage|quota|exceed|limit reached|out of/i.test(raw)
@@ -705,6 +707,10 @@ export class Session {
         this.host.notifyTurnEnd(this.meta.id)
         // Bila ada permintaan compact tertunda, padatkan konteks sekarang (turn sudah selesai).
         if (this.pendingCompactSeed) this.doCompact()
+        // Auto-compact: konteks mendekati penuh → minta orkestrator padatkan (cegah freeze).
+        else if (contextPercent(this.meta.ctxInput, this.meta.ctxWindow) >= AUTO_COMPACT_PCT) {
+          this.host.notifyHighContext(this.meta.id)
+        }
         break
       }
       default:

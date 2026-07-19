@@ -27,6 +27,8 @@ export interface GroveHost {
   getAccountToken(accountId?: string): string | null
   /** Dipanggil Session saat turn gagal karena limit — untuk auto-switch akun bila aktif. */
   onLimitHit(sessionId: string): void
+  /** Dipanggil Session saat ctx% ≥ ambang → auto-compact (padatkan konteks, cegah freeze). */
+  notifyHighContext(sessionId: string): void
 }
 
 const ok = (text: string) => ({ content: [{ type: 'text' as const, text }] })
