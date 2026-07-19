@@ -305,8 +305,9 @@ export class SessionManager implements GroveHost {
   }
 
   /**
-   * Compact: minta root merangkum SELURUH pohon (dari laporan board sub & sub-sub),
-   * lalu (via tool save_compaction) simpan ke memori + padatkan konteks root.
+   * Compact (tombol UTAMA): Grove SENDIRI menyusun ringkasan dari laporan board sub & sub-sub,
+   * lalu LANGSUNG padatkan konteks root (compactWith) — TANPA giliran model. Jadi selalu berhasil
+   * walau konteks penuh/macet, dan sekaligus membebaskan sesi yang lagi stuck.
    */
   compactSession(rootId: string): void {
     const root = this.sessions.get(rootId)
@@ -323,13 +324,10 @@ export class SessionManager implements GroveHost {
       if (b?.progress) lines.push(`    progres: ${b.progress}`)
       if (b?.todo?.length) lines.push(`    todo: ${b.todo.map((t) => `${t.done ? '✓' : '○'} ${t.text}`).join('; ')}`)
     }
-    const prompt =
-      `[GROVE COMPACT] Rangkum SELURUH kerja pohon ini menjadi satu ringkasan konsolidasi yang padat dan MANDIRI, ` +
-      `berdasarkan laporan worker di bawah. Sertakan: tujuan keseluruhan, hasil/temuan tiap worker, keputusan penting, ` +
-      `kondisi terkini, dan sisa pekerjaan. Lalu panggil mcp__grove__save_compaction dengan ringkasan itu sebagai argumen. ` +
-      `Setelah disimpan, konteksmu akan dipadatkan (detail mentah lama dilepas), jadi pastikan ringkasannya cukup untuk melanjutkan.\n\n` +
-      `Laporan worker:\n${lines.join('\n') || '(belum ada laporan board)'}`
-    root.injectAutoTask(prompt)
+    const summary = `Ringkasan tugas pohon ini (dari laporan worker, hasil compact):\n${lines.join('\n') || '(belum ada laporan board)'}`
+    const mem = this.db.addMemory(treeId, rootId, summary, Date.now())
+    this.emit({ channel: 'memory:new', payload: mem })
+    root.compactWith(summary) // reset konteks seketika + seed ringkasan untuk pesan berikutnya
   }
 
   /** GroveHost.saveCompaction — dipanggil tool save_compaction: simpan memori + padatkan konteks. */

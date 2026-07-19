@@ -126,8 +126,9 @@ app.whenReady().then(async () => {
   void loopUsage()
 
   app.on('before-quit', () => {
-    void manager.stopAll() // hentikan turn yang jalan sebelum proses mati
-    board.flush() // pastikan DB tersimpan saat keluar
+    // JANGAN stopAll di sini: itu mengubah status running→idle & menghapus info "sesi ini tadi kerja"
+    // yang dipakai auto-resume saat dibuka lagi. Proses yang mati sendiri sudah mematikan query-nya.
+    board.flush() // pastikan DB (termasuk status 'running') tersimpan saat keluar
   })
 
   createWindow()

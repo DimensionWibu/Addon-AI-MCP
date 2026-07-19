@@ -4,16 +4,29 @@ out/
 dist/
 release/
 
+# databases — grove.sqlite menyimpan TOKEN AKUN; jangan pernah commit copy DB
+# (DB asli ada di app userData, di luar repo; ini jaring pengaman kalau ke-copy ke repo / dari test)
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
 # logs & temp
 *.log
+npm-debug.log*
 .tmp*/
-.tmptest/
-.tmpiso/
-.tmprepro/
 
 # env & secrets
 .env
 .env.*
+*.token
+*.secret
+
+# editor / IDE
+.vscode/
+.idea/
+*.swp
 
 # OS
 Thumbs.db

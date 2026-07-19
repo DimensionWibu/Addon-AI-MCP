@@ -275,13 +275,19 @@ export class Session {
     this.pendingCompactSeed = summary
   }
 
-  /**
-   * Padatkan konteks: lepas sesi SDK lama (drop resume) & siapkan ringkasan untuk disisipkan
-   * ke pesan berikutnya. Dipanggil di akhir turn agar tidak memutus turn yang berjalan.
-   */
   private doCompact(): void {
     const summary = this.pendingCompactSeed
     this.pendingCompactSeed = null
+    if (summary) this.compactWith(summary)
+  }
+
+  /**
+   * Padatkan konteks LANGSUNG (tanpa giliran model): lepas sesi SDK lama (drop resume),
+   * turunkan ctx% ke 0, dan siapkan ringkasan untuk disisipkan ke pesan berikutnya.
+   * Menghentikan turn yang sedang jalan (mis. macet karena konteks penuh) → membebaskan sesi.
+   * Dipakai tombol Compact (ringkasan dari board) & tool save_compaction (ringkasan model).
+   */
+  compactWith(summary: string): void {
     if (!summary) return
     this.reseedText = summary
     this.meta.sdkSessionId = undefined // start berikutnya FRESH (tanpa resume) → konteks lama dilepas
@@ -297,7 +303,7 @@ export class Session {
     }
     this.record({
       role: 'system',
-      text: '⟲ Konteks dipadatkan (compact). Ringkasan disimpan ke Memori — pesan berikutnya melanjutkan dari ringkasan.',
+      text: '⟲ Konteks dipadatkan (compact). Ringkasan tugas disimpan ke Memori — pesan berikutnya melanjutkan dari ringkasan.',
       ts: Date.now()
     })
     this.setStatus('idle')
