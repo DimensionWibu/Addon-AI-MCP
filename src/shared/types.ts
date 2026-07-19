@@ -121,6 +121,7 @@ export type GroveEvent =
       channel: 'session:update'
       payload: { id: string } & Partial<SessionMeta> & {
           ctxPercent?: number
+          ctxPending?: boolean // true = konteks baru di-reset (compact); UI tampilkan badge netral, bukan 0%
           tokensTotal?: number
           loopActive?: boolean
           apiStopped?: boolean

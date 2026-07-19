@@ -143,11 +143,25 @@ function extractResultText(content: unknown): string {
   return content == null ? '' : JSON.stringify(content)
 }
 
-const AUTO_COMPACT_PCT = 88 // ctx% ambang auto-compact (cegah freeze saat konteks nyaris penuh)
+const AUTO_COMPACT_HIGH = 88 // ctx% ambang ATAS: picu auto-compact (cegah freeze saat konteks nyaris penuh)
+const AUTO_COMPACT_LOW = 70 // ctx% ambang BAWAH: baru boleh mempersenjatai ulang auto-compact (hysteresis anti-thrash)
 
 /** Apakah error menandakan batas pemakaian/rate-limit (pemicu auto-switch akun). */
 function isLimitError(raw: string): boolean {
   return /rate_limit|429|usage|quota|exceed|limit reached|out of/i.test(raw)
+}
+
+/**
+ * Pemberitahuan limit langganan yang datang sebagai TEKS asisten, mis:
+ *   "You've hit your session limit · resets 4:20pm (Asia/Jakarta)"
+ *   "You've reached your weekly limit"
+ * Pola sengaja SPESIFIK (bukan sekadar kata "limit") agar tidak salah-picu saat model
+ * kebetulan membahas kata limit dalam jawabannya.
+ */
+function isLimitNotice(text: string): boolean {
+  return /(hit|reached|exceeded)\s+your\s+[\w\s-]*limit|(session|weekly|usage|5-hour|five-hour)\s+limit\b[^\n]{0,40}\bresets?\b|limit\s*·\s*resets/i.test(
+    text
+  )
 }
 
 /** Apakah pesan menandakan blokir keamanan API Claude (pemicu recycle sesi). */
@@ -230,6 +244,9 @@ export class Session {
   private apiBlockPending = false // blokir API terdeteksi → recycle di akhir turn
   private limitHitPending = false // limit pemakaian terdeteksi → auto-switch akun di akhir turn
   private limitStreak = 0 // pindah akun beruntun akibat limit tanpa turn sukses (guard anti-loop)
+  private compactArmed = true // auto-compact hanya menyala bila konteks NYATA pernah turun < LOW (hysteresis anti-thrash)
+  private compactStreak = 0 // compact beruntun tanpa turn yang berakhir < LOW (guard anti-freeze; lihat limitStreak)
+  private compactWarned = false // peringatan "konteks tetap penuh" sudah dikirim untuk streak ini (anti-spam)
 
   constructor(
     meta: SessionMeta,
@@ -294,6 +311,8 @@ export class Session {
     this.reseedText = summary
     this.meta.sdkSessionId = undefined // start berikutnya FRESH (tanpa resume) → konteks lama dilepas
     this.resetCtx() // ctx% turun ke 0 seketika
+    this.compactArmed = false // jangan auto-compact lagi sampai konteks NYATA turun < LOW (anti-thrash)
+    this.compactStreak++ // hitung compact beruntun → guard anti-freeze bila konteks tetap penuh
     this.db.upsertSession(this.meta)
     this.started = false
     const q = this.q
@@ -515,9 +534,11 @@ export class Session {
   private resetCtx(): void {
     this.meta.ctxInput = 0
     this.meta.ctxOutput = 0
+    // ctxInput=0 dipakai logika ambang; UI diberi penanda "pending" agar badge TIDAK memajang 0% palsu —
+    // isi window nyata baru diketahui saat turn berikutnya melapor usage (lihat applyUsage → ctxPending:false).
     this.emit({
       channel: 'session:update',
-      payload: { id: this.meta.id, ctxInput: 0, ctxOutput: 0, ctxPercent: 0 }
+      payload: { id: this.meta.id, ctxInput: 0, ctxOutput: 0, ctxPercent: 0, ctxPending: true }
     })
   }
 
@@ -593,6 +614,8 @@ export class Session {
             this.meta.model = model
             this.meta.ctxWindow = contextWindowFor(model)
             changed = true
+            // Verifikasi (sekali/model): pastikan model 1M tak salah dideteksi sbagai 200k.
+            console.log(`[Session ${this.meta.id}] model="${model}" → ctxWindow=${this.meta.ctxWindow}`)
           }
           if (changed) {
             this.meta.updatedAt = Date.now()
@@ -646,6 +669,9 @@ export class Session {
           if (block.type === 'text' && block.text?.trim()) {
             this.record({ role: 'assistant', text: block.text, ts: Date.now() })
             if (isApiBlock(block.text)) this.flagApiBlock() // API blokir pesan → recycle di akhir turn
+            // Limit langganan sering datang sebagai TEKS ("You've hit your session limit · resets …"),
+            // bukan exception/field error → deteksi di sini agar auto-switch akun ikut kepicu.
+            else if (isLimitNotice(block.text)) this.flagLimitHit()
           } else if (block.type === 'tool_use') {
             const input = formatToolInput(block.input)
             const rowId = this.record({
@@ -707,9 +733,28 @@ export class Session {
         this.host.notifyTurnEnd(this.meta.id)
         // Bila ada permintaan compact tertunda, padatkan konteks sekarang (turn sudah selesai).
         if (this.pendingCompactSeed) this.doCompact()
-        // Auto-compact: konteks mendekati penuh → minta orkestrator padatkan (cegah freeze).
-        else if (contextPercent(this.meta.ctxInput, this.meta.ctxWindow) >= AUTO_COMPACT_PCT) {
-          this.host.notifyHighContext(this.meta.id)
+        else {
+          const pct = contextPercent(this.meta.ctxInput, this.meta.ctxWindow)
+          if (pct < AUTO_COMPACT_LOW) {
+            // Turn berakhir lega → reset guard futility (compact sebelumnya benar memberi headroom).
+            this.compactStreak = 0
+            this.compactWarned = false
+          } else if (this.compactArmed && pct >= AUTO_COMPACT_HIGH) {
+            if (this.compactStreak >= 2) {
+              // Compact berulang tak menurunkan konteks → jangan loop; peringatkan SEKALI (anti-freeze + anti-spam).
+              if (!this.compactWarned) {
+                this.record({
+                  role: 'system',
+                  text: '⚠️ Konteks tetap penuh setelah compact berulang; ringkasan/tugas mungkin terlalu besar — pertimbangkan pecah tugas atau Compact manual.',
+                  ts: Date.now()
+                })
+                this.compactWarned = true
+              }
+            } else {
+              // Auto-compact: konteks mendekati penuh → minta orkestrator padatkan (cegah freeze).
+              this.host.notifyHighContext(this.meta.id)
+            }
+          }
         }
         break
       }
@@ -738,8 +783,11 @@ export class Session {
         ctxInput,
         ctxOutput,
         ctxPercent: contextPercent(ctxInput, this.meta.ctxWindow),
-        tokensTotal: this.tokensTotal
+        tokensTotal: this.tokensTotal,
+        ctxPending: false // ada pengukuran nyata → badge keluar dari mode pending
       }
     })
+    // Hysteresis: begitu konteks NYATA turun < LOW, persenjatai ulang auto-compact (boleh memicu lagi nanti).
+    if (contextPercent(ctxInput, this.meta.ctxWindow) < AUTO_COMPACT_LOW) this.compactArmed = true
   }
 }

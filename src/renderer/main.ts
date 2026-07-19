@@ -15,7 +15,7 @@ import type {
 let pendingImages: ImageAttachment[] = []
 let pendingRefs: string[] = [] // path file/folder referensi
 
-type Node = SessionMeta & { ctxPercent: number; tokensTotal: number; loopActive?: boolean; apiStopped?: boolean }
+type Node = SessionMeta & { ctxPercent: number; tokensTotal: number; loopActive?: boolean; apiStopped?: boolean; ctxPending?: boolean }
 
 const turnStart = new Map<string, number>() // kapan turn 'running' dimulai
 const lastElapsed = new Map<string, number>() // durasi turn terakhir (ms)
@@ -279,6 +279,16 @@ function badgeClass(pct: number): string {
   return 'badge ok'
 }
 
+/** Teks badge ctx: '·' saat pending (konteks baru di-reset/compact), selain itu 'NN%'. */
+function ctxBadgeText(n: { ctxPercent: number; ctxPending?: boolean }): string {
+  return n.ctxPending ? '·' : `${n.ctxPercent}%`
+}
+
+/** Kelas badge ctx: netral (abu) saat pending, selain itu warna sesuai ambang. */
+function ctxBadgeClass(n: { ctxPercent: number; ctxPending?: boolean }): string {
+  return n.ctxPending ? 'badge' : badgeClass(n.ctxPercent)
+}
+
 // ---- tree ------------------------------------------------------------------
 
 /** Kunci urut dalam grup: orderIndex manual bila ada, jika tidak createdAt. */
@@ -436,7 +446,7 @@ function renderNode(node: Node, depth: number, container: HTMLElement): void {
 
   const dot = el('span', { class: `dot s-${node.status}` })
   const title = el('span', { class: 'node-title' }, node.title)
-  const badge = el('span', { class: badgeClass(node.ctxPercent) }, `${node.ctxPercent}%`)
+  const badge = el('span', { class: ctxBadgeClass(node) }, ctxBadgeText(node))
   const del = el('button', { class: 'node-del', title: 'Hapus session' }, '×')
   del.onclick = (e) => {
     e.stopPropagation()
@@ -471,8 +481,8 @@ function updateNodeVisual(id: string): void {
   if (!refs || !n) return
   refs.dot.className = `dot s-${n.status}`
   refs.title.textContent = n.title
-  refs.badge.textContent = `${n.ctxPercent}%`
-  refs.badge.className = badgeClass(n.ctxPercent)
+  refs.badge.textContent = ctxBadgeText(n)
+  refs.badge.className = ctxBadgeClass(n)
   refs.wrap.classList.toggle('active', activeId === id)
   refs.wrap.classList.toggle('api-stopped', !!n.apiStopped) // dihentikan API Claude → judul merah
 }
@@ -580,8 +590,8 @@ function updateChatBadge(): void {
     badge.className = 'badge'
     return
   }
-  badge.textContent = `ctx ${node.ctxPercent}%`
-  badge.className = badgeClass(node.ctxPercent)
+  badge.textContent = `ctx ${ctxBadgeText(node)}`
+  badge.className = ctxBadgeClass(node)
 }
 
 function updateChatHeader(): void {
