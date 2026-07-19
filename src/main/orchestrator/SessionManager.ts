@@ -27,6 +27,8 @@ const DEFAULT_MODEL: string | undefined = undefined // undefined = ikut default 
 const ROOT_STATUS_DEBOUNCE_MS = 60_000
 const LOOP_INTERVAL_MS = 10 * 60_000 // auto-check "udah sampe mana?" tiap 10 menit (bisa diubah)
 const IDLE_CHECK_LIMIT = 3 // auto-check beruntun tanpa perubahan → stop loop (cegah bakar usage)
+const LIMIT_COOLDOWN_MS = 30 * 60_000 // akun yang kena limit dianggap "tak tersedia" selama ini
+const DEFAULT_ACCT_KEY = '__default__' // penanda sesi yang memakai login CLI (bukan akun tersimpan)
 
 // Prompt auto-ping dibangun DINAMIS (lihat rootStatusPrompt/loopCheckPrompt) dengan ringkasan
 // board disuntik langsung → root tak perlu memanggil read_board tiap ping (hemat konteks besar).
@@ -37,6 +39,7 @@ export class SessionManager implements GroveHost {
   private readonly lastPingSummary = new Map<string, string>() // treeId → board saat ping terakhir (dedupe)
   private readonly lastLoopSummary = new Map<string, string>() // rootId → board saat auto-check terakhir
   private readonly loopIdleStreak = new Map<string, number>() // rootId → auto-check beruntun tanpa perubahan
+  private readonly limitedAt = new Map<string, number>() // accountKey → kapan terbukti kena limit
   private readonly loopTimers = new Map<string, NodeJS.Timeout>() // rootId → timer auto-check berkala
   private readonly loopEnabled = new Set<string>() // rootId dengan auto-check aktif
   private autoSwitch = false // pindah akun otomatis saat kena limit
@@ -203,6 +206,22 @@ export class SessionManager implements GroveHost {
    * (resume konteks + inject "lanjutkan"). Guard anti-loop: bila sudah keliling semua akun
    * tanpa turn sukses, berhenti. Bila tak bisa switch, beri pesan jelas ke user.
    */
+  /** Tandai sebuah akun (atau login default) sedang kena limit — dipakai bersama semua sesi. */
+  markAccountLimited(accountKey: string): void {
+    this.limitedAt.set(accountKey, Date.now())
+  }
+
+  /** Akun dianggap tak tersedia selama cooldown setelah terbukti kena limit. */
+  isAccountLimited(accountKey: string): boolean {
+    const t = this.limitedAt.get(accountKey)
+    return t != null && Date.now() - t < LIMIT_COOLDOWN_MS
+  }
+
+  /** Akun pertama yang BELUM diketahui kena limit (bukan akun yang sedang dipakai). */
+  pickAvailableAccount(currentKey: string): Account | undefined {
+    return this.db.getAccounts().find((a) => a.id !== currentKey && !this.isAccountLimited(a.id))
+  }
+
   onLimitHit(sessionId: string): void {
     const s = this.sessions.get(sessionId)
     if (!s) return
@@ -226,9 +245,14 @@ export class SessionManager implements GroveHost {
       return
     }
 
-    const curIdx = accts.findIndex((a) => a.id === s.meta.accountId)
-    const next = accts[(curIdx + 1) % accts.length]
-    if (!next || next.id === s.meta.accountId) {
+    // Akun yang barusan dipakai TERBUKTI kena limit → catat, supaya sesi ini (dan sesi lain)
+    // tidak mencoba akun itu lagi selama cooldown. Lalu pilih akun yang BELUM kena limit —
+    // langsung ke akun yang benar-benar bisa dipakai, bukan rotasi buta.
+    const curKey = s.meta.accountId ?? DEFAULT_ACCT_KEY
+    this.markAccountLimited(curKey)
+    const next = this.pickAvailableAccount(curKey)
+    if (!next) {
+      s.systemNote(`🚫 Semua akun sedang kena limit. Coba lagi setelah limitnya reset.`)
       s.markLimited()
       return
     }

@@ -51,6 +51,16 @@ async function main(): Promise<void> {
   ok(mgr.listAccounts().autoSwitch === true, 'setAutoSwitch(true) aktif')
   ok(board.getSetting('autoSwitch') === '1', 'autoSwitch tersimpan di settings DB')
 
+  // Rotasi sadar-limit: akun yang terbukti limit tidak dipilih lagi (sesi ini & sesi lain).
+  ok(mgr.isAccountLimited(a.id) === false, 'awal: akun A belum ditandai limit')
+  ok(mgr.pickAvailableAccount('__default__')?.id === a.id, 'dari Default → pilih akun pertama (A)')
+  mgr.markAccountLimited(a.id) // A terbukti kena limit
+  ok(mgr.isAccountLimited(a.id) === true, 'A ditandai limit')
+  ok(mgr.pickAvailableAccount('__default__')?.id === b.id, 'A limit → LANGSUNG pilih B (bukan A lagi)')
+  ok(mgr.pickAvailableAccount(b.id)?.id === undefined, 'dari B, A limit → tak ada akun tersisa')
+  mgr.markAccountLimited(b.id)
+  ok(mgr.pickAvailableAccount('__default__') === undefined, 'semua akun limit → tak ada pilihan (stop)')
+
   mgr.deleteAccount(b.id)
   ok(mgr.listAccounts().accounts.length === 1, 'hapus akun → sisa 1')
 
