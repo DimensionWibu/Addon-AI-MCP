@@ -611,6 +611,18 @@ function ensureNode(meta: SessionMeta, ctxPercent = 0): void {
 function appendChatMessage(m: ChatMessage, scroll = true): HTMLElement {
   const node = document.createElement('div')
   node.className = `msg ${m.role}`
+  if (m.role === 'system' && m.text.startsWith('⟲')) {
+    // Penanda reset konteks (recycle / compact) → garis pembatas jelas di chat.
+    node.className = 'msg divider'
+    node.append(
+      el('span', { class: 'divider-line' }),
+      el('span', { class: 'divider-label' }, m.text.replace(/^⟲\s*/, '')),
+      el('span', { class: 'divider-line' })
+    )
+    $('chat-log').append(node)
+    if (scroll) scrollChatToBottom()
+    return node
+  }
   if (m.role === 'assistant') {
     node.innerHTML = renderMarkdown(m.text)
   } else if (m.role === 'tool' && m.detail) {

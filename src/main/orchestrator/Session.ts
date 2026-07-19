@@ -283,6 +283,7 @@ export class Session {
     if (!summary) return
     this.reseedText = summary
     this.meta.sdkSessionId = undefined // start berikutnya FRESH (tanpa resume) → konteks lama dilepas
+    this.resetCtx() // ctx% turun ke 0 seketika
     this.db.upsertSession(this.meta)
     this.started = false
     const q = this.q
@@ -294,7 +295,7 @@ export class Session {
     }
     this.record({
       role: 'system',
-      text: '🗜️ Konteks dipadatkan (compact). Ringkasan disimpan ke Memori — pesan berikutnya melanjutkan dari ringkasan itu.',
+      text: '⟲ Konteks dipadatkan (compact). Ringkasan disimpan ke Memori — pesan berikutnya melanjutkan dari ringkasan.',
       ts: Date.now()
     })
     this.setStatus('idle')
@@ -459,6 +460,16 @@ export class Session {
     this.emit({ channel: 'session:update', payload: { id: this.meta.id, apiStopped: v } })
   }
 
+  /** Reset hitungan konteks ke 0 (setelah konteks dibuang) → badge ctx% langsung turun. */
+  private resetCtx(): void {
+    this.meta.ctxInput = 0
+    this.meta.ctxOutput = 0
+    this.emit({
+      channel: 'session:update',
+      payload: { id: this.meta.id, ctxInput: 0, ctxOutput: 0, ctxPercent: 0 }
+    })
+  }
+
   /**
    * Recycle akibat blokir API: reset konteks Claude (buang riwayat yang ke-flag) TAPI seed
    * ringkasan tugas (dari board: summary/progress/todo) + prompt terakhir → lanjut langsung.
@@ -491,10 +502,11 @@ export class Session {
       : ''
     this.record({
       role: 'system',
-      text: `🔄 Diblokir API — recycle konteks #${this.apiRetries}/3, melanjutkan tugas terakhir dengan konteks bersih…`,
+      text: `⟲ Konteks direset — recycle #${this.apiRetries}/3 (blokir API). Lanjut dari ringkasan tugas.`,
       ts: Date.now()
     })
     this.meta.sdkSessionId = undefined // fresh SDK session (tanpa resume → riwayat lama dilepas)
+    this.resetCtx() // ctx% turun ke 0 seketika → bukti reset jalan
     this.db.upsertSession(this.meta)
     const prompt = `${seed}Lanjutkan pekerjaan.${this.lastUserPrompt ? ` Instruksi terakhir dari user: ${this.lastUserPrompt}` : ''}`
     this.start() // fresh (started sudah false dari finally)
