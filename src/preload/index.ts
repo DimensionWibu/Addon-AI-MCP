@@ -21,6 +21,7 @@ const api: GroveApi = {
   setSessionAccount: (id: string, accountId: string | null) =>
     ipcRenderer.invoke('grove:setSessionAccount', { id, accountId }),
   setAutoSwitch: (on: boolean) => ipcRenderer.invoke('grove:setAutoSwitch', { on }),
+  setAutoResume: (on: boolean) => ipcRenderer.invoke('grove:setAutoResume', { on }),
   interruptSession: (id: string) => ipcRenderer.invoke('grove:interruptSession', { id }),
   deleteSession: (id: string) => ipcRenderer.invoke('grove:deleteSession', { id }),
   getSnapshot: () => ipcRenderer.invoke('grove:getSnapshot'),

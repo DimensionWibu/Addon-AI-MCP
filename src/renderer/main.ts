@@ -35,6 +35,7 @@ const board = new Map<string, BoardEntry>()
 const memories: Memory[] = [] // hasil compact per pohon
 let accounts: Account[] = [] // akun Claude tersimpan (tanpa token)
 let autoSwitch = false // pindah akun otomatis saat limit
+let autoResume = false // lanjutkan sesi yang tadi kerja saat app dibuka lagi
 let activeId: string | null = null
 let pendingEl: HTMLElement | null = null
 let pendingText = '' // target teks penuh yang terkumpul
@@ -212,6 +213,13 @@ function renderMarkdown(src: string): string {
 let boardRaf = 0
 let scrollRaf = 0
 let pendingRaf = 0
+
+// Batasi jumlah node DOM di chat-log → mencegah lag saat sesi panjang/aktif (riwayat penuh tetap di DB).
+const MAX_CHAT_DOM = 400
+function capChatLog(): void {
+  const log = $('chat-log')
+  while (log.childElementCount > MAX_CHAT_DOM) log.removeChild(log.firstElementChild as ChildNode)
+}
 
 function scheduleBoard(): void {
   if (boardRaf) return
@@ -558,7 +566,7 @@ async function selectSession(id: string): Promise<void> {
   log.textContent = ''
   toolDetailEls.clear() // panel detail milik sesi lama tak relevan lagi
   const history = await window.grove.getChat(id)
-  for (const m of history) appendChatMessage(m, false)
+  for (const m of history.slice(-MAX_CHAT_DOM)) appendChatMessage(m, false) // hanya N terakhir → anti-lag
   log.scrollTop = log.scrollHeight
   updateActiveHighlight()
   renderMemories() // memori pohon sesi ini
@@ -620,6 +628,7 @@ function appendChatMessage(m: ChatMessage, scroll = true): HTMLElement {
       el('span', { class: 'divider-line' })
     )
     $('chat-log').append(node)
+    capChatLog()
     if (scroll) scrollChatToBottom()
     return node
   }
@@ -650,6 +659,7 @@ function appendChatMessage(m: ChatMessage, scroll = true): HTMLElement {
     }
   }
   $('chat-log').append(node)
+  capChatLog()
   if (scroll) scrollChatToBottom()
   return node
 }
@@ -710,11 +720,12 @@ function renderBoard(): void {
   entries.sort(
     (a, b) => (nodes.get(a.sessionId)?.createdAt ?? 0) - (nodes.get(b.sessionId)?.createdAt ?? 0)
   )
+  let focusCard: HTMLElement | null = null
   for (const b of entries) {
     const node = nodes.get(b.sessionId)!
     const card = el(
       'div',
-      { class: 'board-card' },
+      { class: `board-card${node.status === 'running' ? ' active-proc' : ''}` },
       el(
         'div',
         { class: 'bc-head' },
@@ -738,7 +749,10 @@ function renderBoard(): void {
       card.append(ul)
     }
     container.append(card)
+    // Target scroll = proses yang sedang jalan (prioritaskan sesi aktif yang running).
+    if (node.status === 'running' && (!focusCard || b.sessionId === activeId)) focusCard = card
   }
+  if (focusCard) focusCard.scrollIntoView({ block: 'nearest' }) // auto-scroll ke proses aktif
 }
 
 function addInbox(m: InboxMessage): void {
@@ -751,6 +765,7 @@ function addInbox(m: InboxMessage): void {
     m.body
   )
   inbox.prepend(item)
+  inbox.scrollTop = 0 // pesan terbaru (di atas) selalu terlihat
 }
 
 /** Panel MEMORI: hasil compact untuk pohon sesi aktif (terbaru di atas, klik untuk expand). */
@@ -789,6 +804,12 @@ function renderAccountsPanel(): void {
   cb.checked = autoSwitch
   cb.addEventListener('change', () => void window.grove.setAutoSwitch(cb.checked).catch(() => {}))
   panel.append(el('label', { class: 'ap-toggle' }, cb, el('span', {}, ' Auto-switch akun saat kena limit')))
+
+  const cr = document.createElement('input')
+  cr.type = 'checkbox'
+  cr.checked = autoResume
+  cr.addEventListener('change', () => void window.grove.setAutoResume(cr.checked).catch(() => {}))
+  panel.append(el('label', { class: 'ap-toggle' }, cr, el('span', {}, ' Lanjutkan sesi yang tadi kerja saat app dibuka')))
 
   panel.append(el('div', { class: 'ap-head' }, 'Tersimpan'))
   if (!accounts.length) {
@@ -929,6 +950,7 @@ function onEvent(ev: GroveEvent): void {
     case 'accounts:update': {
       accounts = ev.payload.accounts
       autoSwitch = ev.payload.autoSwitch
+      autoResume = ev.payload.autoResume
       if ($('acct-panel').classList.contains('show')) renderAccountsPanel()
       break
     }
@@ -1193,6 +1215,7 @@ async function init(): Promise<void> {
     .then((r) => {
       accounts = r.accounts
       autoSwitch = r.autoSwitch
+      autoResume = r.autoResume
     })
     .catch(() => {})
 

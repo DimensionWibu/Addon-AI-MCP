@@ -54,6 +54,7 @@ export function registerIpc(manager: SessionManager): void {
     manager.setSessionAccount(id, accountId)
   )
   ipcMain.handle('grove:setAutoSwitch', (_e, { on }: { on: boolean }) => manager.setAutoSwitch(on))
+  ipcMain.handle('grove:setAutoResume', (_e, { on }: { on: boolean }) => manager.setAutoResume(on))
 
   ipcMain.handle('grove:interruptSession', (_e, { id }: { id: string }) => manager.interruptSession(id))
 

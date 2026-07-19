@@ -137,11 +137,11 @@ export function buildGroveServer(sessionId: string, host: GroveHost) {
 
   const readBoard = tool(
     'read_board',
-    'Read the shared board (summary/todo/progress) of sessions. scope "all" (default) shows every session across all trees; "tree" shows only your tree. Read-only awareness — do NOT work on another tree\'s task.',
-    { scope: z.enum(['tree', 'all']).default('all') },
+    'Read the shared board (summary/todo/progress) of sessions. scope "tree" (default) = only your own tree; "all" = every tree (use sparingly — it is large and floods your context). Read-only awareness — do NOT work on another tree\'s task.',
+    { scope: z.enum(['tree', 'all']).default('tree') },
     async (args) => {
       const rows = host.readBoard(sessionId, args.scope)
-      return ok(JSON.stringify(rows, null, 2))
+      return ok(JSON.stringify(rows)) // kompak (tanpa indentasi) → hemat token konteks
     }
   )
 
@@ -161,7 +161,7 @@ export function buildGroveServer(sessionId: string, host: GroveHost) {
     { unread_only: z.boolean().default(true) },
     async (args) => {
       const msgs = host.readMessages(sessionId, args.unread_only)
-      return ok(JSON.stringify(msgs, null, 2))
+      return ok(JSON.stringify(msgs)) // kompak → hemat token
     }
   )
 
@@ -170,7 +170,7 @@ export function buildGroveServer(sessionId: string, host: GroveHost) {
     'List the sessions in YOUR tree (for coordinating with your sub-workers).',
     {},
     async () => {
-      return ok(JSON.stringify(host.listWorkers(sessionId), null, 2))
+      return ok(JSON.stringify(host.listWorkers(sessionId))) // kompak → hemat token
     }
   )
 

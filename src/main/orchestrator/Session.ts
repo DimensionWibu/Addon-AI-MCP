@@ -36,8 +36,8 @@ YOUR ROLE: you are the ROOT orchestrator of this tree (shown as "UTAMA" in the U
 - REUSE workers before creating new ones. FIRST call mcp__grove__list_workers. If a worker is idle, give it the next task with mcp__grove__assign_worker (it keeps its full prior context and is cheaper). Only call mcp__grove__spawn_worker when there is no suitable idle worker, or you genuinely need more parallelism at once.
 - Each task you hand off must be clear and self-contained; you may share full context with your own workers.
 - After delegating, monitor with mcp__grove__read_board / mcp__grove__read_messages, then synthesize the workers' results into the final answer for the user.
-- PROGRESS TO THE USER: workers report their percent as they go, and you will be AUTO-PINGED with a "[GROVE AUTO]" message whenever they report. When that happens, call mcp__grove__read_board (scope "tree") + mcp__grove__list_workers and send the USER one short line saying how far along things are — each worker's percent/state, what is done, what is still running. When all workers reach 100%, send the final synthesized answer instead. Keep these updates brief; do not repeat unchanged status.
-- PERIODIC AUTO-CHECK: roughly every few minutes you also get a "[GROVE AUTO-CHECK]" ping (like the user asking "udah sampe mana?"). On it: check the board + list_workers; if any worker is idle but its task is NOT finished, push it to continue via mcp__grove__assign_worker so nobody stalls; give the user a brief status. When the ENTIRE task is truly complete, call mcp__grove__task_done to stop the periodic checks (they auto-resume when the user gives a new task).
+- PROGRESS TO THE USER: workers report their percent as they go, and you will be AUTO-PINGED with a "[GROVE AUTO]" message whenever they report. That ping ALREADY CONTAINS the current board summary — do NOT call read_board (it would flood your context). Just send the USER one short line from that summary. When all workers reach 100%, send the final synthesized answer instead. Keep updates brief; do not repeat unchanged status.
+- PERIODIC AUTO-CHECK: roughly every few minutes you also get a "[GROVE AUTO-CHECK]" ping (like the user asking "udah sampe mana?"), which ALSO already includes the board summary — do NOT call read_board. From that summary: if any worker is idle but its task is NOT finished, push it to continue (list_workers for its id → assign_worker) so nobody stalls; give the user a brief status. When the ENTIRE task is complete, call mcp__grove__task_done to stop the periodic checks (they auto-resume on a new task).
 - Only exception: a trivial one-off question you can just answer directly — no workers needed.
 `.trim()
 
@@ -226,6 +226,8 @@ export class Session {
   private apiRetries = 0 // berapa kali recycle akibat blokir API (maks 3)
   private apiStopped = false // dihentikan API Claude setelah 3× → judul merah
   private apiBlockPending = false // blokir API terdeteksi → recycle di akhir turn
+  private limitHitPending = false // limit pemakaian terdeteksi → auto-switch akun di akhir turn
+  private limitStreak = 0 // pindah akun beruntun akibat limit tanpa turn sukses (guard anti-loop)
 
   constructor(
     meta: SessionMeta,
@@ -314,6 +316,7 @@ export class Session {
   sendUserMessage(text: string, images?: ImageAttachment[]): void {
     this.lastUserPrompt = text // prompt user SEBELUM kena flag → diulang saat recycle
     this.apiRetries = 0 // prompt baru → reset hitungan recycle
+    this.limitStreak = 0 // prompt user baru → reset rantai pindah-akun akibat limit
     this.setApiStopped(false)
     text = this.withReseed(text)
     if (!this.started) this.start()
@@ -354,6 +357,13 @@ export class Session {
     this.injectAutoTask(prompt)
   }
 
+  /** Saat app dibuka lagi: sesi yang tadinya kerja → resume konteks & dorong lanjut. */
+  autoResume(): void {
+    if (this.stopped || this.started) return
+    this.record({ role: 'system', text: '▶ Melanjutkan sesi yang terputus saat aplikasi ditutup…', ts: Date.now() })
+    this.injectAutoTask('Lanjutkan pekerjaan sebelumnya yang terputus saat aplikasi ditutup.')
+  }
+
   private emitActivity(activity: string): void {
     this.emit({ channel: 'session:activity', payload: { id: this.meta.id, activity } })
   }
@@ -388,23 +398,23 @@ export class Session {
 
   private async consume(): Promise<void> {
     if (!this.q) return
-    let limitHit = false
     try {
       for await (const msg of this.q) {
         this.handle(msg as Record<string, unknown> & { type: string })
       }
     } catch (e) {
-      if (isApiBlock(String(e))) this.apiBlockPending = true
-      // Jangan cetak error generik kalau kita sengaja interupsi untuk recycle blokir API.
-      if (!this.stopped && !this.apiBlockPending) {
+      const raw = String(e)
+      if (isApiBlock(raw)) this.apiBlockPending = true
+      else if (isLimitError(raw)) this.limitHitPending = true // limit via exception → auto-switch
+      // Jangan cetak error generik kalau kita sengaja interupsi (recycle blokir API / switch limit).
+      else if (!this.stopped) {
         console.error(`[Session ${this.meta.id}] error:`, e)
         this.record({
           role: 'system',
-          text: `⚠️ ${friendlyError(String(e))}  (session tetap bisa dilanjut — kirim pesan lagi)`,
+          text: `⚠️ ${friendlyError(raw)}  (session tetap bisa dilanjut — kirim pesan lagi)`,
           ts: Date.now()
         })
         this.setStatus('error')
-        if (isLimitError(String(e))) limitHit = true
       }
     } finally {
       // Query mati (error/blokir/selesai). Bila bukan karena stop manual, izinkan
@@ -415,7 +425,10 @@ export class Session {
         if (this.meta.status === 'running') this.setStatus('idle')
       }
       // Setelah state di-reset: bila kena limit, minta orkestrator auto-switch akun (bila aktif).
-      if (limitHit && !this.stopped) this.host.onLimitHit(this.meta.id)
+      if (this.limitHitPending && !this.stopped) {
+        this.limitHitPending = false
+        this.host.onLimitHit(this.meta.id)
+      }
       // Bila terdeteksi blokir API → recycle (reset konteks + ulang tugas terakhir).
       if (this.apiBlockPending && !this.stopped) {
         this.apiBlockPending = false
@@ -452,6 +465,36 @@ export class Session {
     } catch {
       /* abaikan */
     }
+  }
+
+  /**
+   * Limit pemakaian terdeteksi (dari error field pesan assistant / result / exception).
+   * Hentikan turn → consume().finally memanggil host.onLimitHit (auto-switch akun + lanjut).
+   */
+  private flagLimitHit(): void {
+    if (this.limitHitPending || this.apiBlockPending) return
+    this.limitHitPending = true
+    try {
+      void this.q?.interrupt?.()
+    } catch {
+      /* abaikan */
+    }
+  }
+
+  /** Catat satu baris system ke chat (dipakai orkestrator: memberi tahu switch akun / limit). */
+  systemNote(text: string): void {
+    this.record({ role: 'system', text, ts: Date.now() })
+  }
+
+  /** Tandai sesi berhenti karena limit (tak bisa/berhenti auto-switch) → status error. */
+  markLimited(): void {
+    this.setStatus('error')
+    this.emitActivity('kena limit')
+  }
+
+  /** Naikkan & kembalikan hitungan pindah-akun beruntun akibat limit (guard anti-loop). */
+  bumpLimitStreak(): number {
+    return ++this.limitStreak
   }
 
   private setApiStopped(v: boolean): void {
@@ -579,6 +622,10 @@ export class Session {
         break
       }
       case 'assistant': {
+        // Limit langganan (5-jam/7-hari) datang sebagai field `error:'rate_limit'` di wrapper,
+        // BUKAN exception — deteksi di sini agar auto-switch akun ikut kepicu.
+        const wrapErr = (msg as { error?: string }).error
+        if (wrapErr && isLimitError(wrapErr)) this.flagLimitHit()
         const message = (msg as { message?: { content?: unknown[]; usage?: Record<string, number> } }).message
         this.applyUsage(message?.usage)
         for (const block of (message?.content ?? []) as {
@@ -627,9 +674,19 @@ export class Session {
         break
       }
       case 'result': {
-        const subtype = (msg as { subtype?: string }).subtype
+        const r = msg as { subtype?: string; errors?: unknown[]; stop_reason?: string }
+        const subtype = r.subtype
         if (isApiBlock(JSON.stringify(msg))) this.flagApiBlock() // blokir API terselip di result
-        if (subtype && subtype !== 'success' && !this.apiBlockPending) {
+        // Limit bisa muncul sbg result error (errors[]/stop_reason). JANGAN stringify seluruh msg
+        // untuk isLimitError — field "usage"/"modelUsage" akan false-positive; cek yang spesifik saja.
+        if (subtype && subtype !== 'success') {
+          const hit =
+            (Array.isArray(r.errors) && r.errors.some((x) => isLimitError(String(x)))) ||
+            (r.stop_reason ? isLimitError(r.stop_reason) : false)
+          if (hit) this.flagLimitHit()
+        }
+        if (subtype === 'success') this.limitStreak = 0 // turn sukses → rantai limit direset
+        if (subtype && subtype !== 'success' && !this.apiBlockPending && !this.limitHitPending) {
           this.record({
             role: 'system',
             text: `⚠️ ${friendlyError(subtype)}  (session tetap bisa dilanjut — kirim pesan lagi)`,

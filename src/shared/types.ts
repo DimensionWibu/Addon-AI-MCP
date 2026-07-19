@@ -132,7 +132,7 @@ export type GroveEvent =
   | { channel: 'board:update'; payload: BoardEntry }
   | { channel: 'message:new'; payload: InboxMessage }
   | { channel: 'memory:new'; payload: Memory }
-  | { channel: 'accounts:update'; payload: { accounts: Account[]; autoSwitch: boolean } }
+  | { channel: 'accounts:update'; payload: { accounts: Account[]; autoSwitch: boolean; autoResume: boolean } }
   | { channel: 'session:removed'; payload: { ids: string[] } }
   | { channel: 'session:activity'; payload: { id: string; activity: string } }
   | { channel: 'usage:update'; payload: UsageInfo | null }
@@ -149,11 +149,12 @@ export interface GroveApi {
   reorderSessions: (orderedIds: string[]) => Promise<void>
   compactSession: (id: string) => Promise<void>
   setLoop: (id: string, enabled: boolean) => Promise<void>
-  listAccounts: () => Promise<{ accounts: Account[]; autoSwitch: boolean }>
+  listAccounts: () => Promise<{ accounts: Account[]; autoSwitch: boolean; autoResume: boolean }>
   addAccount: (label: string, token: string) => Promise<Account>
   deleteAccount: (id: string) => Promise<void>
   setSessionAccount: (id: string, accountId: string | null) => Promise<void>
   setAutoSwitch: (on: boolean) => Promise<void>
+  setAutoResume: (on: boolean) => Promise<void>
   interruptSession: (id: string) => Promise<void>
   deleteSession: (id: string) => Promise<string[]>
   getSnapshot: () => Promise<GroveSnapshot>

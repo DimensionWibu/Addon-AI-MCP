@@ -25,11 +25,8 @@ const DEFAULT_MODEL: string | undefined = undefined // undefined = ikut default 
 const ROOT_STATUS_DEBOUNCE_MS = 3000 // gabung beberapa laporan worker jadi 1 giliran root
 const LOOP_INTERVAL_MS = 10 * 60_000 // auto-check "udah sampe mana?" tiap 10 menit (bisa diubah)
 
-// Instruksi yang di-inject ke root saat worker melapor → root merangkum ke user.
-const ROOT_STATUS_REQUEST = `[GROVE AUTO] One or more sub-workers in your tree just reported progress. Do NOT do their work. Call mcp__grove__read_board (scope "tree") and mcp__grove__list_workers, then send the USER ONE short, consolidated status update: for each worker its percent + state, what is finished, what is still running, and the overall progress. If every worker is done, give the final synthesized answer instead.`
-
-// Ping auto-check berkala ke root (thread loop): dorong worker mangkrak, lapor ke user, stop bila selesai.
-const LOOP_CHECK_PROMPT = `[GROVE AUTO-CHECK] Pengecekan berkala — udah sampai mana? Panggil mcp__grove__read_board (scope "tree") + mcp__grove__list_workers. Jika ADA worker idle padahal tugasnya BELUM tuntas, dorong dia lanjut (mcp__grove__assign_worker) supaya tidak mangkrak. Beri user update singkat progres saat ini. Jika SELURUH pekerjaan pohon sudah SELESAI, panggil mcp__grove__task_done untuk menghentikan pengecekan berkala ini (menyala lagi otomatis saat user memberi tugas baru).`
+// Prompt auto-ping dibangun DINAMIS (lihat rootStatusPrompt/loopCheckPrompt) dengan ringkasan
+// board disuntik langsung → root tak perlu memanggil read_board tiap ping (hemat konteks besar).
 
 export class SessionManager implements GroveHost {
   private readonly sessions = new Map<string, Session>()
@@ -37,6 +34,7 @@ export class SessionManager implements GroveHost {
   private readonly loopTimers = new Map<string, NodeJS.Timeout>() // rootId → timer auto-check berkala
   private readonly loopEnabled = new Set<string>() // rootId dengan auto-check aktif
   private autoSwitch = false // pindah akun otomatis saat kena limit
+  private autoResume = false // saat app dibuka lagi, lanjutkan sesi yang tadinya kerja
 
   constructor(
     private readonly db: Board,
@@ -123,22 +121,33 @@ export class SessionManager implements GroveHost {
 
   /** Muat ulang session dari DB saat startup (dormant; resume saat di-chat lagi). */
   loadFromDisk(): void {
+    // Sesi yang statusnya masih 'running'/'waiting' = tadi sedang kerja saat app ditutup.
+    const wasWorking = this.db
+      .getAllSessions()
+      .filter((m) => m.status === 'running' || m.status === 'waiting')
+      .map((m) => m.id)
     this.db.normalizeStaleStatuses()
     this.autoSwitch = this.db.getSetting('autoSwitch') === '1'
+    this.autoResume = this.db.getSetting('autoResume') === '1'
     for (const meta of this.db.getAllSessions()) {
       if (this.sessions.has(meta.id)) continue
       this.registerSession(meta, { emit: false, start: false })
     }
+    // Reconnect: bila diaktifkan, lanjutkan sesi-sesi yang tadi kerja (resume konteks + dorong lanjut).
+    if (this.autoResume) for (const id of wasWorking) this.sessions.get(id)?.autoResume()
   }
 
   // ---- akun (multi-account) -------------------------------------------------
 
   private emitAccounts(): void {
-    this.emit({ channel: 'accounts:update', payload: { accounts: this.db.getAccounts(), autoSwitch: this.autoSwitch } })
+    this.emit({
+      channel: 'accounts:update',
+      payload: { accounts: this.db.getAccounts(), autoSwitch: this.autoSwitch, autoResume: this.autoResume }
+    })
   }
 
-  listAccounts(): { accounts: Account[]; autoSwitch: boolean } {
-    return { accounts: this.db.getAccounts(), autoSwitch: this.autoSwitch }
+  listAccounts(): { accounts: Account[]; autoSwitch: boolean; autoResume: boolean } {
+    return { accounts: this.db.getAccounts(), autoSwitch: this.autoSwitch, autoResume: this.autoResume }
   }
 
   addAccount(label: string, token: string): Account {
@@ -160,6 +169,12 @@ export class SessionManager implements GroveHost {
     this.emitAccounts()
   }
 
+  setAutoResume(on: boolean): void {
+    this.autoResume = on
+    this.db.setSetting('autoResume', on ? '1' : '0')
+    this.emitAccounts()
+  }
+
   // GroveHost.getAccountToken
   getAccountToken(accountId?: string): string | null {
     return accountId ? this.db.getAccountToken(accountId) : null
@@ -176,19 +191,45 @@ export class SessionManager implements GroveHost {
     s.applyAccountChange() // kalau sedang jalan → henti; pesan berikutnya resume dgn token baru
   }
 
-  /** GroveHost.onLimitHit — auto-switch akun bila aktif & ada akun lain, lalu lanjutkan. */
+  /**
+   * GroveHost.onLimitHit — dipanggil saat sebuah sesi kena limit pemakaian.
+   * Bila auto-switch aktif & ada ≥2 akun: pindah ke akun berikutnya lalu LANJUTKAN otomatis
+   * (resume konteks + inject "lanjutkan"). Guard anti-loop: bila sudah keliling semua akun
+   * tanpa turn sukses, berhenti. Bila tak bisa switch, beri pesan jelas ke user.
+   */
   onLimitHit(sessionId: string): void {
-    if (!this.autoSwitch) return
     const s = this.sessions.get(sessionId)
     if (!s) return
     const accts = this.db.getAccounts()
-    if (accts.length < 2) return // butuh ≥2 akun untuk rotasi
+
+    // Tak bisa rotasi → berhenti dgn pesan yang menjelaskan cara mengaktifkan auto-lanjut.
+    if (!this.autoSwitch || accts.length < 2) {
+      s.systemNote(
+        !this.autoSwitch
+          ? '🚫 Kena limit pemakaian. Aktifkan "Auto-switch akun" di tab Akun agar otomatis pindah akun & lanjut. Kirim pesan lagi untuk coba lagi nanti.'
+          : '🚫 Kena limit pemakaian. Tambah akun kedua di tab Akun agar bisa auto-switch & lanjut otomatis. Kirim pesan lagi untuk coba lagi nanti.'
+      )
+      s.markLimited()
+      return
+    }
+
+    // Guard anti-loop: kalau sudah pindah sebanyak jumlah akun tanpa turn sukses → semua kena limit.
+    if (s.bumpLimitStreak() > accts.length) {
+      s.systemNote(`🚫 Semua ${accts.length} akun kena limit. Auto-switch dihentikan — coba lagi setelah limit reset.`)
+      s.markLimited()
+      return
+    }
+
     const curIdx = accts.findIndex((a) => a.id === s.meta.accountId)
     const next = accts[(curIdx + 1) % accts.length]
-    if (!next || next.id === s.meta.accountId) return
+    if (!next || next.id === s.meta.accountId) {
+      s.markLimited()
+      return
+    }
     this.setSessionAccount(sessionId, next.id)
+    s.systemNote(`🔀 Akun kena limit → pindah ke "${next.label}", melanjutkan otomatis…`)
     s.injectAutoTask(
-      `[GROVE] Akun sebelumnya kena limit — sudah dipindah ke akun "${next.label}". Lanjutkan pekerjaan sebelumnya.`
+      `[GROVE] Akun sebelumnya kena limit, sudah dipindah otomatis ke akun "${next.label}". Lanjutkan pekerjaan sebelumnya tepat dari titik terakhir tanpa mengulang dari awal.`
     )
   }
 
@@ -329,7 +370,12 @@ export class SessionManager implements GroveHost {
     this.loopTimers.set(rootId, setTimeout(() => this.runLoopCheck(rootId), LOOP_INTERVAL_MS))
   }
 
-  /** Tiap interval: dorong root idle untuk cek worker; skip bila root running / belum ada worker. */
+  /**
+   * Tiap interval: dorong root untuk cek worker HANYA bila perlu — hemat konteks.
+   * Skip kalau: root sedang running, belum ada worker, atau SEMUA worker masih running
+   * (beneran lagi kerja → tak perlu ditanya). Cuma tanya kalau ada worker yg tak sedang jalan
+   * (mangkrak/selesai) supaya bisa didorong lanjut / dilaporkan.
+   */
   private runLoopCheck(rootId: string): void {
     this.loopTimers.delete(rootId)
     if (!this.loopEnabled.has(rootId)) return
@@ -338,8 +384,11 @@ export class SessionManager implements GroveHost {
       this.stopLoop(rootId)
       return
     }
-    const treeSize = [...this.sessions.values()].filter((s) => s.meta.treeId === rootId).length
-    if (root.meta.status !== 'running' && treeSize > 1) root.autoCheck(LOOP_CHECK_PROMPT)
+    const subs = [...this.sessions.values()].filter((s) => s.meta.treeId === rootId && s.meta.role === 'sub')
+    const anyStalled = subs.some((s) => s.meta.status !== 'running') // ada worker yg tak sedang kerja
+    if (root.meta.status !== 'running' && subs.length > 0 && anyStalled) {
+      root.autoCheck(this.loopCheckPrompt(rootId))
+    }
     this.scheduleLoop(rootId) // ulangi sampai task_done / dimatikan manual
   }
 
@@ -438,6 +487,28 @@ export class SessionManager implements GroveHost {
     this.scheduleRootStatus(s.meta.treeId)
   }
 
+  /** Ringkasan board 1-baris/sesi untuk pohon ini — disuntik ke ping (ganti read_board = hemat konteks). */
+  private treeBoardSummary(treeId: string): string {
+    const boardMap = new Map(this.db.getAllBoard().map((b) => [b.sessionId, b]))
+    const lines: string[] = []
+    for (const m of this.metaSnapshot()) {
+      if (m.treeId !== treeId) continue
+      const b = boardMap.get(m.id)
+      const pct = b?.percent != null ? `, ${b.percent}%` : ''
+      const prog = b?.progress ? ` — ${b.progress}` : b?.summary ? ` — ${b.summary}` : ''
+      lines.push(`- [${m.role}] ${m.title} (${m.status}${pct})${prog}`)
+    }
+    return lines.join('\n') || '(belum ada laporan)'
+  }
+
+  private rootStatusPrompt(treeId: string): string {
+    return `[GROVE AUTO] Worker melapor progres. Ringkasan board pohonmu (JANGAN panggil read_board — ini sudah lengkap):\n${this.treeBoardSummary(treeId)}\n\nBeri user SATU baris update singkat dari ringkasan ini. Kalau semua worker sudah selesai, beri sintesis akhir.`
+  }
+
+  private loopCheckPrompt(treeId: string): string {
+    return `[GROVE AUTO-CHECK] Udah sampai mana? Ringkasan board pohonmu (JANGAN panggil read_board — sudah lengkap):\n${this.treeBoardSummary(treeId)}\n\nDari ringkasan itu: kalau ADA worker idle yang tugasnya BELUM selesai, dorong lanjut (mcp__grove__list_workers untuk id → mcp__grove__assign_worker). Beri user update singkat. Kalau SEMUA selesai, panggil mcp__grove__task_done.`
+  }
+
   /** Debounce: banyak laporan worker berdekatan → satu kali bangunkan root. */
   private scheduleRootStatus(treeId: string): void {
     if (!this.sessions.has(treeId)) return // root sudah tak ada
@@ -448,7 +519,7 @@ export class SessionManager implements GroveHost {
       setTimeout(() => {
         this.rootStatusTimers.delete(treeId)
         const root = this.sessions.get(treeId)
-        if (root && root.meta.role === 'root') root.injectAutoTask(ROOT_STATUS_REQUEST)
+        if (root && root.meta.role === 'root') root.injectAutoTask(this.rootStatusPrompt(treeId))
       }, ROOT_STATUS_DEBOUNCE_MS)
     )
   }
