@@ -31,3 +31,7 @@ npm-debug.log*
 # OS
 Thumbs.db
 .DS_Store
+
+# file sementara audit/status
+_*.cjs
+_*.ts

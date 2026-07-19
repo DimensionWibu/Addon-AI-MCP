@@ -11,9 +11,33 @@ import type {
   SessionRole,
   SessionStatus
 } from '../../shared/types'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 import type { Board } from './db'
 import { buildGroveServer, type GroveHost } from './mcpTools'
 import { contextPercent, contextWindowFor } from './contextWindows'
+
+/**
+ * Path claude.exe untuk app TERPAKET. Di dalam paket, SDK menunjuk binary yang berada
+ * DI DALAM app.asar — file di arsip asar tak bisa dieksekusi ("exists but failed to launch").
+ * electron-builder sudah menyalinnya ke app.asar.unpacked (lihat asarUnpack di package.json),
+ * jadi arahkan SDK ke salinan nyata itu. Di dev path ini tak ada → undefined → SDK pakai default.
+ */
+function packagedClaudeExecutable(): string | undefined {
+  const rp = process.resourcesPath
+  if (!rp) return undefined
+  const bin = process.platform === 'win32' ? 'claude.exe' : 'claude'
+  const p = join(
+    rp,
+    'app.asar.unpacked',
+    'node_modules',
+    '@anthropic-ai',
+    `claude-agent-sdk-${process.platform}-${process.arch}`,
+    bin
+  )
+  return existsSync(p) ? p : undefined
+}
+const CLAUDE_EXE = packagedClaudeExecutable()
 
 // Bagian prompt yang SAMA untuk root & sub: cara melapor ke papan tulis + koordinasi.
 const GROVE_COMMON = `
@@ -287,6 +311,7 @@ export class Session {
         mcpServers: { grove: server },
         // Token akun → CLI subprocess pakai akun itu. Wajib spread process.env (opsi env MENGGANTInya).
         ...(token ? { env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: token } as Record<string, string> } : {}),
+        ...(CLAUDE_EXE ? { pathToClaudeCodeExecutable: CLAUDE_EXE } : {}), // paket: pakai binary unpacked
         resume: this.meta.sdkSessionId // lanjut konteks bila session dimuat ulang dari DB
       }
     })
