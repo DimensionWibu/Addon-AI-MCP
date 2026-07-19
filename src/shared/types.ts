@@ -123,6 +123,7 @@ export type GroveEvent =
           ctxPercent?: number
           tokensTotal?: number
           loopActive?: boolean
+          apiStopped?: boolean
         }
     }
   | { channel: 'chat:delta'; payload: { id: string; delta: string } }

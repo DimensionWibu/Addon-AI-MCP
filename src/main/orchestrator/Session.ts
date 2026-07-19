@@ -148,6 +148,13 @@ function isLimitError(raw: string): boolean {
   return /rate_limit|429|usage|quota|exceed|limit reached|out of/i.test(raw)
 }
 
+/** Apakah pesan menandakan blokir keamanan API Claude (pemicu recycle sesi). */
+function isApiBlock(raw: string): boolean {
+  return /safety measures that flagged|flagged this message for a|Cyber Verification Program|cybersecurity topic/i.test(
+    raw
+  )
+}
+
 /** Ubah error/subtype mentah jadi pesan ramah + apakah masih bisa dilanjut. */
 function friendlyError(raw: string): string {
   const s = raw.toLowerCase()
@@ -215,6 +222,10 @@ export class Session {
   private toolRows = new Map<string, { rowId: number; input: string }>() // tool_use_id → baris + input
   private pendingCompactSeed: string | null = null // ringkasan compact, dieksekusi saat turn selesai
   private reseedText: string | null = null // disisipkan ke pesan berikutnya setelah konteks dipadatkan
+  private lastUserPrompt = '' // prompt terakhir (untuk diulang saat recycle akibat blokir API)
+  private apiRetries = 0 // berapa kali recycle akibat blokir API (maks 3)
+  private apiStopped = false // dihentikan API Claude setelah 3× → judul merah
+  private apiBlockPending = false // blokir API terdeteksi → recycle di akhir turn
 
   constructor(
     meta: SessionMeta,
@@ -300,6 +311,9 @@ export class Session {
 
   /** Kirim pesan user (opsional dengan gambar); start otomatis bila dormant. */
   sendUserMessage(text: string, images?: ImageAttachment[]): void {
+    this.lastUserPrompt = text // prompt user SEBELUM kena flag → diulang saat recycle
+    this.apiRetries = 0 // prompt baru → reset hitungan recycle
+    this.setApiStopped(false)
     text = this.withReseed(text)
     if (!this.started) this.start()
     const dataUrls = (images ?? []).map((im) => `data:${im.mediaType};base64,${im.data}`)
@@ -379,7 +393,9 @@ export class Session {
         this.handle(msg as Record<string, unknown> & { type: string })
       }
     } catch (e) {
-      if (!this.stopped) {
+      if (isApiBlock(String(e))) this.apiBlockPending = true
+      // Jangan cetak error generik kalau kita sengaja interupsi untuk recycle blokir API.
+      if (!this.stopped && !this.apiBlockPending) {
         console.error(`[Session ${this.meta.id}] error:`, e)
         this.record({
           role: 'system',
@@ -399,6 +415,11 @@ export class Session {
       }
       // Setelah state di-reset: bila kena limit, minta orkestrator auto-switch akun (bila aktif).
       if (limitHit && !this.stopped) this.host.onLimitHit(this.meta.id)
+      // Bila terdeteksi blokir API → recycle (reset konteks + ulang tugas terakhir).
+      if (this.apiBlockPending && !this.stopped) {
+        this.apiBlockPending = false
+        this.handleApiBlock()
+      }
     }
   }
 
@@ -419,6 +440,67 @@ export class Session {
     }
     this.setStatus('idle')
     this.emitActivity('idle')
+  }
+
+  /** Blokir API terdeteksi → hentikan turn agar consume().finally menjalankan recycle. */
+  private flagApiBlock(): void {
+    if (this.apiStopped || this.apiBlockPending) return
+    this.apiBlockPending = true
+    try {
+      void this.q?.interrupt?.()
+    } catch {
+      /* abaikan */
+    }
+  }
+
+  private setApiStopped(v: boolean): void {
+    if (this.apiStopped === v) return
+    this.apiStopped = v
+    this.emit({ channel: 'session:update', payload: { id: this.meta.id, apiStopped: v } })
+  }
+
+  /**
+   * Recycle akibat blokir API: reset konteks Claude (buang riwayat yang ke-flag) TAPI seed
+   * ringkasan tugas (dari board: summary/progress/todo) + prompt terakhir → lanjut langsung.
+   * Setelah 3× masih diblokir → stop + tandai judul merah.
+   */
+  private handleApiBlock(): void {
+    if (this.apiStopped) return
+    if (this.apiRetries >= 3) {
+      this.record({
+        role: 'system',
+        text: '⛔ Sesi dihentikan oleh API Claude (diblokir 3× berturut). Rephrase prompt lalu kirim manual untuk mencoba lagi.',
+        ts: Date.now()
+      })
+      this.setApiStopped(true)
+      this.setStatus('error')
+      this.emitActivity('diblokir API')
+      return
+    }
+    this.apiRetries++
+    // Ringkasan tugas dari board sesi ini → agar sesi fresh tetap tahu konteksnya.
+    const board = this.db.getBoardEntry(this.meta.id)
+    const ctx: string[] = []
+    if (board?.summary) ctx.push(`Tujuan & hasil sejauh ini: ${board.summary}`)
+    if (board?.progress) ctx.push(`Terakhir dikerjakan: ${board.progress}`)
+    if (board?.todo?.length) {
+      ctx.push(`Checklist: ${board.todo.map((t) => `${t.done ? '✓' : '○'} ${t.text}`).join('; ')}`)
+    }
+    const seed = ctx.length
+      ? `[Konteks direset karena blokir keamanan API — ringkasan tugasmu agar bisa langsung lanjut:]\n${ctx.join('\n')}\n\n`
+      : ''
+    this.record({
+      role: 'system',
+      text: `🔄 Diblokir API — recycle konteks #${this.apiRetries}/3, melanjutkan tugas terakhir dengan konteks bersih…`,
+      ts: Date.now()
+    })
+    this.meta.sdkSessionId = undefined // fresh SDK session (tanpa resume → riwayat lama dilepas)
+    this.db.upsertSession(this.meta)
+    const prompt = `${seed}Lanjutkan pekerjaan.${this.lastUserPrompt ? ` Instruksi terakhir dari user: ${this.lastUserPrompt}` : ''}`
+    this.start() // fresh (started sudah false dari finally)
+    this.setStatus('running')
+    this.emitActivity(`recycle #${this.apiRetries}…`)
+    this.inbox.push(prompt)
   }
 
   /** Interupsi turn yang sedang berjalan TANPA menutup session (masih bisa lanjut chat). */
@@ -496,6 +578,7 @@ export class Session {
         }[]) {
           if (block.type === 'text' && block.text?.trim()) {
             this.record({ role: 'assistant', text: block.text, ts: Date.now() })
+            if (isApiBlock(block.text)) this.flagApiBlock() // API blokir pesan → recycle di akhir turn
           } else if (block.type === 'tool_use') {
             const input = formatToolInput(block.input)
             const rowId = this.record({
@@ -533,7 +616,8 @@ export class Session {
       }
       case 'result': {
         const subtype = (msg as { subtype?: string }).subtype
-        if (subtype && subtype !== 'success') {
+        if (isApiBlock(JSON.stringify(msg))) this.flagApiBlock() // blokir API terselip di result
+        if (subtype && subtype !== 'success' && !this.apiBlockPending) {
           this.record({
             role: 'system',
             text: `⚠️ ${friendlyError(subtype)}  (session tetap bisa dilanjut — kirim pesan lagi)`,

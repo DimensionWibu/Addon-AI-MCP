@@ -15,7 +15,7 @@ import type {
 let pendingImages: ImageAttachment[] = []
 let pendingRefs: string[] = [] // path file/folder referensi
 
-type Node = SessionMeta & { ctxPercent: number; tokensTotal: number; loopActive?: boolean }
+type Node = SessionMeta & { ctxPercent: number; tokensTotal: number; loopActive?: boolean; apiStopped?: boolean }
 
 const turnStart = new Map<string, number>() // kapan turn 'running' dimulai
 const lastElapsed = new Map<string, number>() // durasi turn terakhir (ms)
@@ -466,6 +466,7 @@ function updateNodeVisual(id: string): void {
   refs.badge.textContent = `${n.ctxPercent}%`
   refs.badge.className = badgeClass(n.ctxPercent)
   refs.wrap.classList.toggle('active', activeId === id)
+  refs.wrap.classList.toggle('api-stopped', !!n.apiStopped) // dihentikan API Claude → judul merah
 }
 
 function updateActiveHighlight(): void {

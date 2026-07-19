@@ -134,6 +134,8 @@ button, input { font-family: var(--mono); }
 .node:hover { background: var(--panel-2); }
 .node.active { background: #1f1712; border-color: var(--accent); }
 .node.child { border-left: 1px solid var(--border); }
+/* sesi dihentikan oleh API Claude (setelah 3× recycle gagal) → judul background merah */
+.node.api-stopped .node-title { background: var(--err); color: #fff; padding: 0 5px; border-radius: 2px; }
 /* drag-reorder: node yang sedang digenggam + garis indikator posisi drop */
 .node.dragging { opacity: .55; background: var(--panel-2); border-color: var(--accent); cursor: grabbing; }
 .node.drop-above { box-shadow: inset 0 2px 0 0 var(--accent); }
