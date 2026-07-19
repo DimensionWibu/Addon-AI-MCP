@@ -45,6 +45,13 @@ export interface InboxMessage {
   ts: number
 }
 
+/** Akun Claude (langganan) untuk dipakai per-session. Token TIDAK pernah dikirim ke renderer. */
+export interface Account {
+  id: string
+  label: string
+  createdAt: number
+}
+
 /** Hasil "compact": ringkasan konsolidasi 1 pohon, disimpan persist di DB Grove. */
 export interface Memory {
   id: number

@@ -5,6 +5,7 @@ import { Board } from './orchestrator/db'
 import { SessionManager } from './orchestrator/SessionManager'
 import { registerIpc } from './ipc'
 import { fetchUsage } from './usage'
+import { loadWindowState, trackWindowState } from './windowState'
 import type { GroveEvent } from '../shared/types'
 
 let mainWindow: BrowserWindow | null = null
@@ -38,9 +39,11 @@ if (!app.requestSingleInstanceLock()) {
 }
 
 function createWindow(): void {
+  const st = loadWindowState() // ukuran + posisi terakhir (atau default)
   mainWindow = new BrowserWindow({
-    width: 1360,
-    height: 860,
+    width: st.width,
+    height: st.height,
+    ...(st.x != null && st.y != null ? { x: st.x, y: st.y } : {}),
     minWidth: 960,
     minHeight: 600,
     backgroundColor: '#0b1220',
@@ -52,6 +55,8 @@ function createWindow(): void {
       nodeIntegration: false
     }
   })
+  if (st.maximized) mainWindow.maximize()
+  trackWindowState(mainWindow) // simpan otomatis saat resize/move/close
 
   if (process.env.ELECTRON_RENDERER_URL) {
     void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)

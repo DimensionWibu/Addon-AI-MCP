@@ -12,4 +12,4 @@ if not exist node_modules (
 )
 echo [Grove] Menjalankan...
 call npm run dev
-pause
+
