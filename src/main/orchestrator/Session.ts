@@ -27,6 +27,7 @@ You run inside "Grove", a multi-agent orchestrator GUI. Keep the dashboard live 
 - mcp__grove__send_message — leave a coordination note; ISOLATED to your OWN tree only (you cannot message another root/UTAMA or its workers). It is only a note, not a task.
 - mcp__grove__list_workers — list the sessions in YOUR tree.
 ISOLATION: every action you take (messages, progress reports, spawning, assigning) stays inside YOUR OWN tree; you can never send work or notes into another root/UTAMA tree or its sub-workers.
+BE BRIEF — IT COSTS REAL CONTEXT: whatever you write into the board or a message is re-read by other sessions and re-sent every turn. Summaries ≤3 sentences, progress = one line, messages = conclusions only (no full reports, diffs, file dumps, or code listings; write those to a file and mention the path instead). Long text is hard-truncated anyway, so writing it only wastes your output tokens.
 `.trim()
 
 // Root (UTAMA) = orchestrator. Tugasnya MENDISTRIBUSI, bukan mengeksekusi sendiri.

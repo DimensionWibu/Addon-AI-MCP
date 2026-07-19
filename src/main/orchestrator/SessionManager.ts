@@ -562,9 +562,11 @@ export class SessionManager implements GroveHost {
       const b = boardMap.get(m.id)
       const pct = b?.percent != null ? `, ${b.percent}%` : ''
       const prog = b?.progress ? ` — ${b.progress}` : b?.summary ? ` — ${b.summary}` : ''
-      lines.push(`- [${m.role}] ${m.title} (${m.status}${pct})${prog}`)
+      lines.push(`- [${m.role}] ${m.title} (${m.status}${pct})${prog}`.slice(0, 220)) // 1 baris/sesi
     }
-    return lines.join('\n') || '(belum ada laporan)'
+    const out = lines.join('\n') || '(belum ada laporan)'
+    // Batas total: ringkasan ini disuntik ke SETIAP ping → jangan biarkan tumbuh tak terbatas.
+    return out.length > 2000 ? out.slice(0, 2000) + '\n… (dipotong)' : out
   }
 
   private rootStatusPrompt(treeId: string): string {

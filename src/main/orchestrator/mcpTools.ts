@@ -33,6 +33,22 @@ export interface GroveHost {
 
 const ok = (text: string) => ({ content: [{ type: 'text' as const, text }] })
 
+// HEMAT KONTEKS: semua teks yang ditulis agent ke papan/pesan akan MASUK ke konteks sesi lain
+// (board disuntik ke tiap auto-ping root; pesan dibaca penerima). Tanpa batas, satu laporan
+// 10.000 karakter membebani setiap pembaca. Batas ditegakkan di sini, bukan sekadar diimbau.
+const CAP_MESSAGE = 1200 // isi send_message
+const CAP_SUMMARY = 600 // update_summary
+const CAP_PROGRESS = 200 // report_progress / report_to_parent
+const CAP_TODO_ITEM = 100 // teks per item todo
+const MAX_TODO_ITEMS = 12
+const CAP_READ_MESSAGES = 4000 // total hasil read_messages
+
+/** Potong teks dengan penanda jelas agar agent tahu isinya dipangkas. */
+function cap(s: string, max: number): string {
+  const t = (s ?? '').trim()
+  return t.length <= max ? t : `${t.slice(0, max)}… [dipotong ${t.length - max} char — ringkas saja]`
+}
+
 export function buildGroveServer(sessionId: string, host: GroveHost) {
   const spawnWorker = tool(
     'spawn_worker',
@@ -73,10 +89,10 @@ export function buildGroveServer(sessionId: string, host: GroveHost) {
 
   const updateSummary = tool(
     'update_summary',
-    'Set/update your 1-3 sentence summary (goal + current result) on the shared board.',
+    'Set/update your 1-3 sentence summary (goal + current result) on the shared board. Keep it under ~600 chars — it is truncated, and the board is injected into the orchestrator context on every status ping.',
     { summary: z.string() },
     async (args) => {
-      host.updateSummary(sessionId, args.summary)
+      host.updateSummary(sessionId, cap(args.summary, CAP_SUMMARY))
       return ok('Summary updated.')
     }
   )
@@ -86,20 +102,20 @@ export function buildGroveServer(sessionId: string, host: GroveHost) {
     'Replace your task checklist on the shared board.',
     { items: z.array(z.object({ text: z.string(), done: z.boolean() })) },
     async (args) => {
-      host.updateTodo(sessionId, args.items)
+      host.updateTodo(sessionId, args.items.slice(0, MAX_TODO_ITEMS).map((t) => ({ ...t, text: cap(t.text, CAP_TODO_ITEM) })))
       return ok(`Todo updated (${args.items.length} items).`)
     }
   )
 
   const reportProgress = tool(
     'report_progress',
-    'One sentence on what you are doing RIGHT NOW (+ optional rough completion percent). Call whenever you switch activity so the dashboard stays live.',
+    'ONE short sentence on what you are doing RIGHT NOW (+ optional percent). Under ~200 chars (truncated). Call when you switch activity so the dashboard stays live.',
     {
       progress: z.string(),
       percent: z.number().min(0).max(100).optional().describe('Rough completion percent 0-100 for the progress bar')
     },
     async (args) => {
-      host.reportProgress(sessionId, args.progress, args.percent)
+      host.reportProgress(sessionId, cap(args.progress, CAP_PROGRESS), args.percent)
       return ok('Progress reported.')
     }
   )
@@ -112,7 +128,7 @@ export function buildGroveServer(sessionId: string, host: GroveHost) {
       percent: z.number().min(0).max(100).optional().describe('Rough completion percent 0-100')
     },
     async (args) => {
-      host.reportToParent(sessionId, { status: args.status, percent: args.percent })
+      host.reportToParent(sessionId, { status: cap(args.status, CAP_PROGRESS), percent: args.percent })
       return ok('Reported to parent orchestrator.')
     }
   )
@@ -149,10 +165,10 @@ export function buildGroveServer(sessionId: string, host: GroveHost) {
 
   const sendMessage = tool(
     'send_message',
-    'Send a coordination note to another session IN YOUR OWN TREE (or omit `to` to broadcast to your tree only). Isolated: you cannot message another root/UTAMA tree or its sub-workers. It is only a note, not a task.',
+    'Send a SHORT coordination note to another session IN YOUR OWN TREE (or omit `to` to broadcast to your tree only). Keep it under ~1200 chars — it is HARD-TRUNCATED, and every recipient pays for it in their context. Send conclusions, not full reports/diffs/code dumps (put detail in files instead). Isolated to your own tree; it is a note, not a task.',
     { to: z.string().optional().describe('Target session id in your tree; omit to broadcast within your tree'), body: z.string() },
     async (args) => {
-      host.sendMessage(sessionId, args.to ?? null, args.body)
+      host.sendMessage(sessionId, args.to ?? null, cap(args.body, CAP_MESSAGE))
       return ok('Message sent.')
     }
   )
@@ -163,7 +179,8 @@ export function buildGroveServer(sessionId: string, host: GroveHost) {
     { unread_only: z.boolean().default(true) },
     async (args) => {
       const msgs = host.readMessages(sessionId, args.unread_only)
-      return ok(JSON.stringify(msgs)) // kompak → hemat token
+      // Batasi total agar inbox besar tak membanjiri konteks pembaca.
+      return ok(cap(JSON.stringify(msgs), CAP_READ_MESSAGES))
     }
   )
 
