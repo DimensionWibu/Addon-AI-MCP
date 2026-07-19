@@ -114,6 +114,18 @@ export interface UsageInfo {
   stale?: boolean // true = fetch terakhir gagal, ini nilai last-good (token mungkin sedang refresh)
 }
 
+/**
+ * Usage SELALU dibawa bersama identitas akun pemiliknya. Tanpa ini angka jadi ambigu:
+ * user tak bisa tahu 19% itu milik akun mana (bug lama: selalu akun login utama).
+ * usage = null berarti "belum/tak bisa diketahui untuk akun ini" — JANGAN tampilkan
+ * angka akun lain sebagai gantinya.
+ */
+export interface UsageSnapshot {
+  accountId: string | null // null = login utama (~/.claude/.credentials.json)
+  accountLabel: string
+  usage: UsageInfo | null
+}
+
 /** Event yang dikirim main → renderer lewat channel 'grove:event'. */
 export type GroveEvent =
   | { channel: 'session:new'; payload: SessionMeta & { ctxPercent: number } }
@@ -136,7 +148,7 @@ export type GroveEvent =
   | { channel: 'accounts:update'; payload: { accounts: Account[]; autoSwitch: boolean; autoResume: boolean } }
   | { channel: 'session:removed'; payload: { ids: string[] } }
   | { channel: 'session:activity'; payload: { id: string; activity: string } }
-  | { channel: 'usage:update'; payload: UsageInfo | null }
+  | { channel: 'usage:update'; payload: UsageSnapshot }
 
 /** API yang dibuka preload sebagai window.grove */
 export interface GroveApi {
@@ -160,7 +172,10 @@ export interface GroveApi {
   deleteSession: (id: string) => Promise<string[]>
   getSnapshot: () => Promise<GroveSnapshot>
   getChat: (id: string) => Promise<ChatMessage[]>
-  getUsage: () => Promise<UsageInfo | null>
+  /** Usage akun milik sesi tsb (null/undefined = login utama). Fetch langsung. */
+  getUsage: (sessionId?: string | null) => Promise<UsageSnapshot>
+  /** Beri tahu main sesi mana yang sedang dipilih; balikan = snapshot cache akun itu (tanpa nunggu fetch). */
+  setUsageSession: (sessionId: string | null) => Promise<UsageSnapshot>
   onEvent: (cb: (ev: GroveEvent) => void) => () => void
 }
 

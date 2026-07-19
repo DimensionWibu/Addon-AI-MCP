@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { Board } from './orchestrator/db'
 import { SessionManager } from './orchestrator/SessionManager'
 import { registerIpc } from './ipc'
-import { fetchUsage } from './usage'
+import { fetchUsage, peekUsage } from './usage'
 import { loadWindowState, trackWindowState } from './windowState'
 import type { GroveEvent } from '../shared/types'
 
@@ -111,19 +111,55 @@ app.whenReady().then(async () => {
   registerIpc(manager)
   if (KEEP_ALIVE) createTray() // hanya di produksi: sesi lanjut jalan meski jendela ditutup
 
-  // Limit paket langganan → poll adaptif + IPC on-demand.
+  // Limit paket langganan → poll adaptif + IPC on-demand, MENGIKUTI AKUN SESI YANG DIPILIH di UI.
   // Endpoint oauth/usage bisa membalas 429 (rate-limit); maka saat fetch gagal/stale kita
   // BACKOFF (mundur makin lama, sampai 5 menit) agar tidak makin memicu rate-limit — bukan
   // mempercepat. last-good tetap tampil selama ini. Begitu segar lagi, balik ke 60s.
-  ipcMain.handle('grove:getUsage', () => fetchUsage())
-  let usageDelay = 60_000
-  const loopUsage = async (): Promise<void> => {
-    const u = await fetchUsage()
-    emit({ channel: 'usage:update', payload: u })
-    usageDelay = u && !u.stale ? 60_000 : Math.min(usageDelay * 2, 300_000)
-    setTimeout(() => void loopUsage(), usageDelay)
+  // Backoff disimpan PER AKUN: akun yang lagi kena 429 tak boleh menghukum akun lain.
+  let usageSessionId: string | null = null // sesi yang sedang dipilih di UI
+  let usageGen = 0 // penanda generasi; hasil fetch dari akun lama dibuang
+  let usageTimer: NodeJS.Timeout | null = null
+  const usageDelays = new Map<string, number>() // accountId ?? 'default' → jeda poll berikutnya
+
+  const usageTarget = (): { id: string | null; label: string; token: string | null } =>
+    manager.getSessionAccountInfo(usageSessionId)
+
+  const loopUsage = async (gen: number): Promise<void> => {
+    const t = usageTarget()
+    const key = t.id ?? 'default'
+    const usage = await fetchUsage({ id: t.id, token: t.token })
+    if (gen !== usageGen) return // akun terlanjur berganti → hasil ini basi, jangan ditampilkan
+    emit({ channel: 'usage:update', payload: { accountId: t.id, accountLabel: t.label, usage } })
+    const delay = usage && !usage.stale ? 60_000 : Math.min((usageDelays.get(key) ?? 60_000) * 2, 300_000)
+    usageDelays.set(key, delay)
+    usageTimer = setTimeout(() => void loopUsage(gen), delay)
   }
-  void loopUsage()
+
+  /** Akun terpilih berubah → refetch SEGERA, jangan menunggu sisa backoff akun sebelumnya. */
+  const restartUsage = (): void => {
+    usageGen++
+    if (usageTimer) clearTimeout(usageTimer)
+    void loopUsage(usageGen)
+  }
+
+  ipcMain.handle('grove:getUsage', async (_e, arg?: { sessionId?: string | null }) => {
+    if (arg && 'sessionId' in arg) usageSessionId = arg.sessionId ?? null
+    const t = usageTarget()
+    return { accountId: t.id, accountLabel: t.label, usage: await fetchUsage({ id: t.id, token: t.token }) }
+  })
+
+  // Renderer memberi tahu sesi mana yang dipilih. Balasannya dari cache (instan, tanpa nunggu
+  // jaringan) supaya label+angka di header langsung jadi milik akun yang benar; fetch segarnya
+  // menyusul lewat event usage:update. Kalau akunnya sama, jangan restart poll (hemat rate-limit).
+  ipcMain.handle('grove:setUsageSession', (_e, { sessionId }: { sessionId: string | null }) => {
+    const before = usageTarget().id
+    usageSessionId = sessionId ?? null
+    const t = usageTarget()
+    if (t.id !== before) restartUsage()
+    return { accountId: t.id, accountLabel: t.label, usage: peekUsage(t.id) }
+  })
+
+  void loopUsage(usageGen)
 
   app.on('before-quit', () => {
     // JANGAN stopAll di sini: itu mengubah status running→idle & menghapus info "sesi ini tadi kerja"

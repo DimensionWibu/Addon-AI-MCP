@@ -26,7 +26,8 @@ const api: GroveApi = {
   deleteSession: (id: string) => ipcRenderer.invoke('grove:deleteSession', { id }),
   getSnapshot: () => ipcRenderer.invoke('grove:getSnapshot'),
   getChat: (id: string) => ipcRenderer.invoke('grove:getChat', { id }),
-  getUsage: () => ipcRenderer.invoke('grove:getUsage'),
+  getUsage: (sessionId?: string | null) => ipcRenderer.invoke('grove:getUsage', { sessionId: sessionId ?? null }),
+  setUsageSession: (sessionId: string | null) => ipcRenderer.invoke('grove:setUsageSession', { sessionId }),
   onEvent: (cb: (ev: GroveEvent) => void) => {
     const handler = (_e: unknown, ev: GroveEvent): void => cb(ev)
     ipcRenderer.on('grove:event', handler)

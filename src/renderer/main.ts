@@ -8,7 +8,7 @@ import type {
   Memory,
   SessionMeta,
   TreeNode,
-  UsageInfo,
+  UsageSnapshot,
   UsageWindow
 } from '../shared/types'
 
@@ -77,30 +77,37 @@ function fmtResetIn(iso: string | null): string {
   const m = mins % 60
   return h > 0 ? `reset ${h}j ${m}m` : `reset ${m}m`
 }
-let lastUsageShown: UsageInfo | null = null
-
-function renderUsage(u: UsageInfo | null): void {
+/**
+ * Angka usage SELALU diberi label akun pemiliknya — tanpa itu user tak bisa tahu
+ * "5-jam 19%" itu milik akun mana. usage null = tak diketahui untuk akun tsb; kita
+ * tampilkan "—", BUKAN angka akun sebelumnya (itu bug lamanya).
+ */
+function renderUsage(snap: UsageSnapshot): void {
   const box = $('usage')
   const panel = $('usage-panel')
+  const u = snap.usage
+  const label = escapeHtml(snap.accountLabel)
+  const acct = `<span class="uacct">${label}</span>`
+  box.classList.toggle('stale', !!u?.stale)
+
   if (!u) {
-    // Jangan kosongkan kalau sudah pernah ada nilai — biarkan last-good tetap tampil.
-    if (lastUsageShown) return
-    box.textContent = ''
-    panel.textContent = ''
+    box.title = `Usage akun "${snap.accountLabel}" belum bisa dibaca. Klik untuk detail.`
+    box.innerHTML = `${acct}<span class="ubar-mini"><span class="ulabel">usage</span><span class="uval">—</span></span>`
+    panel.innerHTML =
+      `<div class="up-title">BATAS PEMAKAIAN · ${label}</div>` +
+      `<div class="up-empty">Belum bisa dibaca untuk akun ini (token belum ada / ditolak server). Angka akun lain sengaja tidak ditampilkan agar tidak menyesatkan.</div>`
     return
   }
-  lastUsageShown = u
-  box.classList.toggle('stale', !!u.stale)
   box.title = u.stale
-    ? 'Data terakhir (refresh gagal — token mungkin sedang di-refresh). Klik untuk detail.'
-    : 'Klik untuk detail limit'
-  // top bar: mini bars 5-jam + minggu
+    ? `Akun "${snap.accountLabel}" — data terakhir (refresh gagal, token mungkin sedang di-refresh). Klik untuk detail.`
+    : `Akun "${snap.accountLabel}" — klik untuk detail limit`
+  // top bar: label akun + mini bars 5-jam + minggu
   const mini = (label: string, w?: UsageWindow): string => {
     const v = w?.utilization ?? null
     const val = v != null ? Math.round(v) : 0
     return `<span class="ubar-mini"><span class="ulabel">${label}</span><span class="ubar"><span class="ufill ${ufillClass(v)}" style="width:${val}%"></span></span><span class="uval">${v != null ? val + '%' : '—'}</span></span>`
   }
-  box.innerHTML = mini('5-jam', u.fiveHour) + mini('minggu', u.sevenDay)
+  box.innerHTML = acct + mini('5-jam', u.fiveHour) + mini('minggu', u.sevenDay)
 
   // panel detail (ala halaman Usage web)
   const row = (name: string, w?: UsageWindow): string => {
@@ -109,7 +116,7 @@ function renderUsage(u: UsageInfo | null): void {
     const val = Math.round(v)
     return `<div class="up-row"><div class="up-head"><span class="up-name">${name}<span class="up-reset">${fmtResetIn(w?.resetsAt ?? null)}</span></span><span class="up-pct">${val}% terpakai</span></div><div class="up-bar"><span class="up-fill ${ufillClass(v)}" style="width:${val}%"></span></div></div>`
   }
-  let html = `<div class="up-title">BATAS PEMAKAIAN</div>`
+  let html = `<div class="up-title">BATAS PEMAKAIAN · ${label}</div>`
   html += row('Sesi saat ini (5 jam)', u.fiveHour)
   html += row('Mingguan — semua model', u.sevenDay)
   html += row('Mingguan — Opus', u.sevenDayOpus)
@@ -117,6 +124,20 @@ function renderUsage(u: UsageInfo | null): void {
   if (u.monthly?.enabled) html += row('Bulanan (kredit)', { utilization: u.monthly.utilization, resetsAt: null })
   html += `<div class="up-updated">Update: ${new Date(u.fetchedAt).toLocaleTimeString()}${u.stale ? ' · data terakhir (refresh gagal)' : ''}</div>`
   panel.innerHTML = html
+}
+
+// Beri tahu main sesi mana yang dipilih → usage di header ikut akun sesi itu.
+// Guard `usageReq`: pindah sesi cepat-cepat bisa membuat balasan lama datang belakangan;
+// hanya balasan permintaan TERAKHIR yang boleh dirender.
+let usageReq = 0
+function syncUsageSession(): void {
+  const my = ++usageReq
+  void window.grove
+    .setUsageSession(activeId)
+    .then((snap) => {
+      if (my === usageReq) renderUsage(snap)
+    })
+    .catch(() => {})
 }
 
 // ---- markdown ringan (aman: escape dulu) → tampil ala Claude Code CLI ------
@@ -562,6 +583,7 @@ function applyRemoved(ids: string[]): void {
 
 async function selectSession(id: string): Promise<void> {
   activeId = id
+  syncUsageSession() // usage di header ikut akun sesi yang baru dipilih
   pendingEl = null
   pendingText = ''
   shownLen = 0
@@ -911,6 +933,8 @@ function onEvent(ev: GroveEvent): void {
         updateNodeVisual(ev.payload.id) // incremental, bukan rebuild pohon
         touchActive(ev.payload.id) // catat waktu aktif + refresh label jam idle/done
         if (ev.payload.id === activeId) updateChatHeader()
+        // Akun sesi aktif berganti (manual atau auto-switch saat limit) → usage harus ikut pindah.
+        if (ev.payload.id === activeId && 'accountId' in ev.payload) syncUsageSession()
       }
       break
     }
@@ -1225,7 +1249,7 @@ async function init(): Promise<void> {
   }, 1000)
 
   window.grove.onEvent(onEvent)
-  void window.grove.getUsage().then(renderUsage).catch(() => {})
+  syncUsageSession() // sebelum ada sesi terpilih → akun default (login utama)
   void window.grove
     .listAccounts()
     .then((r) => {

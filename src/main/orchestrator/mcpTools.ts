@@ -21,8 +21,12 @@ export interface GroveHost {
   sendMessage(fromId: string, to: string | null, body: string): void
   readMessages(sessionId: string, unreadOnly: boolean): InboxMessage[]
   listWorkers(sessionId: string): { id: string; title: string; role: string; status: string }[]
-  /** Dipanggil Session saat satu turn selesai — dipakai membangunkan root untuk lapor ke user. */
-  notifyTurnEnd(sessionId: string): void
+  /**
+   * Dipanggil Session saat satu turn selesai — dipakai membangunkan root untuk lapor ke user.
+   * `outcome` HANYA diisi bila turn berakhir WAJAR (result sukses, bukan interupsi/limit/blokir API)
+   * DAN worker belum melapor final sendiri → host wajib melapor otomatis ke parent.
+   */
+  notifyTurnEnd(sessionId: string, outcome?: { finalText: string }): void
   /** Token akun untuk di-inject ke query (null → pakai login default). */
   getAccountToken(accountId?: string): string | null
   /** Dipanggil Session saat turn gagal karena limit — untuk auto-switch akun bila aktif. */
@@ -36,15 +40,15 @@ const ok = (text: string) => ({ content: [{ type: 'text' as const, text }] })
 // HEMAT KONTEKS: semua teks yang ditulis agent ke papan/pesan akan MASUK ke konteks sesi lain
 // (board disuntik ke tiap auto-ping root; pesan dibaca penerima). Tanpa batas, satu laporan
 // 10.000 karakter membebani setiap pembaca. Batas ditegakkan di sini, bukan sekadar diimbau.
-const CAP_MESSAGE = 1200 // isi send_message
+export const CAP_MESSAGE = 1200 // isi send_message
 const CAP_SUMMARY = 600 // update_summary
-const CAP_PROGRESS = 200 // report_progress / report_to_parent
+export const CAP_PROGRESS = 200 // report_progress / report_to_parent
 const CAP_TODO_ITEM = 100 // teks per item todo
 const MAX_TODO_ITEMS = 12
 const CAP_READ_MESSAGES = 4000 // total hasil read_messages
 
 /** Potong teks dengan penanda jelas agar agent tahu isinya dipangkas. */
-function cap(s: string, max: number): string {
+export function cap(s: string, max: number): string {
   const t = (s ?? '').trim()
   return t.length <= max ? t : `${t.slice(0, max)}… [dipotong ${t.length - max} char — ringkas saja]`
 }

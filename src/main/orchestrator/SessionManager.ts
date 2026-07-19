@@ -189,6 +189,19 @@ export class SessionManager implements GroveHost {
     return accountId ? this.db.getAccountToken(accountId) : null
   }
 
+  /**
+   * Akun yang dipakai sebuah sesi + tokennya — untuk fetch usage per-akun.
+   * HANYA dipanggil di main-process; `token` TIDAK BOLEH ikut dikirim ke renderer.
+   * Akun yang sudah dihapus dari DB → token null (bukan jatuh ke login utama), supaya
+   * UI menampilkan "tidak diketahui", bukan angka akun lain.
+   */
+  getSessionAccountInfo(sessionId: string | null): { id: string | null; label: string; token: string | null } {
+    const accountId = (sessionId ? this.sessions.get(sessionId)?.meta.accountId : null) ?? null
+    if (!accountId) return { id: null, label: 'Default', token: null }
+    const label = this.db.getAccounts().find((a) => a.id === accountId)?.label
+    return { id: accountId, label: label ?? 'Akun terhapus', token: this.db.getAccountToken(accountId) }
+  }
+
   /** Set akun sebuah session (null = login default); berlaku pada start/resume berikutnya. */
   setSessionAccount(sessionId: string, accountId: string | null): void {
     const s = this.sessions.get(sessionId)
@@ -588,10 +601,14 @@ export class SessionManager implements GroveHost {
         this.rootStatusTimers.delete(treeId)
         const root = this.sessions.get(treeId)
         if (!root || root.meta.role !== 'root') return
-        // HEMAT USAGE: root sedang jalan → jangan antrekan giliran ekstra (nanti dia lihat
-        // kondisi terbaru sendiri); dan bila board TIDAK berubah sejak ping terakhir, tak ada
-        // info baru untuk dilaporkan → lewati (giliran nol = biaya nol).
-        if (root.meta.status === 'running') return
+        // HEMAT USAGE tanpa MENGHILANGKAN laporan:
+        // - root sedang jalan → JANGAN dibuang (dulu bug: laporan worker lenyap selamanya).
+        //   Jadwalkan ulang saja; nanti saat root idle, ping-nya menyusul.
+        // - board tak berubah sejak ping terakhir → memang tak ada info baru → lewati.
+        if (root.meta.status === 'running') {
+          this.scheduleRootStatus(treeId) // coba lagi nanti, jangan hilang
+          return
+        }
         const summary = this.treeBoardSummary(treeId)
         if (this.lastPingSummary.get(treeId) === summary) return
         this.lastPingSummary.set(treeId, summary)

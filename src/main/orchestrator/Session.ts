@@ -248,6 +248,10 @@ export class Session {
   private compactArmed = true // auto-compact hanya menyala bila konteks NYATA pernah turun < LOW (hysteresis anti-thrash)
   private compactStreak = 0 // compact beruntun tanpa turn yang berakhir < LOW (guard anti-freeze; lihat limitStreak)
   private compactWarned = false // peringatan "konteks tetap penuh" sudah dikirim untuk streak ini (anti-spam)
+  // --- jaminan runtime "worker selesai → parent tahu" (lihat host.notifyTurnEnd) ---
+  private lastAssistantText = '' // teks asisten TERAKHIR pada turn berjalan = hasil kerja worker
+  private finalReportSent = false // worker SUDAH lapor final (report_to_parent 100%) untuk turn ini → jangan dobel
+  private interrupting = false // turn dihentikan PAKSA (Stop All/compact/ganti akun) → bukan "selesai wajar"
 
   constructor(
     meta: SessionMeta,
@@ -309,6 +313,7 @@ export class Session {
    */
   compactWith(summary: string): void {
     if (!summary) return
+    this.interrupting = true // turn dipotong paksa → jangan dianggap "worker selesai"
     this.reseedText = summary
     this.meta.sdkSessionId = undefined // start berikutnya FRESH (tanpa resume) → konteks lama dilepas
     this.resetCtx() // ctx% turun ke 0 seketika
@@ -340,8 +345,24 @@ export class Session {
     return `[MEMORI TERKOMPAK — ringkasan konteks sebelumnya]\n${seed}\n\n---\n${text}`
   }
 
+  /**
+   * Awal satu giliran baru → reset pelacak laporan-final. Dipanggil di SETIAP jalur yang
+   * mendorong pekerjaan baru (pesan user, tugas dari orkestrator, auto-check, resume).
+   */
+  private beginTurn(): void {
+    this.lastAssistantText = ''
+    this.finalReportSent = false
+    this.interrupting = false
+  }
+
+  /** Dipanggil host saat worker memanggil report_to_parent dgn percent 100 → auto-report jangan dobel. */
+  markFinalReported(): void {
+    this.finalReportSent = true
+  }
+
   /** Kirim pesan user (opsional dengan gambar); start otomatis bila dormant. */
   sendUserMessage(text: string, images?: ImageAttachment[]): void {
+    this.beginTurn()
     this.lastUserPrompt = text // prompt user SEBELUM kena flag → diulang saat recycle
     this.apiRetries = 0 // prompt baru → reset hitungan recycle
     this.limitStreak = 0 // prompt user baru → reset rantai pindah-akun akibat limit
@@ -371,6 +392,7 @@ export class Session {
    */
   injectAutoTask(text: string): void {
     if (this.stopped) return
+    this.beginTurn()
     text = this.withReseed(text)
     if (!this.started) this.start()
     this.setStatus('running')
@@ -417,6 +439,7 @@ export class Session {
 
   async stop(): Promise<void> {
     this.stopped = true
+    this.interrupting = true // ditutup paksa → bukan "turn selesai wajar"
     this.inbox.close()
     try {
       await this.q?.interrupt?.()
@@ -482,6 +505,7 @@ export class Session {
    */
   applyAccountChange(): void {
     if (!this.started) return
+    this.interrupting = true // turn dipotong paksa demi ganti akun → bukan "worker selesai"
     this.started = false
     const q = this.q
     this.q = null
