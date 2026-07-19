@@ -119,6 +119,7 @@ body.reordering .node { cursor: grabbing; }
 .node-id { color: var(--text-dim); font-size: 10px; }
 .node-meta { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
 .node-act { color: var(--accent); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.node-time { color: var(--text-dim); font-size: 10px; white-space: nowrap; margin-left: auto; font-variant-numeric: tabular-nums; }
 .role-tag { font-size: 9px; padding: 0 5px; border-radius: 2px; background: #262626; color: #9a9a9a; text-transform: uppercase; letter-spacing: .5px; }
 .role-tag.root { background: #3a2418; color: var(--accent-2); }
 .node-del { background: transparent; border: none; color: var(--text-dim); cursor: pointer; font-size: 16px; line-height: 1; padding: 0 4px; border-radius: 3px; visibility: hidden; flex: 0 0 auto; }

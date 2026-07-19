@@ -43,10 +43,16 @@ const activities = new Map<string, string>()
 // Panel detail tool (untuk update saat output tool tiba) — key = toolUseId, di sesi aktif.
 const toolDetailEls = new Map<string, HTMLElement>()
 
+// Kapan tiap sesi terakhir aktif — dipakai menampilkan jam kerja terakhir untuk idle/done.
+const lastActive = new Map<string, number>()
+function fmtClock(ts: number): string {
+  return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+}
+
 // Referensi elemen DOM per node → update incremental tanpa rebuild seluruh pohon.
 const nodeEls = new Map<
   string,
-  { wrap: HTMLElement; dot: HTMLElement; badge: HTMLElement; title: HTMLElement; act: HTMLElement }
+  { wrap: HTMLElement; dot: HTMLElement; badge: HTMLElement; title: HTMLElement; act: HTMLElement; time: HTMLElement }
 >()
 
 function fmtTokens(n: number): string {
@@ -427,16 +433,20 @@ function renderNode(node: Node, depth: number, container: HTMLElement): void {
   }
   const row = el('div', { class: 'node-row' }, dot, title, badge, del)
   const act = el('span', { class: 'node-act' }, activities.get(node.id) ?? '')
+  const time = el('span', { class: 'node-time' }, '')
   const meta = el(
     'div',
     { class: 'node-meta' },
     el('span', { class: `role-tag ${node.role}` }, node.role === 'root' ? 'UTAMA' : 'SUB'),
     el('span', { class: 'node-id' }, shortId(node.id)),
-    act
+    act,
+    time
   )
   wrap.append(row, meta)
   container.append(wrap)
-  nodeEls.set(node.id, { wrap, dot, badge, title, act })
+  nodeEls.set(node.id, { wrap, dot, badge, title, act, time })
+  if (!lastActive.has(node.id) && node.updatedAt) lastActive.set(node.id, node.updatedAt) // seed dari DB
+  updateNodeTime(node.id)
 
   const children = [...nodes.values()].filter((n) => n.parentId === node.id)
   children.sort(orderCmp)
@@ -462,6 +472,22 @@ function updateActiveHighlight(): void {
 function updateNodeActivity(id: string): void {
   const refs = nodeEls.get(id)
   if (refs) refs.act.textContent = activities.get(id) ?? ''
+}
+
+/** Untuk sesi non-running (idle/done/error): tampilkan jam kerja terakhir "· HH:MM". */
+function updateNodeTime(id: string): void {
+  const refs = nodeEls.get(id)
+  const n = nodes.get(id)
+  if (!refs?.time || !n) return
+  const active = n.status === 'running' || n.status === 'waiting'
+  const ts = lastActive.get(id)
+  refs.time.textContent = !active && ts ? `· ${fmtClock(ts)}` : ''
+}
+
+/** Catat sesi baru saja aktif → simpan waktu + refresh label jam. */
+function touchActive(id: string): void {
+  lastActive.set(id, Date.now())
+  updateNodeTime(id)
 }
 
 function countDescendants(id: string): number {
@@ -720,6 +746,7 @@ function onEvent(ev: GroveEvent): void {
         Object.assign(cur, ev.payload)
         if (ev.payload.ctxPercent != null) cur.ctxPercent = ev.payload.ctxPercent
         updateNodeVisual(ev.payload.id) // incremental, bukan rebuild pohon
+        touchActive(ev.payload.id) // catat waktu aktif + refresh label jam idle/done
         if (ev.payload.id === activeId) updateChatHeader()
       }
       break
@@ -776,6 +803,7 @@ function onEvent(ev: GroveEvent): void {
     case 'session:activity': {
       activities.set(ev.payload.id, ev.payload.activity)
       updateNodeActivity(ev.payload.id)
+      touchActive(ev.payload.id) // jaga waktu aktif tetap terkini
       if (ev.payload.id === activeId) updateChatHeader()
       break
     }
