@@ -389,7 +389,17 @@ export class Session {
   autoResume(): void {
     if (this.stopped || this.started) return
     this.record({ role: 'system', text: '▶ Melanjutkan sesi yang terputus saat aplikasi ditutup…', ts: Date.now() })
-    this.injectAutoTask('Lanjutkan pekerjaan sebelumnya yang terputus saat aplikasi ditutup.')
+    // Sertakan ringkasan tugas dari board: kalau sesi ini fresh (tanpa resume), dia tetap tahu
+    // harus melanjutkan apa — bukan sekadar disuruh "lanjutkan" tanpa konteks.
+    const b = this.db.getBoardEntry(this.meta.id)
+    const ctx: string[] = []
+    if (b?.summary) ctx.push(`Tujuan & kondisi terakhir: ${b.summary}`)
+    if (b?.progress) ctx.push(`Terakhir dikerjakan: ${b.progress}`)
+    if (b?.todo?.length) ctx.push(`Checklist: ${b.todo.map((t) => `${t.done ? '✓' : '○'} ${t.text}`).join('; ')}`)
+    const seed = ctx.length ? `\n\n${ctx.join('\n')}` : ''
+    this.injectAutoTask(
+      `Lanjutkan pekerjaan sebelumnya yang terputus saat aplikasi ditutup. Mulai dari titik terakhir, jangan mengulang dari awal.${seed}`
+    )
   }
 
   private emitActivity(activity: string): void {
