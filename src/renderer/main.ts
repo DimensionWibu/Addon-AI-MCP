@@ -6,17 +6,26 @@ import type {
   ImageAttachment,
   InboxMessage,
   Memory,
+  OpenRouterModel,
   SessionMeta,
   TreeNode,
   UsageSnapshot,
   UsageUnavailable,
   UsageWindow
 } from '../shared/types'
+import { MODEL_OPTIONS, modelLabel, OPENROUTER_MODEL_SUGGESTIONS } from '../shared/types'
 
 let pendingImages: ImageAttachment[] = []
 let pendingRefs: string[] = [] // path file/folder referensi
 
-type Node = SessionMeta & { ctxPercent: number; tokensTotal: number; loopActive?: boolean; apiStopped?: boolean; ctxPending?: boolean }
+// Draft compose PER-SESI (Bug 2): teks + lampiran yang belum terkirim, disimpan per sessionId supaya
+// tiap sesi punya kolom ketiknya sendiri — tak ada teks/lampiran satu sesi yang nyasar ke sesi lain.
+// Map ini hanya menyimpan draft sesi NON-aktif; draft sesi aktif "hidup" di textarea (di-load keluar
+// dari map saat sesi dipilih, di-save balik ke map saat sesi ditinggalkan).
+type Draft = { text: string; images: ImageAttachment[]; refs: string[] }
+const drafts = new Map<string, Draft>()
+
+type Node = SessionMeta & { ctxPercent: number; tokensTotal: number; loopActive?: boolean; apiStopped?: boolean; ctxPending?: boolean; awaitingInput?: boolean }
 
 const turnStart = new Map<string, number>() // kapan turn 'running' dimulai
 const lastElapsed = new Map<string, number>() // durasi turn terakhir (ms)
@@ -37,8 +46,13 @@ const memories: Memory[] = [] // hasil compact per pohon
 let accounts: Account[] = [] // akun Claude tersimpan (tanpa token)
 let autoSwitch = false // pindah akun otomatis saat limit
 let autoResume = false // lanjutkan sesi yang tadi kerja saat app dibuka lagi
+let defaultSwitchPct = 90 // ambang untuk akun yang tak punya ambang sendiri
+let defaultAccountId: string | null = null // akun global (dipakai pohon yang tak menentukan sendiri)
+let defaultModel: string | null = null // model global (dipakai sesi yang tak menentukan sendiri)
+let orModels: OpenRouterModel[] = [] // daftar model OpenRouter (dukung tools) untuk sesi ber-akun OR
 let activeId: string | null = null
 let pendingEl: HTMLElement | null = null
+let pendingTextNode: Text | null = null // B4: node teks streaming → append-only (hindari O(n²) set-ulang)
 let pendingText = '' // target teks penuh yang terkumpul
 let shownLen = 0 // berapa char sudah ditampilkan (efek ketik)
 
@@ -57,7 +71,15 @@ function fmtClock(ts: number): string {
 // Referensi elemen DOM per node → update incremental tanpa rebuild seluruh pohon.
 const nodeEls = new Map<
   string,
-  { wrap: HTMLElement; dot: HTMLElement; badge: HTMLElement; title: HTMLElement; act: HTMLElement; time: HTMLElement }
+  {
+    wrap: HTMLElement
+    dot: HTMLElement
+    badge: HTMLElement
+    title: HTMLElement
+    act: HTMLElement
+    time: HTMLElement
+    cwd: HTMLElement
+  }
 >()
 
 function fmtTokens(n: number): string {
@@ -286,15 +308,18 @@ function scrollChatToBottom(): void {
 // Efek ketik: ungkap teks menuju pendingText secara halus (SDK kirim ~50 char/500ms).
 function flushPending(): void {
   pendingRaf = 0
-  if (!pendingEl) {
+  if (!pendingEl || !pendingTextNode) {
     shownLen = 0
     return
   }
   if (shownLen < pendingText.length) {
     const remaining = pendingText.length - shownLen
     // kecepatan ungkap menyesuaikan backlog (min 1/frame → selalu mengalir & tak tertinggal)
-    shownLen = Math.min(pendingText.length, shownLen + Math.max(1, Math.ceil(remaining / 12)))
-    pendingEl.textContent = pendingText.slice(0, shownLen)
+    const next = Math.min(pendingText.length, shownLen + Math.max(1, Math.ceil(remaining / 12)))
+    // B4: APPEND hanya substring yang baru terungkap (O(char baru)) — bukan menyalin ulang
+    // seluruh string yang tumbuh tiap frame (dulu `textContent = slice(0,n)` → O(n²)).
+    pendingTextNode.appendData(pendingText.slice(shownLen, next))
+    shownLen = next
     scrollChatToBottom()
     pendingRaf = requestAnimationFrame(flushPending)
   }
@@ -458,6 +483,149 @@ function onDragEnd(): void {
   void window.grove.reorderSessions(without).catch((err) => alert(`Gagal ubah urutan: ${String(err)}`))
 }
 
+// ---- kunci folder kerja per-sesi (drag-drop folder) ------------------------
+
+/** Drag membawa FILE dari luar (bukan drag/seleksi internal)? */
+const dragHasFiles = (e: DragEvent): boolean => Array.from(e.dataTransfer?.types ?? []).includes('Files')
+
+/**
+ * Sudah ditangani sebagai "drop FOLDER" (kartu sesi / zona sidebar)? Dipakai supaya handler drop
+ * global tidak ikut memperlakukan folder itu sebagai "referensi chat". Sengaja TIDAK memakai
+ * stopPropagation: handler global-lah yang membereskan overlay & counter dragenter, jadi ia tetap
+ * harus jalan — hanya bagian "jadikan referensi" yang dilewati.
+ */
+let folderDropHandled = false
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/**
+ * Label folder untuk badge kartu: basename saja. Sesi scratch otomatis (…/grove/scratch/<uuid>)
+ * ditampilkan netral sebagai "scratch" — jangan pamerkan UUID panjang ke user.
+ */
+function folderLabel(cwd: string): string {
+  const base = (cwd ?? '').replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? ''
+  if (!base) return 'scratch'
+  return UUID_RE.test(base) || base.toLowerCase() === 'scratch' ? 'scratch' : base
+}
+
+/**
+ * Ambil path FOLDER dari sebuah drop.
+ * Electron 43 sudah MENGHAPUS `File.path`, jadi path wajib diambil lewat
+ * `webUtils.getPathForFile(file)` yang di-expose preload sebagai `window.grove.getPathForFile`.
+ * `webkitGetAsEntry().isDirectory` dipakai untuk menyaring file biasa lebih awal; validasi
+ * otoritatif (ada + benar-benar direktori) tetap dilakukan main lewat statSync.
+ * Mengembalikan null bila yang di-drop jelas bukan folder.
+ */
+function folderPathFromDrop(e: DragEvent): string | null {
+  const fileItems = Array.from(e.dataTransfer?.items ?? []).filter((it) => it.kind === 'file')
+  if (fileItems.length) {
+    for (const it of fileItems) {
+      const entry = it.webkitGetAsEntry?.()
+      if (entry && !entry.isDirectory) continue // file biasa → bukan kandidat folder
+      const f = it.getAsFile()
+      if (f) return window.grove.getPathForFile(f)
+    }
+    return null // ada yang di-drop, tapi tak satu pun folder
+  }
+  const f = e.dataTransfer?.files?.[0]
+  return f ? window.grove.getPathForFile(f) : null
+}
+
+/** Drop folder ke KARTU sesi → kunci sesi itu ke folder tersebut. */
+async function lockSessionToFolder(id: string, e: DragEvent): Promise<void> {
+  const path = folderPathFromDrop(e)
+  if (!path) {
+    alert('Drop sebuah FOLDER (bukan file) untuk mengunci folder kerja sesi.')
+    return
+  }
+  try {
+    const meta = await window.grove.setSessionCwd(id, path)
+    const cur = nodes.get(id)
+    if (cur) {
+      cur.cwd = meta.cwd
+      updateNodeVisual(id)
+    }
+    if (id === activeId) updateChatHeader()
+  } catch (err) {
+    alert(`Gagal mengunci folder: ${String(err)}`)
+  }
+}
+
+/** Drop folder ke area KOSONG sidebar → sesi BARU yang langsung terkunci di folder itu. */
+async function createSessionInFolder(e: DragEvent): Promise<void> {
+  const path = folderPathFromDrop(e)
+  if (!path) {
+    alert('Drop sebuah FOLDER (bukan file) untuk membuat sesi project baru.')
+    return
+  }
+  try {
+    const meta = await window.grove.dropFolder(path) // jalur yang sama dengan tombol "+ Folder"
+    ensureNode(meta)
+    void selectSession(meta.id)
+  } catch (err) {
+    alert(`Gagal membuat sesi dari folder: ${String(err)}`)
+  }
+}
+
+// ---- ZONA drop: kolom SESSIONS vs kolom CHAT (arti berbeda) ----------------
+
+/**
+ * Dua zona dengan SEMANTIK berbeda:
+ *  - 'sidebar' (kolom SESSIONS) → folder = KUNCI FOLDER KERJA (setara tombol "+ Folder")
+ *  - 'chat'    (kolom percakapan) → file/folder = REFERENSI chat ini, gambar = lampiran
+ *
+ * Zona ditentukan dari elemen yang sedang di-hover. Ini hanya mungkin karena `.drop-overlay`
+ * memakai `pointer-events: none`: tanpa itu overlay full-screen tersebut MENELAN semua event drag,
+ * `e.target` selalu si overlay, dan kartu sesi tak akan pernah menerima dragover/drop sama sekali.
+ */
+type DropZone = 'sidebar' | 'chat'
+
+const ZONE_HINT: Record<DropZone, string> = {
+  sidebar: '📁 Lepas FOLDER → kunci folder kerja sesi (fokus)',
+  chat: '📎 Lepas file/folder → jadi referensi chat ini · gambar → lampiran'
+}
+
+function zoneOf(e: DragEvent): DropZone {
+  const t = e.target as Element | null
+  return t?.closest?.('.sidebar') ? 'sidebar' : 'chat'
+}
+
+/** Bersihkan SEMUA penanda drag-over (zona + kartu) — dipanggil saat drop / drag selesai. */
+function clearDropAffordance(): void {
+  document.querySelector('.sidebar')?.classList.remove('drop-target')
+  document.querySelector('.chat')?.classList.remove('drop-target')
+  for (const { wrap } of nodeEls.values()) wrap.classList.remove('drop-folder', 'drop-reject')
+}
+
+/** Judul root sebuah node — dipakai mengarahkan user saat ia salah-drop ke kartu SUB. */
+function rootTitleOf(node: Node): string {
+  let cur: Node | undefined = node
+  const seen = new Set<string>()
+  while (cur?.parentId && !seen.has(cur.id)) {
+    seen.add(cur.id)
+    cur = nodes.get(cur.parentId)
+  }
+  return cur?.title ?? 'UTAMA'
+}
+
+/**
+ * Drop folder di kolom SESSIONS tapi DI LUAR kartu mana pun → sesi BARU terkunci di folder itu.
+ * Dipasang pada `.sidebar` (bukan `#tree`) agar area kosong termasuk header kolom ikut menerima.
+ * Kartu sesi menangani dropnya lebih dulu lalu menyalakan `folderDropHandled`, jadi di sini cukup
+ * mengecek flag itu — TANPA stopPropagation, supaya handler global tetap membereskan overlay.
+ */
+function setupSidebarFolderDrop(): void {
+  const sidebar = document.querySelector<HTMLElement>('.sidebar')
+  if (!sidebar) return
+  sidebar.addEventListener('drop', (e) => {
+    if (!dragHasFiles(e)) return
+    if (folderDropHandled) return // sudah ditangani kartu sesi
+    e.preventDefault()
+    folderDropHandled = true
+    void createSessionInFolder(e)
+  })
+}
+
 function renderTree(): void {
   const tree = $('tree')
   tree.textContent = ''
@@ -469,7 +637,7 @@ function renderTree(): void {
       el(
         'div',
         { class: 'empty' },
-        'Klik "+ Chat" atau langsung ketik untuk mulai. "+ Folder" untuk sesi proyek. Drag file/folder ke jendela = tambah referensi.'
+        'Klik "+ Chat" atau langsung ketik untuk mulai. "+ Folder" — atau DROP sebuah folder ke sini — untuk sesi proyek. Drop folder ke kartu sesi = kunci folder kerjanya. Drag file ke jendela = tambah referensi.'
       )
     )
     return
@@ -478,8 +646,16 @@ function renderTree(): void {
 }
 
 function renderNode(node: Node, depth: number, container: HTMLElement): void {
+  // Bug 1: sertakan status blink/stop/draft SAAT rebuild. Tanpa ini, renderTree() (mis. saat sesi
+  // baru muncul / dihapus / reorder — sering terjadi tepat setelah satu sesi dijawab lalu pohonnya
+  // berubah) menghapus kelas .awaiting-input dari SEMUA kartu, jadi kartu LAIN yang masih menunggu
+  // jawaban ikut berhenti berkedip walau baru satu sesi yang benar-benar dibalas. State per-kartu
+  // (node.awaitingInput/apiStopped) tetap utuh di `nodes`, jadi cukup dipetakan ulang ke kelas di sini.
   const wrap = el('div', {
-    class: `node${depth > 0 ? ' child' : ''}${activeId === node.id ? ' active' : ''}`
+    class:
+      `node${depth > 0 ? ' child' : ''}${activeId === node.id ? ' active' : ''}` +
+      `${node.awaitingInput ? ' awaiting-input' : ''}${node.apiStopped ? ' api-stopped' : ''}` +
+      `${drafts.has(node.id) ? ' has-draft' : ''}`
   })
   wrap.style.marginLeft = `${depth * 14}px`
   wrap.dataset.id = node.id
@@ -488,6 +664,36 @@ function renderNode(node: Node, depth: number, container: HTMLElement): void {
     selectSession(node.id)
   }
   wrap.addEventListener('pointerdown', (e) => onNodePointerDown(e, node)) // tekan-tahan → geser
+  wrap.addEventListener('contextmenu', (e) => {
+    e.preventDefault() // klik-kanan → menu akun/model per-chat (bukan menu bawaan browser)
+    showSessionMenu(node, e.clientX, e.clientY)
+  })
+
+  // Drop FOLDER ke kartu ini (zona SESSIONS). HANYA kartu ROOT yang boleh mengunci folder:
+  // sub-worker MEWARISI folder kerja dari root-nya, jadi drop ke kartu SUB sengaja DITOLAK dengan
+  // petunjuk — ini menghapus risiko tak sengaja mereset konteks sebuah sub yang sedang bekerja.
+  // (Reorder antar-kartu memakai pointer event, bukan HTML5 drag → kedua mekanisme tak bertabrakan.)
+  const isRoot = node.role === 'root'
+  wrap.addEventListener('dragover', (e) => {
+    if (!dragHasFiles(e)) return
+    e.preventDefault()
+    wrap.classList.add(isRoot ? 'drop-folder' : 'drop-reject')
+  })
+  wrap.addEventListener('dragleave', () => wrap.classList.remove('drop-folder', 'drop-reject'))
+  wrap.addEventListener('drop', (e) => {
+    wrap.classList.remove('drop-folder', 'drop-reject')
+    if (!dragHasFiles(e)) return
+    e.preventDefault()
+    folderDropHandled = true // handler global melewati "jadikan referensi", tapi tetap bereskan overlay
+    if (isRoot) {
+      void lockSessionToFolder(node.id, e)
+    } else {
+      alert(
+        `Sub-worker mengikuti folder kerja root-nya ("${rootTitleOf(node)}") — folder TIDAK diubah.\n\n` +
+          'Drop folder ke kartu UTAMA milik pohon ini untuk memindahkan seluruh pohon.'
+      )
+    }
+  })
 
   const dot = el('span', { class: `dot s-${node.status}` })
   const title = el('span', { class: 'node-title' }, node.title)
@@ -500,17 +706,25 @@ function renderNode(node: Node, depth: number, container: HTMLElement): void {
   const row = el('div', { class: 'node-row' }, dot, title, badge, del)
   const act = el('span', { class: 'node-act' }, activities.get(node.id) ?? '')
   const time = el('span', { class: 'node-time' }, '')
+  // Badge folder kerja: basename saja (full path di tooltip) supaya user bisa MEMVERIFIKASI
+  // sesi ini terkunci di mana tanpa menebak.
+  const cwdEl = el(
+    'span',
+    { class: 'node-cwd', title: `Folder kerja: ${node.cwd}\n(drop sebuah folder ke kartu ini untuk memindahkannya)` },
+    `📁 ${folderLabel(node.cwd)}`
+  )
   const meta = el(
     'div',
     { class: 'node-meta' },
     el('span', { class: `role-tag ${node.role}` }, node.role === 'root' ? 'UTAMA' : 'SUB'),
     el('span', { class: 'node-id' }, shortId(node.id)),
+    cwdEl,
     act,
     time
   )
   wrap.append(row, meta)
   container.append(wrap)
-  nodeEls.set(node.id, { wrap, dot, badge, title, act, time })
+  nodeEls.set(node.id, { wrap, dot, badge, title, act, time, cwd: cwdEl })
   if (!lastActive.has(node.id) && node.updatedAt) lastActive.set(node.id, node.updatedAt) // seed dari DB
   updateNodeTime(node.id)
 
@@ -530,6 +744,10 @@ function updateNodeVisual(id: string): void {
   refs.badge.className = ctxBadgeClass(n)
   refs.wrap.classList.toggle('active', activeId === id)
   refs.wrap.classList.toggle('api-stopped', !!n.apiStopped) // dihentikan API Claude → judul merah
+  refs.wrap.classList.toggle('awaiting-input', !!n.awaitingInput) // menunggu jawaban user/parent → kedip kuning
+  refs.wrap.classList.toggle('has-draft', drafts.has(id)) // ada teks/lampiran compose belum terkirim → tanda ✎
+  refs.cwd.textContent = `📁 ${folderLabel(n.cwd)}` // folder bisa berubah (drop folder ke kartu)
+  refs.cwd.title = `Folder kerja: ${n.cwd}\n(drop sebuah folder ke kartu ini untuk memindahkannya)`
 }
 
 function updateActiveHighlight(): void {
@@ -546,7 +764,7 @@ function updateNodeTime(id: string): void {
   const refs = nodeEls.get(id)
   const n = nodes.get(id)
   if (!refs?.time || !n) return
-  const active = n.status === 'running' || n.status === 'waiting'
+  const active = n.status === 'running'
   const ts = lastActive.get(id)
   refs.time.textContent = !active && ts ? `· ${fmtClock(ts)}` : ''
 }
@@ -584,6 +802,7 @@ function applyRemoved(ids: string[]): void {
     nodeEls.delete(id)
     activities.delete(id)
     lastActive.delete(id)
+    drafts.delete(id) // sesi dihapus → buang draft-nya (jangan bocor ke sesi lain / memori nyangkut)
     if (id === activeId) activeRemoved = true
   }
   renderTree()
@@ -595,6 +814,7 @@ function applyRemoved(ids: string[]): void {
     void selectSession(next.id)
   } else {
     pendingEl = null
+    pendingTextNode = null
     pendingText = ''
     $('chat-log').textContent = ''
     toolDetailEls.clear()
@@ -605,10 +825,44 @@ function applyRemoved(ids: string[]): void {
 
 // ---- chat ------------------------------------------------------------------
 
+/** Simpan isi kolom ketik (teks + lampiran) sebagai draft milik sesi `id`; kosong → hapus draft. */
+function saveDraft(id: string): void {
+  const text = $<HTMLTextAreaElement>('chat-input').value
+  if (text.trim() || pendingImages.length || pendingRefs.length) {
+    drafts.set(id, { text, images: pendingImages.slice(), refs: pendingRefs.slice() })
+  } else {
+    drafts.delete(id)
+  }
+  updateNodeVisual(id) // segarkan penanda ✎ "ada draft belum terkirim" pada kartu
+}
+
+/**
+ * Muat draft sesi `id` ke kolom ketik (kosong bila belum ada) lalu KELUARKAN dari map — draft sesi
+ * aktif kini "hidup" di textarea, bukan di map, sehingga penanda ✎ hanya muncul di sesi non-aktif.
+ */
+function loadDraft(id: string): void {
+  const d = drafts.get(id)
+  drafts.delete(id)
+  const input = $<HTMLTextAreaElement>('chat-input')
+  input.value = d?.text ?? ''
+  pendingImages = d ? d.images : []
+  pendingRefs = d ? d.refs : []
+  autoGrow(input)
+  renderAttachStrip()
+  updateNodeVisual(id)
+}
+
 async function selectSession(id: string): Promise<void> {
-  activeId = id
+  // Bug 2: pindah sesi → SIMPAN draft sesi lama, MUAT draft sesi baru. Hanya saat benar-benar ganti
+  // sesi (bukan re-select sesi yang sama, supaya teks yang sedang diketik tak ikut terhapus).
+  if (activeId !== id) {
+    if (activeId) saveDraft(activeId)
+    activeId = id
+    loadDraft(id)
+  }
   syncUsageSession() // usage di header ikut akun sesi yang baru dipilih
   pendingEl = null
+  pendingTextNode = null
   pendingText = ''
   shownLen = 0
   updateChatHeader()
@@ -645,6 +899,70 @@ function updateChatBadge(): void {
   badge.className = ctxBadgeClass(node)
 }
 
+/** Isi <select> model dengan MODEL_OPTIONS sekali; return elemennya. */
+function fillModelOptions(sel: HTMLSelectElement, inheritLabel?: string): void {
+  sel.textContent = ''
+  for (const m of MODEL_OPTIONS) {
+    const o = document.createElement('option')
+    o.value = m.value
+    // Untuk per-sesi, opsi kosong berarti "mewarisi", bukan "Default SDK" — beri tahu warisannya apa.
+    o.textContent = m.value === '' && inheritLabel ? inheritLabel : m.label
+    sel.append(o)
+  }
+}
+
+/** Dropdown model GLOBAL di topbar → set nilai dari state. */
+function syncGlobalModel(): void {
+  const sel = $<HTMLSelectElement>('global-model')
+  if (!sel.options.length) {
+    fillModelOptions(sel)
+    sel.addEventListener('change', () => {
+      void window.grove.setDefaultModel(sel.value || null).catch((e) => alert(`Gagal set model global: ${String(e)}`))
+    })
+  }
+  sel.value = defaultModel ?? ''
+}
+
+/** Model EFEKTIF sebuah node bila ia mewarisi (untuk label "ikut …"): node → root → global. */
+function inheritedModelFor(node: Node): string {
+  const root = node.role === 'sub' ? nodes.get(node.treeId) : null
+  const eff = (root?.model as string | undefined) ?? defaultModel ?? null
+  const src = node.role === 'sub' ? 'sesi utama' : 'global'
+  return `— ikut ${src}: ${modelLabel(eff)} —`
+}
+
+/** Nama pendek model OpenRouter untuk label ("nvidia/nemotron-3-super-…:free" → "nemotron-3-super…"). */
+function orShort(id?: string): string {
+  if (!id) return '?'
+  return id.split('/').pop()!.replace(/:free$/, '')
+}
+
+/** Isi <select> model sesuai PROVIDER akun efektif: OpenRouter → daftar model OR; Claude → alias. */
+function fillSessionModelSelect(sel: HTMLSelectElement, node: Node): void {
+  sel.textContent = ''
+  const eff = effectiveAccountOf(node)
+  if (eff?.provider === 'openrouter') {
+    // Akun OpenRouter: model BEBAS dipilih dari daftar OR. Opsi kosong = pakai model default akun.
+    const inherit = document.createElement('option')
+    inherit.value = ''
+    inherit.textContent = `— default akun: ${orShort(eff.model)} —`
+    sel.append(inherit)
+    const list = orModels.length ? orModels : OPENROUTER_MODEL_SUGGESTIONS.map((m) => ({ id: m.id, name: m.label, paramB: '', context: 0, free: true }))
+    for (const m of list) {
+      const o = document.createElement('option')
+      o.value = m.id
+      const ctx = m.context >= 1e6 ? `${m.context / 1e6}M` : m.context ? `${Math.round(m.context / 1000)}K` : ''
+      o.textContent = `${m.name}${m.paramB ? ` · ${m.paramB}` : ''}${ctx ? ` · ${ctx}` : ''}`
+      sel.append(o)
+    }
+    // node.model dipakai hanya bila ia id OpenRouter (ber-"/"); kalau tidak → pakai default akun.
+    sel.value = node.model && node.model.includes('/') ? node.model : ''
+  } else {
+    fillModelOptions(sel, inheritedModelFor(node))
+    sel.value = node.model ?? ''
+  }
+}
+
 function updateChatHeader(): void {
   const node = activeId ? nodes.get(activeId) : null
   $('chat-title').textContent = node ? `${node.title} · ${shortId(activeId!)}` : 'Belum ada session'
@@ -653,6 +971,7 @@ function updateChatHeader(): void {
   const stopBtn = $('btn-stop')
   const compactBtn = $('btn-compact')
   const loopBtn = $('btn-loop')
+  const modelSel = $<HTMLSelectElement>('chat-model')
   if (node) {
     const act = activities.get(activeId!) || node.status
     const elapsed = fmtDuration(lastElapsed.get(activeId!) ?? 0)
@@ -662,11 +981,21 @@ function updateChatHeader(): void {
     loopBtn.style.display = node.role === 'root' ? 'inline-block' : 'none' // hanya UTAMA
     loopBtn.classList.toggle('on', !!node.loopActive)
     loopBtn.textContent = node.loopActive ? '🔁 Auto ON' : '🔁 Auto'
+    // Dropdown model per-sesi, PROVIDER-AWARE: akun OpenRouter → daftar model OR (bisa dipilih bebas),
+    // akun Claude → alias + warisan. Opsi kosong = ikut warisan / default akun.
+    modelSel.style.display = 'inline-block'
+    fillSessionModelSelect(modelSel, node)
+    modelSel.onchange = (): void => {
+      void window.grove
+        .setSessionModel(node.id, modelSel.value || null)
+        .catch((e) => alert(`Gagal ganti model: ${String(e)}`))
+    }
   } else {
     telem.textContent = ''
     stopBtn.style.display = 'none'
     compactBtn.style.display = 'none'
     loopBtn.style.display = 'none'
+    modelSel.style.display = 'none'
   }
 }
 
@@ -854,6 +1183,134 @@ function renderMemories(): void {
   }
 }
 
+/**
+ * Banner "belum ada akun yang dipakai". SENGAJA non-blocking: Grove tetap bisa dipakai (kelola akun,
+ * baca riwayat, pilih akun) — yang berhenti hanya sesi yang tak punya token. Tombolnya membuka
+ * panel ⚙ Akun langsung supaya user tak perlu menebak harus ke mana.
+ */
+function showAuthBanner(p: { sessionTitle: string; tokenMissing: boolean; hasAccounts: boolean }): void {
+  const b = $('auth-banner')
+  b.textContent = ''
+  const msg = p.tokenMissing
+    ? `⛔ Sesi "${p.sessionTitle}" berhenti: akun yang dipilih tidak punya token. Tambahkan ulang tokennya.`
+    : p.hasAccounts
+      ? `⚠️ Sesi "${p.sessionTitle}" belum dipasangi akun. Pilih salah satu akun agar bisa jalan.`
+      : `⚠️ Belum ada akun Claude yang dipakai. Tambahkan token (CLAUDE_CODE_OAUTH_TOKEN) supaya sesi bisa jalan.`
+  b.append(el('span', {}, msg))
+
+  const open = el('button', {}, p.hasAccounts ? 'Pilih akun' : 'Tambah akun')
+  open.addEventListener('click', (e) => {
+    e.stopPropagation() // handler global menutup panel — jangan sampai dibuka lalu langsung ditutup
+    $('acct-panel').classList.add('show')
+    renderAccountsPanel()
+  })
+  const close = el('button', { class: 'ab-x', title: 'Sembunyikan' }, '×')
+  close.addEventListener('click', hideAuthBanner)
+  b.append(open, close)
+  b.hidden = false
+}
+
+function hideAuthBanner(): void {
+  $('auth-banner').hidden = true
+}
+
+// ---- context menu per-sesi (klik-kanan kartu): ganti akun & model -----------
+
+let ctxMenuEl: HTMLElement | null = null
+
+function closeSessionMenu(): void {
+  ctxMenuEl?.remove()
+  ctxMenuEl = null
+}
+
+/** Akun EFEKTIF sebuah node dari sisi renderer: akun sesi → akun sesi utama → akun global. */
+function effectiveAccountOf(node: Node): Account | undefined {
+  const rootAcc = node.role === 'sub' ? nodes.get(node.treeId)?.accountId : undefined
+  const id = node.accountId ?? rootAcc ?? defaultAccountId ?? null
+  return id ? accounts.find((a) => a.id === id) : undefined
+}
+
+/**
+ * Menu klik-kanan: pilih akun & model KHUSUS sesi ini (per-chat). Sub-sesi mewarisi dari sesi utama;
+ * memilih "ikut warisan" mengembalikannya ke warisan. Untuk akun OpenRouter, model dikunci oleh akun
+ * itu (alias Claude tak berlaku) → ditampilkan sebagai info, bukan pilihan.
+ */
+function showSessionMenu(node: Node, x: number, y: number): void {
+  closeSessionMenu()
+  const menu = el('div', { class: 'ctx-menu' })
+
+  const item = (label: string, on: boolean, onClick: () => void, cls = ''): HTMLElement => {
+    const it = el('div', { class: `ctx-item${on ? ' on' : ''}${cls ? ' ' + cls : ''}` }, label)
+    it.addEventListener('click', (e) => {
+      e.stopPropagation()
+      closeSessionMenu()
+      onClick()
+    })
+    return it
+  }
+
+  menu.append(el('div', { class: 'ctx-head' }, `${node.role === 'root' ? 'UTAMA' : 'SUB'} · ${node.title}`))
+
+  // --- Akun ---
+  menu.append(el('div', { class: 'ctx-sep' }, 'Akun'))
+  const inheritAccLabel =
+    node.role === 'sub'
+      ? `— ikut sesi utama —`
+      : defaultAccountId
+        ? `— ikut global: ${accounts.find((a) => a.id === defaultAccountId)?.label ?? '?'} —`
+        : '— ikut global (kosong) —'
+  menu.append(item(inheritAccLabel, node.accountId == null, () => setSessionAccount(node.id, null)))
+  for (const a of accounts) {
+    const tag = a.provider === 'openrouter' ? '  ⟨OR⟩' : ''
+    menu.append(item(a.label + tag, node.accountId === a.id, () => setSessionAccount(node.id, a.id)))
+  }
+
+  // --- Model ---
+  menu.append(el('div', { class: 'ctx-sep' }, 'Model'))
+  const eff = effectiveAccountOf(node)
+  if (eff?.provider === 'openrouter') {
+    // Akun OpenRouter: model BEBAS dipilih dari daftar OR (tak dikunci). Kosong = default akun.
+    const selfOr = node.model && node.model.includes('/') ? node.model : null
+    menu.append(item(`— default akun: ${orShort(eff.model)} —`, selfOr == null, () => setSessionModel(node.id, null)))
+    const list = orModels.length ? orModels : OPENROUTER_MODEL_SUGGESTIONS.map((m) => ({ id: m.id, name: m.label, paramB: '', context: 0, free: true }))
+    for (const m of list) {
+      const ctx = m.context >= 1e6 ? `${m.context / 1e6}M` : m.context ? `${Math.round(m.context / 1000)}K` : ''
+      const lbl = `${orShort(m.id)}${m.paramB ? ` · ${m.paramB}` : ''}${ctx ? ` · ${ctx}` : ''}`
+      menu.append(item(lbl, selfOr === m.id, () => setSessionModel(node.id, m.id)))
+    }
+  } else {
+    const inheritModelLabel =
+      node.role === 'sub' ? `— ikut sesi utama —` : `— ikut global: ${modelLabel(defaultModel)} —`
+    menu.append(item(inheritModelLabel, node.model == null, () => setSessionModel(node.id, null)))
+    for (const m of MODEL_OPTIONS) {
+      if (m.value === '') continue // '' sudah diwakili "ikut warisan" di atas
+      menu.append(item(m.label, node.model === m.value, () => setSessionModel(node.id, m.value)))
+    }
+  }
+
+  menu.style.left = `${x}px`
+  menu.style.top = `${y}px`
+  document.body.append(menu)
+  ctxMenuEl = menu
+  // Jaga menu tetap di dalam viewport (klik dekat tepi kanan/bawah).
+  const r = menu.getBoundingClientRect()
+  if (r.right > innerWidth) menu.style.left = `${Math.max(4, innerWidth - r.width - 4)}px`
+  if (r.bottom > innerHeight) menu.style.top = `${Math.max(4, innerHeight - r.height - 4)}px`
+}
+
+/** Helper renderer → main untuk set akun/model sesi, dengan penutupan banner bila relevan. */
+function setSessionAccount(id: string, accountId: string | null): void {
+  void window.grove
+    .setSessionAccount(id, accountId)
+    .then(() => {
+      if (accountId || defaultAccountId) hideAuthBanner()
+    })
+    .catch((e) => alert(`Gagal ganti akun: ${String(e)}`))
+}
+function setSessionModel(id: string, model: string | null): void {
+  void window.grove.setSessionModel(id, model).catch((e) => alert(`Gagal ganti model: ${String(e)}`))
+}
+
 /** Panel kelola akun: auto-switch, daftar akun, tambah (token setup-token), akun sesi aktif. */
 function renderAccountsPanel(): void {
   const panel = $('acct-panel')
@@ -878,9 +1335,51 @@ function renderAccountsPanel(): void {
   })
   panel.append(el('label', { class: 'ap-toggle' }, cr, el('span', {}, ' Lanjutkan sesi yang tadi kerja saat app dibuka')))
 
+  // Ambang default (dipakai akun yang tak menyetel sendiri).
+  const dPct = document.createElement('input')
+  dPct.type = 'number'
+  dPct.className = 'ap-pct'
+  dPct.min = '50'
+  dPct.max = '99'
+  dPct.value = String(defaultSwitchPct)
+  const commitDefault = (): void => {
+    const v = Number(dPct.value)
+    if (!Number.isFinite(v)) return
+    defaultSwitchPct = Math.min(99, Math.max(50, Math.round(v)))
+    dPct.value = String(defaultSwitchPct) // pantulkan hasil clamp balik ke UI, jangan biarkan bohong
+    void window.grove.setDefaultSwitchPct(defaultSwitchPct).catch(() => {})
+  }
+  dPct.addEventListener('change', commitDefault)
+  panel.append(el('div', { class: 'ap-row' }, el('span', {}, 'Ambang pindah akun: '), dPct, el('span', {}, '%')))
+
+  // Akun GLOBAL — dasar rantai: akun sesi → akun sesi utama → akun global.
+  panel.append(el('div', { class: 'ap-head' }, 'Akun global (dipakai semua sesi)'))
+  const gSel = document.createElement('select')
+  gSel.className = 'ap-input'
+  const gNone = document.createElement('option')
+  gNone.value = ''
+  gNone.textContent = '— tidak ada —'
+  gSel.append(gNone)
+  for (const a of accounts) {
+    const o = document.createElement('option')
+    o.value = a.id
+    o.textContent = a.label
+    gSel.append(o)
+  }
+  gSel.value = defaultAccountId ?? ''
+  gSel.addEventListener('change', () => {
+    void window.grove
+      .setDefaultAccount(gSel.value || null)
+      .then(() => {
+        if (gSel.value) hideAuthBanner()
+      })
+      .catch((e) => alert(`Gagal set akun global: ${String(e)}`))
+  })
+  panel.append(gSel)
+
   panel.append(el('div', { class: 'ap-head' }, 'Tersimpan'))
   if (!accounts.length) {
-    panel.append(el('div', { class: 'ap-empty' }, 'Belum ada akun.'))
+    panel.append(el('div', { class: 'ap-empty' }, 'Belum ada akun. Sesi TIDAK bisa jalan tanpa akun.'))
   } else {
     for (const a of accounts) {
       const del = el('button', { class: 'ap-del', title: 'Hapus akun' }, '×')
@@ -888,49 +1387,171 @@ function renderAccountsPanel(): void {
         if (confirm(`Hapus akun "${a.label}"?`)) void window.grove.deleteAccount(a.id).catch((e) => alert(String(e)))
       })
       const planTag = a.plan ? el('span', { class: 'ap-plan' }, `Max ${a.plan}x`) : el('span', {})
-      panel.append(el('div', { class: 'ap-item' }, el('span', { class: 'ap-label' }, a.label), planTag, del))
+      // Badge provider: akun OpenRouter ditandai jelas + model yang dipakainya.
+      const provTag =
+        a.provider === 'openrouter'
+          ? el('span', { class: 'ap-prov', title: a.model ?? '' }, `OR: ${a.model?.split('/').pop() ?? '?'}`)
+          : el('span', {})
+      panel.append(
+        el('div', { class: 'ap-item' }, el('span', { class: 'ap-label' }, a.label), provTag, planTag, del)
+      )
+
+      // Akun OpenRouter (mis. model gratis) tak punya kuota gaya Claude → ambang tak relevan; lewati.
+      if (a.provider === 'openrouter') continue
+
+      // Ambang khusus akun ini. Kosong = ikut ambang default di atas.
+      const pct = document.createElement('input')
+      pct.type = 'number'
+      pct.className = 'ap-pct'
+      pct.min = '50'
+      pct.max = '99'
+      pct.placeholder = String(defaultSwitchPct)
+      pct.value = a.switchPct == null ? '' : String(a.switchPct)
+      pct.title = `Kosongkan untuk ikut ambang default (${defaultSwitchPct}%)`
+      pct.addEventListener('change', () => {
+        const raw = pct.value.trim()
+        const v = raw === '' ? null : Math.min(99, Math.max(50, Math.round(Number(raw))))
+        if (v != null && !Number.isFinite(v)) return
+        void window.grove.setAccountSwitchPct(a.id, v).catch((e) => alert(String(e)))
+      })
+      const sub = el('div', { class: 'ap-sub' }, el('span', {}, 'ambang'), pct, el('span', {}, '%'))
+      // KEJUJURAN UI: kalau usage akun ini tak terbaca, ambang di atas TIDAK akan pernah memicu.
+      // Lebih baik user tahu daripada mengira proteksi proaktif menyala padahal tidak.
+      if (a.usageReadable === false) {
+        sub.append(
+          el(
+            'span',
+            {
+              class: 'ap-dead',
+              title:
+                'Kuota akun ini tidak terbaca — baik lewat endpoint resmi maupun header rate-limit.\n' +
+                'Ambang tidak akan memicu; yang tersisa hanya switch REAKTIF saat benar-benar kena limit.\n' +
+                'Cek token akun ini masih sah (belum dicabut/kedaluwarsa).'
+            },
+            '⚠ non-aktif'
+          )
+        )
+      }
+      panel.append(sub)
     }
   }
 
   panel.append(el('div', { class: 'ap-head' }, 'Tambah akun'))
+  // Pilih provider: Claude (langganan) atau OpenRouter (key + model).
+  const prov = document.createElement('select')
+  prov.className = 'ap-input'
+  for (const [v, t] of [
+    ['claude', 'Claude (langganan)'],
+    ['openrouter', 'OpenRouter (key + model)']
+  ] as const) {
+    const o = document.createElement('option')
+    o.value = v
+    o.textContent = t
+    prov.append(o)
+  }
+
   const label = document.createElement('input')
   label.className = 'ap-input'
   label.placeholder = 'Label (mis. Kantor Max20)'
   const token = document.createElement('textarea')
   token.className = 'ap-input ap-token'
-  token.placeholder = 'Token dari `claude setup-token`'
   token.rows = 2
-  // Ukuran paket dipakai saat SEMUA akun sudah menembus ambang kuota → yang terbesar dipilih.
+
+  // Field khusus OpenRouter: id model (dengan saran gratis) — hanya tampil bila provider = openrouter.
+  const orModel = document.createElement('input')
+  orModel.className = 'ap-input'
+  orModel.setAttribute('list', 'or-model-list')
+  orModel.placeholder = 'Model OpenRouter, mis. nvidia/nemotron-3-super-120b-a12b:free'
+  const datalist = document.createElement('datalist')
+  datalist.id = 'or-model-list'
+  // Isi awal: saran statis (langsung ada). Lalu ganti dgn daftar LIVE (gratis + dukung tools) begitu
+  // fetch selesai — id + ukuran param (B) + limit context, seperti diminta.
+  const fillDatalist = (items: ReadonlyArray<{ value: string; text: string }>): void => {
+    datalist.textContent = ''
+    for (const it of items) {
+      const o = document.createElement('option')
+      o.value = it.value
+      o.textContent = it.text
+      datalist.append(o)
+    }
+  }
+  fillDatalist(OPENROUTER_MODEL_SUGGESTIONS.map((m) => ({ value: m.id, text: m.label })))
+  void window.grove
+    .listOpenRouterModels(true)
+    .then((list) => {
+      if (!list.length) return // fetch gagal → biarkan saran statis
+      const fmtCtx = (n: number): string => (n >= 1e6 ? `${n / 1e6}M` : `${Math.round(n / 1000)}K`)
+      fillDatalist(
+        list.map((m) => ({
+          value: m.id,
+          text: `${m.name} · ${m.paramB || '?'} · ${fmtCtx(m.context)} ctx`
+        }))
+      )
+    })
+    .catch(() => {})
+
+  // Ukuran paket dipakai saat SEMUA akun sudah menembus ambang kuota → yang terbesar dipilih (Claude saja).
   const plan = document.createElement('input')
   plan.className = 'ap-input'
   plan.type = 'number'
   plan.min = '1'
   plan.placeholder = 'Ukuran paket, mis. 20 untuk Max 20x (opsional)'
+
+  const hint = el('div', { class: 'ap-hint' }, '')
+  const applyProvider = (): void => {
+    const or = prov.value === 'openrouter'
+    token.placeholder = or ? 'OpenRouter API key (sk-or-v1-…)' : 'CLAUDE_CODE_OAUTH_TOKEN (sk-ant-oat01-…)'
+    orModel.style.display = or ? 'block' : 'none'
+    plan.style.display = or ? 'none' : 'block'
+    hint.textContent = or
+      ? '⚠️ OpenRouter hanya MENJAMIN Claude Code untuk model Anthropic. Model lain (mis. Nemotron) bisa saja tak patuh protokol tool Grove — uji dulu di satu sesi sebelum diandalkan. Kuota gaya Claude tak berlaku (auto-switch/ambang diabaikan).'
+      : 'Token `claude setup-token` didukung penuh: menjalankan sesi maupun memantau kuota (usage dibaca dari header rate-limit bila endpoint resmi menolak).'
+  }
+  prov.addEventListener('change', applyProvider)
+
   const add = el('button', { class: 'ap-add' }, '+ Tambah akun')
   add.addEventListener('click', () => {
     const l = label.value.trim()
     const t = token.value.trim()
-    const p = Number(plan.value) > 0 ? Number(plan.value) : undefined
-    if (!l || !t) return alert('Isi label & token dulu.')
+    const or = prov.value === 'openrouter'
+    const p = !or && Number(plan.value) > 0 ? Number(plan.value) : undefined
+    const m = or ? orModel.value.trim() : undefined
+    if (!l || !t) return alert('Isi label & token/key dulu.')
+    if (or && !m) return alert('Isi id model OpenRouter (mis. nvidia/nemotron-3-super-120b-a12b:free).')
     void window.grove
-      .addAccount(l, t, p)
+      .addAccount(l, t, p, undefined, or ? 'openrouter' : 'claude', m)
       .then(() => {
         label.value = ''
         token.value = ''
         plan.value = ''
+        orModel.value = ''
       })
       .catch((e) => alert(`Gagal tambah: ${String(e)}`))
   })
-  panel.append(label, token, plan, add)
+  panel.append(prov, label, token, orModel, datalist, hint, plan, add)
+  applyProvider() // set tampilan awal sesuai provider default (claude)
 
   const node = activeId ? nodes.get(activeId) : null
   if (node) {
     panel.append(el('div', { class: 'ap-head' }, `Sesi aktif: ${node.title}`))
     const sel = document.createElement('select')
     sel.className = 'ap-input'
+    // TIDAK ADA lagi opsi "Default (login utama)": Grove berjalan murni dgn token akun GUI, jadi
+    // opsi itu dulu berarti "diam-diam pakai & tagih akun login CLI".
+    // Opsi kosong sekarang berarti MEWARISI, bukan "tanpa akun": sub-sesi ikut sesi utamanya,
+    // sesi utama ikut akun global. Teksnya menyebut sumber warisan + akun efektifnya supaya user
+    // tak perlu menebak akun mana yang sebenarnya menagih.
+    const isSub = node.role === 'sub'
+    const rootAcct = isSub ? (nodes.get(node.treeId)?.accountId ?? null) : null
+    const inheritedId = rootAcct ?? defaultAccountId
+    const inheritedLabel = accounts.find((a) => a.id === inheritedId)?.label
     const def = document.createElement('option')
     def.value = ''
-    def.textContent = 'Default (login utama)'
+    def.textContent = inheritedLabel
+      ? `— ikut ${isSub ? 'sesi utama' : 'akun global'}: ${inheritedLabel} —`
+      : accounts.length
+        ? '— pilih akun (warisan kosong) —'
+        : '— belum ada akun —'
     sel.append(def)
     for (const a of accounts) {
       const o = document.createElement('option')
@@ -939,12 +1560,20 @@ function renderAccountsPanel(): void {
       sel.append(o)
     }
     sel.value = node.accountId ?? ''
+    // Memilih opsi kosong = KEMBALI mewarisi (kirim null), bukan "tanpa akun".
     sel.addEventListener('change', () => {
       void window.grove
         .setSessionAccount(node.id, sel.value || null)
+        .then(() => {
+          if (sel.value || inheritedId) hideAuthBanner()
+          renderAccountsPanel() // label warisan sub-sesi ikut berubah saat root diganti
+        })
         .catch((e) => alert(`Gagal ganti akun: ${String(e)}`))
     })
     panel.append(el('div', { class: 'ap-row' }, el('span', {}, 'Akun sesi: '), sel))
+    if (!isSub) {
+      panel.append(el('div', { class: 'ap-hint' }, 'Sub-sesi pohon ini otomatis ikut akun sesi utama, kecuali diatur sendiri.'))
+    }
   }
 }
 
@@ -982,6 +1611,8 @@ function onEvent(ev: GroveEvent): void {
         pendingEl = appendChatMessage({ role: 'assistant', text: '', ts: Date.now() }, false)
         pendingText = ''
         shownLen = 0
+        pendingTextNode = document.createTextNode('') // B4: node teks stabil utk append-only
+        pendingEl.appendChild(pendingTextNode)
       }
       pendingText += ev.payload.delta // buffer; diungkap halus oleh flushPending
       if (!pendingRaf) pendingRaf = requestAnimationFrame(flushPending)
@@ -997,6 +1628,7 @@ function onEvent(ev: GroveEvent): void {
         }
         pendingEl.innerHTML = renderMarkdown(m.text) // finalisasi: render markdown penuh
         pendingEl = null
+        pendingTextNode = null // B4: node teks streaming diganti markdown penuh → lepas ref
         pendingText = ''
         shownLen = 0
       } else {
@@ -1029,7 +1661,21 @@ function onEvent(ev: GroveEvent): void {
       accounts = ev.payload.accounts
       autoSwitch = ev.payload.autoSwitch
       autoResume = ev.payload.autoResume
-      if ($('acct-panel').classList.contains('show')) renderAccountsPanel()
+      defaultSwitchPct = ev.payload.defaultSwitchPct
+      defaultAccountId = ev.payload.defaultAccountId
+      defaultModel = ev.payload.defaultModel
+      syncGlobalModel()
+      const panel = $('acct-panel')
+      // JANGAN bangun ulang panel saat user sedang mengetik di dalamnya. Event ini juga datang dari
+      // latar (watchdog usage tiap 5 mnt → noteUsageReadable); membangun ulang mid-edit menghapus
+      // angka ambang yang belum sempat commit + membuang fokus. Itu bug "ambang kereset/beda-beda".
+      if (panel.classList.contains('show') && !panel.contains(document.activeElement)) renderAccountsPanel()
+      // Akun baru ditambahkan → banner "belum ada akun" mungkin sudah tak relevan lagi.
+      if (accounts.length) hideAuthBanner()
+      break
+    }
+    case 'auth:missing': {
+      showAuthBanner(ev.payload)
       break
     }
     case 'session:activity': {
@@ -1040,6 +1686,11 @@ function onEvent(ev: GroveEvent): void {
       break
     }
     case 'usage:update': {
+      // ATRIBUSI BILLING: HANYA tampilkan usage milik akun SESI YANG SEDANG DIPILIH. Hasil fetch
+      // akun lain (mis. watchdog akun default, atau fetch akun sebelumnya yang mendarat telat)
+      // TIDAK BOLEH menimpa angka akun yang sedang tampil — itu yang bikin angka terlihat "kebagi".
+      const want = activeId ? (nodes.get(activeId)?.accountId ?? null) : null
+      if (ev.payload.accountId !== want) break
       renderUsage(ev.payload)
       break
     }
@@ -1056,6 +1707,19 @@ function setupDragDrop(): void {
   const overlay = $('drop-overlay')
   let depth = 0
   const show = (on: boolean) => overlay.classList.toggle('show', on)
+  const hint = $('drop-hint')
+
+  /**
+   * Teks & highlight overlay MENGIKUTI zona yang sedang di-hover, supaya user tahu AKIBAT drop
+   * sebelum melepas — bukan satu pesan global yang menyesatkan. Panel target diangkat di atas
+   * scrim (lihat .drop-target di styles.css) sehingga zona aktif terlihat terang, sisanya redup.
+   */
+  const applyZone = (zone: DropZone): void => {
+    overlay.dataset.zone = zone
+    hint.textContent = ZONE_HINT[zone]
+    document.querySelector('.sidebar')?.classList.toggle('drop-target', zone === 'sidebar')
+    document.querySelector('.chat')?.classList.toggle('drop-target', zone === 'chat')
+  }
 
   // hanya reaksi untuk drag FILE dari luar, bukan drag/seleksi internal
   const hasFiles = (e: DragEvent): boolean => Array.from(e.dataTransfer?.types ?? []).includes('Files')
@@ -1068,17 +1732,28 @@ function setupDragDrop(): void {
   window.addEventListener('dragover', (e) => {
     if (!hasFiles(e)) return
     e.preventDefault()
+    applyZone(zoneOf(e)) // zona bisa berganti saat kursor pindah kolom → teks & highlight ikut
   })
   window.addEventListener('dragleave', (e) => {
     if (!hasFiles(e)) return
     e.preventDefault()
     depth = Math.max(0, depth - 1)
-    if (depth === 0) show(false)
+    if (depth === 0) {
+      show(false)
+      clearDropAffordance()
+    }
   })
   window.addEventListener('drop', (e) => {
     e.preventDefault()
     depth = 0
     show(false)
+    clearDropAffordance()
+    // Drop sudah dimaknai sebagai "kunci folder kerja" (kartu sesi / zona sidebar) → jangan
+    // dobel-perlakukan folder itu sebagai referensi chat. Overlay & counter tetap dibereskan di atas.
+    if (folderDropHandled) {
+      folderDropHandled = false
+      return
+    }
     const files = e.dataTransfer?.files
     if (!files || !files.length) return
     for (const file of Array.from(files)) {
@@ -1106,6 +1781,7 @@ function setupDragDrop(): void {
 
 async function init(): Promise<void> {
   setupDragDrop()
+  setupSidebarFolderDrop()
 
   $('btn-new-chat').addEventListener('click', async () => {
     try {
@@ -1164,10 +1840,35 @@ async function init(): Promise<void> {
     e.stopPropagation()
     $('usage-panel').classList.toggle('show')
   })
+
+  // Refresh MANUAL: fetch usage akun sesi terpilih sekarang. Disable + spin selama cooldown (10s,
+  // sejalan dgn guard di main) supaya user tak bisa hammer endpoint → cegah 429. Klik saat cooldown
+  // dijaga di main (balik cache, tak fetch); di sini cukup guard visual.
+  $('usage-refresh').addEventListener('click', (e) => {
+    e.stopPropagation() // jangan ikut toggle popover
+    const b = $<HTMLButtonElement>('usage-refresh')
+    if (b.disabled) return
+    b.disabled = true
+    b.classList.add('spin')
+    void window.grove
+      .refreshUsage()
+      .then(renderUsage)
+      .catch(() => {})
+      .finally(() => setTimeout(() => {
+        b.disabled = false
+        b.classList.remove('spin')
+      }, 10_000))
+  })
   document.addEventListener('click', () => {
     $('usage-panel').classList.remove('show')
     $('acct-panel').classList.remove('show')
+    closeSessionMenu()
   })
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeSessionMenu()
+  })
+  // Scroll di sidebar / window → posisi menu jadi salah; tutup saja.
+  window.addEventListener('scroll', closeSessionMenu, true)
 
   $('btn-accounts').addEventListener('click', (e) => {
     e.stopPropagation()
@@ -1202,6 +1903,7 @@ async function init(): Promise<void> {
       $('chat-log').textContent = ''
       toolDetailEls.clear()
       pendingEl = null
+      pendingTextNode = null
       pendingText = ''
       updateChatHeader()
       updateActiveHighlight()
@@ -1210,6 +1912,8 @@ async function init(): Promise<void> {
     try {
       // Target = session aktif yang MASIH ADA. Bila null/stale (mis. baru dihapus) → buat baru.
       const targetId = activeId && nodes.has(activeId) ? activeId : await freshChat()
+      drafts.delete(targetId) // pesan terkirim DARI sesi ini → draft-nya tak berlaku lagi
+      updateNodeVisual(targetId) // hapus penanda ✎ bila sempat ada
       try {
         await window.grove.sendChat(targetId, refBlock + text, images)
       } catch (err) {
@@ -1269,7 +1973,11 @@ async function init(): Promise<void> {
   })
 
   // Klik area chat → fokus kolom (kecuali sedang menyeleksi teks untuk disalin).
-  $('chat').addEventListener('mouseup', () => {
+  // TAPI jangan mencuri fokus dari kontrol interaktif di header (select model, tombol): mencuri
+  // fokus tepat saat <select> mau membuka membuatnya langsung menutup lagi → "dropdown tak bisa diklik".
+  $('chat').addEventListener('mouseup', (e) => {
+    const t = e.target as HTMLElement | null
+    if (t?.closest('select, button, input, textarea, option')) return
     if (!window.getSelection()?.toString()) $<HTMLInputElement>('chat-input').focus()
   })
 
@@ -1287,6 +1995,14 @@ async function init(): Promise<void> {
   }, 1000)
 
   window.grove.onEvent(onEvent)
+  // Prefetch daftar model OpenRouter sekali → dropdown/menu model sesi OR langsung terisi.
+  void window.grove
+    .listOpenRouterModels(true)
+    .then((l) => {
+      orModels = l
+      if (activeId) updateChatHeader()
+    })
+    .catch(() => {})
   syncUsageSession() // sebelum ada sesi terpilih → akun default (login utama)
   void window.grove
     .listAccounts()
@@ -1294,6 +2010,14 @@ async function init(): Promise<void> {
       accounts = r.accounts
       autoSwitch = r.autoSwitch
       autoResume = r.autoResume
+      defaultSwitchPct = r.defaultSwitchPct
+      defaultAccountId = r.defaultAccountId
+      defaultModel = r.defaultModel
+      syncGlobalModel()
+      // Startup tanpa akun sama sekali → beri tahu SEKARANG, jangan tunggu user gagal kirim pesan.
+      if (!accounts.length) {
+        showAuthBanner({ sessionTitle: '', tokenMissing: false, hasAccounts: false })
+      }
     })
     .catch(() => {})
 

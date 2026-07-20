@@ -9,7 +9,7 @@ import type { BoardEntry, InboxMessage, TodoItem } from '../../shared/types'
 /** Kontrak yang harus disediakan SessionManager ke tools (hindari circular import). */
 export interface GroveHost {
   spawnWorker(parentId: string, opts: { title: string; task: string; model?: string }): Promise<string>
-  assignToWorker(callerId: string, workerId: string, task: string): void
+  assignToWorker(callerId: string, workerId: string, task: string, opts?: { fresh?: boolean }): void
   setTitle(sessionId: string, title: string): void
   updateSummary(sessionId: string, summary: string): void
   updateTodo(sessionId: string, items: TodoItem[]): void
@@ -27,8 +27,17 @@ export interface GroveHost {
    * DAN worker belum melapor final sendiri → host wajib melapor otomatis ke parent.
    */
   notifyTurnEnd(sessionId: string, outcome?: { finalText: string }): void
-  /** Token akun untuk di-inject ke query (null → pakai login default). */
-  getAccountToken(accountId?: string): string | null
+  /**
+   * Token akun EFEKTIF sesi ini (akun sesi → akun sesi utama → akun global) untuk di-inject ke query.
+   * null → TIDAK ADA token; sesi tak boleh jalan (lihat onAccountMissing).
+   */
+  getSessionToken(sessionId: string): string | null
+  /** Model EFEKTIF sesi ini (model sesi → model sesi utama → model global → undefined = default SDK). */
+  getSessionModel(sessionId: string): string | undefined
+  /** Semua yang dibutuhkan query: env provider (Claude/OpenRouter) + model efektif. null = tak ada token. */
+  getSessionLaunch(sessionId: string): { env: Record<string, string>; model?: string } | null
+  /** Dipanggil Session saat ia tak bisa jalan karena belum ada akun/token → UI memunculkan notifikasi. */
+  onAccountMissing(sessionId: string): void
   /** Dipanggil Session saat turn gagal karena limit — untuk auto-switch akun bila aktif. */
   onLimitHit(sessionId: string): void
   /** Dipanggil Session saat ctx% ≥ ambang → auto-compact (padatkan konteks, cegah freeze). */
@@ -70,14 +79,21 @@ export function buildGroveServer(sessionId: string, host: GroveHost) {
 
   const assignWorker = tool(
     'assign_worker',
-    'Hand a NEW task to an EXISTING sub-worker in your tree (found via list_workers). REUSE this instead of spawn_worker whenever an idle worker exists — the worker resumes with its full prior context and it is cheaper than a fresh spawn. The task is delivered into the worker\'s inbox and it starts working immediately.',
+    'Hand a task to an EXISTING sub-worker in your tree (found via list_workers). By DEFAULT the worker starts with a CLEAN, independent context (its previous conversation is dropped) — use the default for a NEW, unrelated task so it never blends a sibling/previous topic. Set continuation:true ONLY when the task genuinely CONTINUES the SAME topic the worker was already on (then it keeps its full prior context). The task is delivered into the worker\'s inbox and it starts immediately.',
     {
       worker_id: z.string().describe('Target worker session id, from list_workers'),
-      task: z.string().describe('A clear, self-contained task for the worker to do next')
+      task: z.string().describe('A clear, self-contained task for the worker to do next'),
+      continuation: z
+        .boolean()
+        .default(false)
+        .describe('true = this task CONTINUES the worker\'s SAME prior topic (keep its context); false (DEFAULT) = brand-new independent task, reset to a clean context')
     },
     async (args) => {
-      host.assignToWorker(sessionId, args.worker_id, args.task)
-      return ok(`Assigned a new task to worker ${args.worker_id}. It resumed with its prior context and is now working.`)
+      host.assignToWorker(sessionId, args.worker_id, args.task, { fresh: !args.continuation })
+      const mode = args.continuation
+        ? 'continued its prior context'
+        : 'started with a clean, independent context'
+      return ok(`Assigned a new task to worker ${args.worker_id}. It ${mode} and is now working.`)
     }
   )
 
@@ -159,7 +175,7 @@ export function buildGroveServer(sessionId: string, host: GroveHost) {
 
   const readBoard = tool(
     'read_board',
-    'Read the shared board (summary/todo/progress) of sessions. scope "tree" (default) = only your own tree; "all" = every tree (use sparingly — it is large and floods your context). Read-only awareness — do NOT work on another tree\'s task.',
+    'Read the shared board (summary/todo/progress) of sessions. scope "tree" (default) = your own tree. scope "all" is ROOT-ONLY and deliberately THIN: sessions from OTHER trees come back as status/percent only (no summary/todo/progress), and a sub-worker asking for "all" is silently served "tree" instead. Results are capped. Read-only AWARENESS — do NOT work on another session\'s task. If you are a sub-worker, OTHER sessions show status/percent only — only YOUR own task is yours to do.',
     { scope: z.enum(['tree', 'all']).default('tree') },
     async (args) => {
       const rows = host.readBoard(sessionId, args.scope)

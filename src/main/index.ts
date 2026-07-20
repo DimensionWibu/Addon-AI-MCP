@@ -2,7 +2,7 @@
 import { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage } from 'electron'
 import { join } from 'node:path'
 import { Board } from './orchestrator/db'
-import { SessionManager, USAGE_SWITCH_PCT } from './orchestrator/SessionManager'
+import { SessionManager } from './orchestrator/SessionManager'
 import { registerIpc } from './ipc'
 import { fetchAccountEmail, fetchUsage, peekAccountEmail, peekUsage } from './usage'
 import { loadWindowState, trackWindowState } from './windowState'
@@ -58,7 +58,9 @@ function createWindow(): void {
   if (st.maximized) mainWindow.maximize()
   trackWindowState(mainWindow) // simpan otomatis saat resize/move/close
 
-  if (process.env.ELECTRON_RENDERER_URL) {
+  // Guard app.isPackaged: kalau mesin user kebetulan punya ELECTRON_RENDERER_URL
+  // ter-set, app terpaket akan memuat dev server yang tidak ada → jendela putih.
+  if (!app.isPackaged && process.env.ELECTRON_RENDERER_URL) {
     void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
   } else {
     void mainWindow.loadFile(join(import.meta.dirname, '../renderer/index.html'))
@@ -111,15 +113,16 @@ app.whenReady().then(async () => {
   registerIpc(manager)
   if (KEEP_ALIVE) createTray() // hanya di produksi: sesi lanjut jalan meski jendela ditutup
 
-  // Limit paket langganan → poll adaptif + IPC on-demand, MENGIKUTI AKUN SESI YANG DIPILIH di UI.
-  // Endpoint oauth/usage bisa membalas 429 (rate-limit); maka saat fetch gagal/stale kita
-  // BACKOFF (mundur makin lama, sampai 5 menit) agar tidak makin memicu rate-limit — bukan
-  // mempercepat. last-good tetap tampil selama ini. Begitu segar lagi, balik ke 60s.
-  // Backoff disimpan PER AKUN: akun yang lagi kena 429 tak boleh menghukum akun lain.
+  // Limit paket langganan → SATU timer 5-menit di main (BUKAN realtime) + refresh MANUAL ber-cooldown.
+  // Endpoint oauth/usage membalas 429 bila di-hammer; maka TIDAK ada poll cepat/per-sesi. Nilai sukses
+  // terakhir di-cache per-akun (usage.ts lastGood) & tetap tampil (stale) saat fetch gagal → header
+  // TAK PERNAH blank. Ganti sesi = cache-only (0 request). Watchdog auto-switch ikut irama 5-menit.
+  const USAGE_INTERVAL_MS = 5 * 60_000 // auto-cek tiap 5 menit — TIDAK ada yang lebih sering
+  const USAGE_MANUAL_COOLDOWN_MS = 10_000 // guard anti-spam tombol refresh (cegah 429 dari klik beruntun)
   let usageSessionId: string | null = null // sesi yang sedang dipilih di UI
   let usageGen = 0 // penanda generasi; hasil fetch dari akun lama dibuang
-  let usageTimer: NodeJS.Timeout | null = null
-  const usageDelays = new Map<string, number>() // accountId ?? 'default' → jeda poll berikutnya
+  let usageTimer: NodeJS.Timeout | null = null // interval 5-menit (di-clear saat quit)
+  let lastManualAt = 0 // waktu fetch manual terakhir (untuk cooldown)
 
   const usageTarget = (): { id: string | null; label: string; token: string | null } =>
     manager.getSessionAccountInfo(usageSessionId)
@@ -137,67 +140,72 @@ app.whenReady().then(async () => {
     return { accountId: t.id, accountLabel: t.label, accountEmail: email, usage: r.usage, reason: r.reason }
   }
 
-  const loopUsage = async (gen: number): Promise<void> => {
+  /**
+   * Satu putaran: akun terpilih (untuk header UI) + SEMUA akun GUI (untuk watchdog ambang per-akun),
+   * dengan DEDUP sehingga tiap akun paling banyak di-fetch sekali. Dipakai timer 5-menit & refresh
+   * manual (tak ada pemicu lain). Guard generasi: bila akun terpilih keburu berganti saat fetch
+   * berjalan, hasil basi tidak di-emit.
+   *
+   * Watchdog kini menyapu SETIAP akun tersimpan, bukan hanya login default — karena setelah Grove
+   * berjalan murni dengan token akun GUI, tidak ada lagi "akun default" yang menjalankan pekerjaan.
+   * Akun yang usage-nya tak terbaca (403 tanpa scope user:profile) dicatat lewat noteUsageReadable()
+   * supaya UI bisa jujur bilang ambangnya non-aktif, bukan diam-diam tak pernah memicu.
+   */
+  const runUsageFetch = async (): Promise<UsageSnapshot> => {
+    const gen = ++usageGen
     const t = usageTarget()
-    const key = t.id ?? 'default'
-    const snap = await snapshotFor(t, true)
-    if (gen !== usageGen) return // akun terlanjur berganti → hasil ini basi, jangan ditampilkan
-    emit({ channel: 'usage:update', payload: snap })
-    const ok = snap.usage && !snap.usage.stale
-    // Akun yang ditolak permanen (scope/no-token) tak perlu dipoll cepat — langsung jeda maksimum.
-    const permanent = snap.reason === 'scope' || snap.reason === 'no-token'
-    const delay = ok ? 60_000 : permanent ? 300_000 : Math.min((usageDelays.get(key) ?? 60_000) * 2, 300_000)
-    usageDelays.set(key, delay)
-    usageTimer = setTimeout(() => void loopUsage(gen), delay)
-  }
+    const snap = await snapshotFor(t, true) // fetchUsage → update cache + stale-safe (tak pernah blank)
+    if (gen === usageGen) emit({ channel: 'usage:update', payload: snap })
 
-  /** Akun terpilih berubah → refetch SEGERA, jangan menunggu sisa backoff akun sebelumnya. */
-  const restartUsage = (): void => {
-    usageGen++
-    if (usageTimer) clearTimeout(usageTimer)
-    void loopUsage(usageGen)
-  }
-
-  ipcMain.handle('grove:getUsage', async (_e, arg?: { sessionId?: string | null }) => {
-    if (arg && 'sessionId' in arg) usageSessionId = arg.sessionId ?? null
-    return snapshotFor(usageTarget(), true)
-  })
-
-  // Renderer memberi tahu sesi mana yang dipilih. Balasannya dari cache (instan, tanpa nunggu
-  // jaringan) supaya label+angka di header langsung jadi milik akun yang benar; fetch segarnya
-  // menyusul lewat event usage:update. Kalau akunnya sama, jangan restart poll (hemat rate-limit).
-  ipcMain.handle('grove:setUsageSession', async (_e, { sessionId }: { sessionId: string | null }) => {
-    const before = usageTarget().id
-    usageSessionId = sessionId ?? null
-    const t = usageTarget()
-    if (t.id !== before) restartUsage()
-    return snapshotFor(t, false) // dari cache → header langsung benar tanpa nunggu jaringan
-  })
-
-  void loopUsage(usageGen)
-
-  // Watchdog kuota: pantau akun DEFAULT (satu-satunya yang endpoint usage-nya bisa dibaca —
-  // token `setup-token` membalas 403) lalu pindahkan sesinya ke akun lain SEBELUM kena limit.
-  // Akun setup-token tetap terlindungi jalur reaktif onLimitHit (pindah begitu limit terdeteksi).
-  const USAGE_WATCH_MS = 120_000
-  const watchUsage = async (): Promise<void> => {
-    try {
-      const u = await fetchUsage({ id: null, token: null })
-      const pct = u.usage?.fiveHour?.utilization ?? null
-      if (pct != null && pct >= USAGE_SWITCH_PCT) {
-        const moved = manager.onUsageHigh(null, pct)
-        if (moved) console.log(`[usage] akun default ${Math.round(pct)}% → ${moved} sesi dipindah akun`)
-      }
-    } catch {
-      /* jaringan gagal → coba lagi siklus berikutnya */
+    for (const a of manager.listAccounts().accounts) {
+      // Akun OpenRouter tak punya kuota gaya Claude & endpoint /oauth/usage-nya beda → memfetch-nya
+      // ke Anthropic hanya buang request + memunculkan "non-aktif" palsu. Lewati.
+      if (a.provider === 'openrouter') continue
+      // Akun terpilih baru saja di-fetch di atas → pakai cache, jangan tembak endpoint dua kali.
+      const r = a.id === t.id ? peekUsage(a.id) : await fetchUsage({ id: a.id, token: manager.getAccountToken(a.id) })
+      const pct = r.usage?.fiveHour?.utilization ?? null
+      // 'scope'/'unauthorized' = permanen tak terbaca. 'rate-limited'/'error' = gangguan sesaat →
+      // JANGAN divonis non-aktif, nanti UI bohong ke arah sebaliknya.
+      if (r.reason === 'scope' || r.reason === 'unauthorized') manager.noteUsageReadable(a.id, false)
+      else if (pct != null) manager.noteUsageReadable(a.id, true)
+      if (pct == null) continue
+      // Ambang ditegakkan di dalam onUsageHigh (per akun) — di sini cukup laporkan angkanya.
+      const moved = manager.onUsageHigh(a.id, pct)
+      if (moved) console.log(`[usage] akun "${a.label}" ${Math.round(pct)}% → ${moved} sesi dipindah akun`)
     }
-    setTimeout(() => void watchUsage(), USAGE_WATCH_MS)
+    // Akun PILIHAN user yang sempat di-auto-switch karena limit → kembalikan begitu akunnya bisa
+    // dipakai lagi, supaya billing tidak menetap di akun lain (mis. nyangkut di login default).
+    const back = manager.restorePinnedAccounts()
+    if (back) console.log(`[usage] ${back} sesi dikembalikan ke akun pilihan user`)
+    return snap
   }
-  void watchUsage()
+
+  // Refresh MANUAL (tombol ↻ di header). Cooldown: klik saat masih cooldown → balikan cache TERAKHIR
+  // TANPA fetch (anti-429). Di luar cooldown → fetch sekarang.
+  ipcMain.handle('grove:refreshUsage', async () => {
+    const now = Date.now()
+    if (now - lastManualAt < USAGE_MANUAL_COOLDOWN_MS) return snapshotFor(usageTarget(), false)
+    lastManualAt = now
+    return runUsageFetch()
+  })
+
+  // Renderer memberi tahu sesi mana yang dipilih. CACHE-ONLY: TANPA fetch (0 request saat klik-klik sesi)
+  // → header langsung jadi milik akun yang benar dari cache; angka segar ikut tick 5-menit / refresh manual.
+  ipcMain.handle('grove:setUsageSession', async (_e, { sessionId }: { sessionId: string | null }) => {
+    usageSessionId = sessionId ?? null
+    // ATRIBUSI: batalkan emit dari fetch akun SEBELUMNYA yang masih in-flight. Tanpa ini, hasil
+    // akun lama mendarat setelah user pindah sesi → angka akun A tampil untuk akun B ("kebagi").
+    usageGen++
+    return snapshotFor(usageTarget(), false)
+  })
+
+  usageTimer = setInterval(() => void runUsageFetch(), USAGE_INTERVAL_MS) // auto-cek 5 menit (satu timer global)
+  void runUsageFetch() // sekali di startup → header terisi (bukan blank); bukan poll cepat
 
   app.on('before-quit', () => {
     // JANGAN stopAll di sini: itu mengubah status running→idle & menghapus info "sesi ini tadi kerja"
     // yang dipakai auto-resume saat dibuka lagi. Proses yang mati sendiri sudah mematikan query-nya.
+    if (usageTimer) clearInterval(usageTimer) // hentikan timer usage 5-menit
     board.flush() // pastikan DB (termasuk status 'running') tersimpan saat keluar
   })
 

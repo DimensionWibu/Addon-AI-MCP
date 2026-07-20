@@ -8,6 +8,7 @@ const api: GroveApi = {
   dropFolder: (path: string, title?: string) => ipcRenderer.invoke('grove:dropFolder', { path, title }),
   newChat: (title?: string) => ipcRenderer.invoke('grove:newChat', { title }),
   pickFolder: () => ipcRenderer.invoke('grove:pickFolder'),
+  setSessionCwd: (id: string, path: string) => ipcRenderer.invoke('grove:setSessionCwd', { id, path }),
   sendChat: (id: string, text: string, images?: ImageAttachment[]) =>
     ipcRenderer.invoke('grove:sendChat', { id, text, images }),
   stopSession: (id: string) => ipcRenderer.invoke('grove:stopSession', { id }),
@@ -16,9 +17,22 @@ const api: GroveApi = {
   compactSession: (id: string) => ipcRenderer.invoke('grove:compact', { id }),
   setLoop: (id: string, enabled: boolean) => ipcRenderer.invoke('grove:setLoop', { id, enabled }),
   listAccounts: () => ipcRenderer.invoke('grove:listAccounts'),
-  addAccount: (label: string, token: string, plan?: number) =>
-    ipcRenderer.invoke('grove:addAccount', { label, token, plan }),
+  addAccount: (
+    label: string,
+    token: string,
+    plan?: number,
+    switchPct?: number,
+    provider?: 'claude' | 'openrouter',
+    model?: string
+  ) => ipcRenderer.invoke('grove:addAccount', { label, token, plan, switchPct, provider, model }),
   deleteAccount: (id: string) => ipcRenderer.invoke('grove:deleteAccount', { id }),
+  setAccountSwitchPct: (id: string, pct: number | null) =>
+    ipcRenderer.invoke('grove:setAccountSwitchPct', { id, pct }),
+  setDefaultSwitchPct: (pct: number) => ipcRenderer.invoke('grove:setDefaultSwitchPct', { pct }),
+  setDefaultAccount: (accountId: string | null) => ipcRenderer.invoke('grove:setDefaultAccount', { accountId }),
+  setDefaultModel: (model: string | null) => ipcRenderer.invoke('grove:setDefaultModel', { model }),
+  setSessionModel: (id: string, model: string | null) => ipcRenderer.invoke('grove:setSessionModel', { id, model }),
+  listOpenRouterModels: (freeOnly?: boolean) => ipcRenderer.invoke('grove:listOpenRouterModels', { freeOnly }),
   setSessionAccount: (id: string, accountId: string | null) =>
     ipcRenderer.invoke('grove:setSessionAccount', { id, accountId }),
   setAutoSwitch: (on: boolean) => ipcRenderer.invoke('grove:setAutoSwitch', { on }),
@@ -27,7 +41,7 @@ const api: GroveApi = {
   deleteSession: (id: string) => ipcRenderer.invoke('grove:deleteSession', { id }),
   getSnapshot: () => ipcRenderer.invoke('grove:getSnapshot'),
   getChat: (id: string) => ipcRenderer.invoke('grove:getChat', { id }),
-  getUsage: (sessionId?: string | null) => ipcRenderer.invoke('grove:getUsage', { sessionId: sessionId ?? null }),
+  refreshUsage: () => ipcRenderer.invoke('grove:refreshUsage'),
   setUsageSession: (sessionId: string | null) => ipcRenderer.invoke('grove:setUsageSession', { sessionId }),
   onEvent: (cb: (ev: GroveEvent) => void) => {
     const handler = (_e: unknown, ev: GroveEvent): void => cb(ev)

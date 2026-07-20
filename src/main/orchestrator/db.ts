@@ -40,6 +40,13 @@ CREATE TABLE IF NOT EXISTS messages (
   read_flag INTEGER DEFAULT 0,
   created_at INTEGER NOT NULL
 );
+-- Read-state PER-PENERIMA: broadcast (to_session IS NULL) harus bisa dibaca SETIAP sibling.
+-- read_flag global lama hanya cukup untuk indikator UI; pengiriman ulang broadcast dipandu tabel ini.
+CREATE TABLE IF NOT EXISTS message_reads (
+  message_id INTEGER NOT NULL,
+  session_id TEXT NOT NULL,
+  PRIMARY KEY (message_id, session_id)
+);
 CREATE TABLE IF NOT EXISTS chat_messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id TEXT NOT NULL,
@@ -65,11 +72,27 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+-- Akun PILIHAN user per sesi ("pin"). Auto-switch akibat limit hanya SEMENTARA; nilai di sinilah yang
+-- dipakai restorePinnedAccounts() untuk mengembalikan sesi ke akun yang benar — WAJIB tahan restart,
+-- kalau tidak sesi bisa nyangkut permanen di akun pengganti (billing salah akun).
+-- Baris ADA = ada pin; account_id NULL = pin ke "Default (login utama)" (beda dari tak ada baris).
+-- Sengaja tabel TERPISAH (bukan kolom di tabel sessions) supaya upsertSession — yang dipanggil sangat
+-- sering utk status/ctx — tak pernah bisa menimpa pin secara tak sengaja.
+CREATE TABLE IF NOT EXISTS session_pins (
+  session_id TEXT PRIMARY KEY,
+  account_id TEXT
+);
 `
+
+// Debounce simpan-ke-disk. sql.js meng-EXPORT SELURUH image DB tiap simpan (O(ukuran DB),
+// di main-thread) → semakin jarang, semakin sedikit micro-freeze yang menghentikan semua sesi.
+// Tetap aman: flush() dipanggil saat app before-quit (lihat index.ts) + data hidup di memori.
+const SAVE_DEBOUNCE_MS = 1500
 
 export class Board {
   private db!: Database
   private saveTimer: NodeJS.Timeout | null = null
+  private dirty = false // ada mutasi sejak simpan terakhir? bila tidak, lewati export (mahal).
 
   constructor(private readonly dbPath: string) {}
 
@@ -95,7 +118,14 @@ export class Board {
       `ALTER TABLE sessions ADD COLUMN order_index INTEGER`,
       `ALTER TABLE chat_messages ADD COLUMN detail TEXT`,
       `ALTER TABLE sessions ADD COLUMN account_id TEXT`,
-      `ALTER TABLE accounts ADD COLUMN plan INTEGER`
+      `ALTER TABLE accounts ADD COLUMN plan INTEGER`,
+      // Ambang auto-switch PER AKUN (persen). NULL → pakai default global (DEFAULT_SWITCH_PCT).
+      `ALTER TABLE accounts ADD COLUMN switch_pct INTEGER`,
+      // Provider akun: NULL/'claude' = token Claude (CLAUDE_CODE_OAUTH_TOKEN); 'openrouter' = key
+      // OpenRouter (dipakai via ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN). or_model = id model
+      // OpenRouter yang WAJIB dipakai akun itu (mis. nvidia/nemotron-3-super-120b-a12b:free).
+      `ALTER TABLE accounts ADD COLUMN provider TEXT`,
+      `ALTER TABLE accounts ADD COLUMN or_model TEXT`
     ]) {
       try {
         this.db.run(sql)
@@ -116,6 +146,7 @@ export class Board {
 
   private run(sql: string, params: unknown[] = []): void {
     this.db.run(sql, params as never)
+    this.dirty = true // tandai perlu simpan → writeAtomic tak akan meng-skip
     this.scheduleSave()
   }
 
@@ -130,9 +161,11 @@ export class Board {
 
   /** Tulis atomik: ke .tmp lalu rename → tak ada torn-read walau ada akses barengan. */
   private writeAtomic(): void {
+    if (!this.dirty) return // tak ada perubahan sejak simpan terakhir → jangan export seluruh DB (mahal)
     const tmp = `${this.dbPath}.tmp`
     writeFileSync(tmp, Buffer.from(this.db.export()))
     renameSync(tmp, this.dbPath)
+    this.dirty = false
   }
 
   private scheduleSave(): void {
@@ -144,7 +177,7 @@ export class Board {
       } catch (e) {
         console.error('[Board] gagal simpan DB:', e)
       }
-    }, 250)
+    }, SAVE_DEBOUNCE_MS)
   }
 
   // ---- sessions ------------------------------------------------------------
@@ -177,8 +210,34 @@ export class Board {
     return this.all(`SELECT * FROM sessions ORDER BY created_at ASC`).map(rowToSession)
   }
 
+  // ---- pin akun per-sesi (pilihan eksplisit user; tahan restart) ------------
+
+  /** Simpan/ubah pin akun pilihan user. accountId null = pin ke "Default (login utama)". */
+  setSessionPin(sessionId: string, accountId: string | null): void {
+    this.run(
+      `INSERT INTO session_pins (session_id, account_id) VALUES (?,?)
+       ON CONFLICT(session_id) DO UPDATE SET account_id=excluded.account_id`,
+      [sessionId, accountId]
+    )
+  }
+
+  /** Semua pin tersimpan → dimuat ke memori saat startup (SessionManager.loadFromDisk). */
+  getAllSessionPins(): { sessionId: string; accountId: string | null }[] {
+    return this.all(`SELECT session_id, account_id FROM session_pins`).map((r) => ({
+      sessionId: String(r.session_id),
+      accountId: r.account_id == null ? null : String(r.account_id)
+    }))
+  }
+
   deleteSession(id: string): void {
+    // Bersihkan read-state DULU (sebelum baris messages hilang): milik sesi ini + utk pesan yg akan dihapus.
+    this.run(`DELETE FROM message_reads WHERE session_id=?`, [id])
+    this.run(
+      `DELETE FROM message_reads WHERE message_id IN (SELECT id FROM messages WHERE from_session=? OR to_session=?)`,
+      [id, id]
+    )
     this.run(`DELETE FROM sessions WHERE id=?`, [id])
+    this.run(`DELETE FROM session_pins WHERE session_id=?`, [id]) // jangan tinggalkan pin yatim
     this.run(`DELETE FROM board WHERE session_id=?`, [id])
     this.run(`DELETE FROM messages WHERE from_session=? OR to_session=?`, [id, id])
     this.run(`DELETE FROM chat_messages WHERE session_id=?`, [id])
@@ -207,15 +266,30 @@ export class Board {
 
   // ---- accounts (token TIDAK diekspos ke UI) & settings --------------------
 
-  addAccount(id: string, label: string, token: string, ts: number, plan?: number): void {
-    this.run(`INSERT INTO accounts (id, label, token, created_at, plan) VALUES (?,?,?,?,?)`, [
-      id, label, token, ts, plan ?? null
-    ])
+  addAccount(
+    id: string,
+    label: string,
+    token: string,
+    ts: number,
+    plan?: number,
+    switchPct?: number,
+    provider?: string,
+    orModel?: string
+  ): void {
+    this.run(
+      `INSERT INTO accounts (id, label, token, created_at, plan, switch_pct, provider, or_model) VALUES (?,?,?,?,?,?,?,?)`,
+      [id, label, token, ts, plan ?? null, switchPct ?? null, provider ?? null, orModel ?? null]
+    )
   }
 
   /** Ubah ukuran paket sebuah akun (mis. 20 untuk Max 20x). */
   setAccountPlan(id: string, plan: number | null): void {
     this.run(`UPDATE accounts SET plan=? WHERE id=?`, [plan, id])
+  }
+
+  /** Ambang auto-switch akun ini (persen). null → ikut default global. */
+  setAccountSwitchPct(id: string, pct: number | null): void {
+    this.run(`UPDATE accounts SET switch_pct=? WHERE id=?`, [pct, id])
   }
 
   deleteAccount(id: string): void {
@@ -224,10 +298,15 @@ export class Board {
 
   /** Daftar akun TANPA token (aman dikirim ke renderer), termasuk ukuran paket. */
   getAccounts(): Account[] {
-    return this.all(`SELECT id, label, created_at, plan FROM accounts ORDER BY created_at ASC`).map((r) => ({
+    return this.all(
+      `SELECT id, label, created_at, plan, switch_pct, provider, or_model FROM accounts ORDER BY created_at ASC`
+    ).map((r) => ({
       id: String(r.id),
       label: String(r.label),
       plan: r.plan == null ? undefined : Number(r.plan),
+      switchPct: r.switch_pct == null ? undefined : Number(r.switch_pct),
+      provider: r.provider === 'openrouter' ? ('openrouter' as const) : ('claude' as const),
+      model: r.or_model == null ? undefined : String(r.or_model),
       createdAt: Number(r.created_at)
     }))
   }
@@ -255,7 +334,11 @@ export class Board {
     this.run(`UPDATE sessions SET order_index=?, updated_at=? WHERE id=?`, [orderIndex, ts, id])
   }
 
-  /** Normalisasi status basi 'running'/'waiting' → 'idle' (proses mati saat app ditutup). */
+  /**
+   * Normalisasi status basi → 'idle' (proses mati saat app ditutup).
+   * 'waiting' SENGAJA tetap disebut di SQL ini: status itu sudah dihapus dari kode, tapi DB user
+   * lama mungkin masih menyimpannya — biarkan ikut dibersihkan agar tak tertinggal selamanya.
+   */
   normalizeStaleStatuses(): void {
     this.run(`UPDATE sessions SET status='idle' WHERE status IN ('running','waiting')`)
   }
@@ -322,17 +405,29 @@ export class Board {
   }
 
   getMessagesFor(id: string, unreadOnly: boolean): InboxMessage[] {
+    // unreadOnly: "belum dibaca OLEH SESI INI" (per-penerima), bukan read_flag global — supaya
+    // broadcast yang sudah dibaca sibling lain TETAP sampai ke sesi ini.
     const rows = this.all(
       `SELECT * FROM messages
-       WHERE (to_session=? OR to_session IS NULL) ${unreadOnly ? 'AND read_flag=0' : ''}
+       WHERE (to_session=? OR to_session IS NULL)
+       ${unreadOnly ? 'AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=messages.id AND r.session_id=?)' : ''}
        ORDER BY created_at ASC`,
-      [id]
+      unreadOnly ? [id, id] : [id]
     )
     return rows.map(rowToMessage)
   }
 
-  markRead(ids: number[]): void {
+  /**
+   * Tandai pesan-pesan ini sudah dibaca OLEH `sessionId` (per-penerima). Broadcast jadi aman:
+   * tiap sibling punya baris read-nya sendiri. Sekaligus set read_flag global agar panel pesan
+   * UI (getAllMessages) tetap menampilkan status "read" seperti sebelumnya.
+   */
+  markReadFor(sessionId: string, ids: number[]): void {
     if (!ids.length) return
+    const values = ids.map(() => '(?,?)').join(',')
+    const params: unknown[] = []
+    for (const mid of ids) params.push(mid, sessionId)
+    this.run(`INSERT OR IGNORE INTO message_reads (message_id, session_id) VALUES ${values}`, params)
     this.run(`UPDATE messages SET read_flag=1 WHERE id IN (${ids.map(() => '?').join(',')})`, ids)
   }
 
@@ -342,6 +437,17 @@ export class Board {
 }
 
 // ---- row mappers -----------------------------------------------------------
+
+/**
+ * Status dari DB → SessionStatus, TOLERAN terhadap nilai lama/asing.
+ * DB user lama bisa menyimpan status 'waiting' (status yang kini sudah dihapus karena tak pernah
+ * di-set kode mana pun) — dipetakan ke 'idle' supaya baris lama tetap terbaca dan app tidak gagal
+ * start. Nilai tak dikenal apa pun juga jatuh ke 'idle' daripada menyelundupkan status tak valid.
+ */
+function normalizeStatus(raw: unknown): SessionMeta['status'] {
+  const s = String(raw ?? '')
+  return s === 'running' || s === 'done' || s === 'error' || s === 'idle' ? s : 'idle'
+}
 
 function rowToSession(r: Record<string, unknown>): SessionMeta {
   return {
@@ -353,7 +459,7 @@ function rowToSession(r: Record<string, unknown>): SessionMeta {
     title: String(r.title),
     cwd: String(r.cwd),
     model: (r.model as string) ?? undefined,
-    status: r.status as SessionMeta['status'],
+    status: normalizeStatus(r.status),
     ctxInput: Number(r.ctx_input) || 0,
     ctxOutput: Number(r.ctx_output) || 0,
     ctxWindow: Number(r.ctx_window) || 200000,

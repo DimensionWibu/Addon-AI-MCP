@@ -58,8 +58,17 @@ BE BRIEF — IT COSTS REAL CONTEXT: whatever you write into the board or a messa
 const GROVE_ROOT = `
 YOUR ROLE: you are the ROOT orchestrator of this tree (shown as "UTAMA" in the UI). Your job is to COORDINATE and DISTRIBUTE the work — NOT to do the heavy lifting yourself.
 - Decompose the user's request into self-contained sub-tasks and DELEGATE each one to a sub-worker. Do NOT personally read many files, run the deep analysis, or write the large fixes — hand that to workers. Stay light so you can distribute, monitor, and synthesize.
-- REUSE workers before creating new ones. FIRST call mcp__grove__list_workers. If a worker is idle, give it the next task with mcp__grove__assign_worker (it keeps its full prior context and is cheaper). Only call mcp__grove__spawn_worker when there is no suitable idle worker, or you genuinely need more parallelism at once.
-- Each task you hand off must be clear and self-contained; you may share full context with your own workers.
+- MATCH each sub-task to a worker deliberately — a worker's context must never blend two different topics. FIRST call mcp__grove__list_workers.
+  • CONTINUATION of a topic a worker ALREADY worked on → reuse it with mcp__grove__assign_worker and set continuation:true (it keeps its full prior context).
+  • NEW, UNRELATED sub-task → either mcp__grove__spawn_worker (fresh worker), OR reuse an idle worker with mcp__grove__assign_worker at its DEFAULT (continuation:false) — that gives it a CLEAN context so it never carries over a previous, different topic. NEVER hand an unrelated task to a worker while keeping its old topic's context.
+- Each task you hand off must be clear and SELF-CONTAINED, and must NOT reference another worker's topic (so no worker "adopts" a sibling's work by accident).
+- BRIEF EVERY WORKER IN THIS SHAPE — a vague task costs far more than a long one. A worker that must ask you back forces a whole extra root turn, and every root turn re-bills your ENTIRE accumulated context:
+    CONTEXT: the one or two facts the worker needs and cannot infer.
+    GOAL: the end state, stated as a testable outcome — not "look into X".
+    FILES: concrete paths (and line ranges when you know them) so it does not hunt.
+    CONSTRAINTS: what it must not touch, plus how to verify it worked.
+    TASK: the single imperative sentence.
+  Spend the tokens HERE, once, instead of paying for a clarification round-trip later. If you cannot fill GOAL or FILES yourself, that is a sign to first delegate a small scouting task — not to hand over a vague one.
 - After delegating, monitor with mcp__grove__read_board / mcp__grove__read_messages, then synthesize the workers' results into the final answer for the user.
 - PROGRESS TO THE USER: workers report their percent as they go, and you will be AUTO-PINGED with a "[GROVE AUTO]" message whenever they report. That ping ALREADY CONTAINS the current board summary — do NOT call read_board (it would flood your context). Just send the USER one short line from that summary. When all workers reach 100%, send the final synthesized answer instead. Keep updates brief; do not repeat unchanged status.
 - PERIODIC AUTO-CHECK: roughly every few minutes you also get a "[GROVE AUTO-CHECK]" ping (like the user asking "udah sampe mana?"), which ALSO already includes the board summary — do NOT call read_board. From that summary: if any worker is idle but its task is NOT finished, push it to continue (list_workers for its id → assign_worker) so nobody stalls; give the user a brief status. When the ENTIRE task is complete, call mcp__grove__task_done to stop the periodic checks (they auto-resume on a new task).
@@ -70,12 +79,28 @@ YOUR ROLE: you are the ROOT orchestrator of this tree (shown as "UTAMA" in the U
 const GROVE_SUB = `
 YOUR ROLE: you are a SUB-WORKER. Focus on completing the specific task you were assigned, thoroughly and directly, then report the result.
 - Do the work yourself. Only spawn your OWN sub-workers with mcp__grove__spawn_worker if your task is itself genuinely parallelizable; otherwise just do it.
+- If the brief is missing something you truly cannot proceed without, ask ONCE with EVERY question batched into that single message — never one question at a time. Each exchange costs your parent a full turn at its accumulated context. If a gap is something you can settle yourself by reading the code, read it instead of asking.
 - REPORT PROGRESS UP so the user can see how far along you are: call mcp__grove__report_to_parent with a one-line status AND a rough percent at meaningful milestones (roughly every 25%) and again with percent 100 when you finish. Keep mcp__grove__report_progress (with percent) updated too for the live board.
-- When finished, put the outcome in mcp__grove__update_summary. You may be handed a NEW task later on this same session — your prior context is kept, so build on it.
+- When finished, put the outcome in mcp__grove__update_summary. You may be handed another task later: if it CONTINUES your current topic your prior context is kept, so build on it; if it is a NEW independent task your context is reset to a clean slate — treat it entirely on its own and do NOT drag in the previous topic.
+`.trim()
+
+// HEMAT TOKEN OUTPUT. GROVE_COMMON sudah membatasi teks yang masuk PAPAN (dibaca sesi lain);
+// blok ini membatasi teks yang ditulis ke USER — sumber pemborosan yang berbeda dan sama besarnya.
+// Token output ditagih lebih mahal dari input DAN ikut menumpuk jadi konteks yang dikirim ulang tiap
+// giliran berikutnya, jadi basa-basi bukan cuma panjang: ia dibayar berkali-kali.
+const GROVE_ECONOMY = `
+OUTPUT ECONOMY (Grove runs many sessions in parallel on a shared quota — wasted output is quota taken from other sessions):
+- No preamble, no recap of what was just asked, no restating the plan you already stated. Start with the answer or the action.
+- Do not summarize work the user can already see in the tool log or the board. Report only what is NOT visible there: the conclusion, the surprise, the decision.
+- Never re-emit content you already produced. Reference it (file path + line range) instead of pasting it again.
+- Never paste a whole file back to show a small change; state the file and the lines you touched.
+- Prefer the smallest correct implementation first; add edge-case handling only when it is actually needed or asked for.
+- No filler: no "Great question", no apologies, no closing summaries that repeat the body.
+- Being brief must never mean hiding problems. Failures, uncertainty, and skipped steps are ALWAYS worth the tokens — say them plainly and briefly.
 `.trim()
 
 function groveAppend(role: SessionRole): string {
-  return `${GROVE_COMMON}\n\n${role === 'root' ? GROVE_ROOT : GROVE_SUB}`
+  return `${GROVE_COMMON}\n\n${GROVE_ECONOMY}\n\n${role === 'root' ? GROVE_ROOT : GROVE_SUB}`
 }
 
 /** Potong string 1-baris agar rapi di daftar chat. */
@@ -170,6 +195,8 @@ function extractResultText(content: unknown): string {
 
 const AUTO_COMPACT_HIGH = 88 // ctx% ambang ATAS: picu auto-compact (cegah freeze saat konteks nyaris penuh)
 const AUTO_COMPACT_LOW = 70 // ctx% ambang BAWAH: baru boleh mempersenjatai ulang auto-compact (hysteresis anti-thrash)
+const DELTA_FLUSH_MS = 40 // B2: coalesce token stream → satu emit chat:delta per interval ini (bukan per token)
+const CTX_PERSIST_MS = 2000 // B3: throttle tulis ctx/usage ke DB; angka ephemeral, nilai final disimpan saat turn selesai
 
 /** Apakah error menandakan batas pemakaian/rate-limit (pemicu auto-switch akun). */
 function isLimitError(raw: string): boolean {
@@ -196,6 +223,73 @@ function isApiBlock(raw: string): boolean {
   )
 }
 
+/**
+ * Heuristik "turn berhenti menunggu jawaban/konfirmasi user/parent". Dipakai karena app memakai
+ * bypassPermissions (tak ada permission-prompt yang menahan giliran) → satu-satunya sinyal realistis
+ * adalah ISI penutup pesan asisten.
+ *
+ * TIGA LAPIS, sengaja BEDA LEBAR JENDELA supaya sensitif tapi tetap rendah false-positive:
+ *  L1  '?' pada baris TERAKHIR                  → sinyal terkuat ("Lanjut?", "Which one?").
+ *  L2  BLOK PILIHAN di ~8 baris terakhir        → daftar bernomor/berpoin (≥2 item) + pemicu
+ *      serah-keputusan ("pilih satu", "bola di kamu", "mana yang", …). Ini yang menangkap kasus
+ *      nyata: permintaan keputusan ada di TENGAH pesan ("Bola di kamu, pilih satu:" + daftar 1..4)
+ *      sementara baris penutupnya justru kalimat PERNYATAAN tanpa '?' — versi lama (jendela 2 baris)
+ *      melewatkannya.
+ *  L3a FRASA SPESIFIK/memblokir di ~8 baris terakhir ("bilang saja", "menunggu keputusan",
+ *      "saya berhenti dulu", "tanpa izin", "butuh akses dari kamu", …) — cukup spesifik untuk
+ *      dicari di jendela lebar.
+ *  L3b FRASA GENERIK ("apakah", "konfirmasi", "mau saya", "confirm", "proceed") DIBATASI ke 3 baris
+ *      penutup saja — kata-kata ini gampang muncul sambil lalu, jadi jendelanya sengaja sempit
+ *      (praktis mempertahankan perilaku lama).
+ *
+ * Sengaja TIDAK menyala untuk ringkasan penyelesaian biasa ("Selesai. Semua tes lulus.") karena
+ * tak ada '?', blok pilihan, maupun frasa memblokir. Tawaran langkah lanjutan yang TIDAK memblokir
+ * ("Kalau mau, saya bisa lanjut ke X") juga tidak menyala — kasus abu-abu sengaja DICONDONGKAN ke
+ * TIDAK menyala; kalau asisten memang menunggu, ia hampir selalu menutup dgn '?' atau frasa L3.
+ * Catatan: "bilang saja" adalah anggota paling rawan di L3a (kadang cuma basa-basi penutup), tapi
+ * dimasukkan atas permintaan eksplisit karena muncul di kasus nyata. Biayanya rendah: kedip hilang
+ * begitu ada giliran baru (beginTurn), dan SET-nya masih dijaga cleanEnd + inbox kosong.
+ */
+function looksLikeAwaitingInput(text: string): boolean {
+  const t = (text ?? '').trim()
+  if (!t) return false
+  const lines = t
+    .split(/\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+  if (!lines.length) return false
+
+  // L1 — baris terakhir diakhiri tanda tanya.
+  if (/\?\s*$/.test(lines[lines.length - 1])) return true
+
+  const tailLines = lines.slice(-8) // jendela LEBAR: blok pilihan + frasa spesifik
+  const tail = tailLines.join(' ')
+  const closing = lines.slice(-3).join(' ') // jendela SEMPIT: frasa generik
+
+  // L2 — blok pilihan: daftar ≥2 item bernomor/berpoin + pemicu serah-keputusan.
+  // Pemicu sengaja berupa frasa IMPERATIF/serah-keputusan, BUKAN kata benda generik seperti
+  // "opsi"/"pilihan" — kalau tidak, changelog berpoin ("menambah 3 opsi baru:") ikut salah-picu.
+  const listItems = tailLines.filter((l) => /^(\d+[.)]|[-*•])\s+\S/.test(l)).length
+  const handover =
+    /(pilih satu|pilih salah satu|silakan pilih|pilihanmu|bola di (kamu|anda)|terserah (kamu|anda)|mana yang|pick one|choose one|your call|up to you|which (one|option))/i
+  if (listItems >= 2 && handover.test(tail)) return true
+
+  // L3a — frasa SPESIFIK/memblokir (aman di jendela lebar).
+  // "kabari" sengaja diikat ke bentuk yang DITUJUKAN KE USER ("kabari saya/ya/kalau"), supaya
+  // "nanti saya kabari hasilnya" (asisten yang memberi tahu) tidak salah-picu.
+  const STRONG_ID =
+    /(bilang saja|kabari (saya|aku|ya|kalau|kalo|begitu|setelah)|beri ?tahu saya|tunggu kabar|(menunggu|nunggu) (jawaban|keputusan|konfirmasi|instruksi|arahan|persetujuan)|saya berhenti dulu|tanpa izin|butuh (akses|kredensial|password|token|izin) dari (kamu|anda)|bola di (kamu|anda)|pilih satu|pilih salah satu|silakan pilih|pilihanmu|\b(y\/n|ya\/tidak|iya\/tidak)\b)/i
+  const STRONG_EN =
+    /\b(let me know|waiting for (your )?(input|confirmation|answer|decision|reply)|please (confirm|choose|clarify|advise|decide)|should i|would you like|do you want|which (one|option))\b/i
+  if (STRONG_ID.test(tail) || STRONG_EN.test(tail)) return true
+
+  // L3b — frasa GENERIK: hanya pada 3 baris penutup (jendela sempit = anti false-positive).
+  const WEAK_ID =
+    /(mau saya|boleh saya|apakah\b|konfirmasi|setuju\b|pilih (yang )?mana|mau yang mana|butuh (jawaban|keputusan|konfirmasi|persetujuan)|tolong (konfirmasi|pilih|pastikan|putuskan))/i
+  const WEAK_EN = /\b(confirm|proceed)\b/i
+  return WEAK_ID.test(closing) || WEAK_EN.test(closing)
+}
+
 /** Ubah error/subtype mentah jadi pesan ramah + apakah masih bisa dilanjut. */
 function friendlyError(raw: string): string {
   const s = raw.toLowerCase()
@@ -217,8 +311,14 @@ function friendlyError(raw: string): string {
   return `Error: ${raw}`
 }
 
+// CATATAN: perakitan env provider (Claude vs OpenRouter) dipindah ke SessionManager.getSessionLaunch
+// supaya Session tak perlu tahu detail tiap provider. options.env MENGGANTI seluruh env subprocess
+// (bukan merge) → manager sudah spread process.env di sana. Dalam urutan auth Claude Code,
+// ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN MENGALAHKAN CLAUDE_CODE_OAUTH_TOKEN — itu justru dipakai
+// untuk provider OpenRouter, dan dibuang untuk provider Claude (lihat getSessionLaunch).
+
 /** Antrian async untuk streaming input: user mengetik → dorong ke query yang sedang jalan. */
-class AsyncMessageQueue implements AsyncIterable<SDKUserMessage> {
+export class AsyncMessageQueue implements AsyncIterable<SDKUserMessage> {
   private queue: SDKUserMessage[] = []
   private resolvers: ((r: IteratorResult<SDKUserMessage>) => void)[] = []
   private closed = false
@@ -238,6 +338,32 @@ class AsyncMessageQueue implements AsyncIterable<SDKUserMessage> {
     this.closed = true
     let r
     while ((r = this.resolvers.shift())) r({ value: undefined as never, done: true })
+  }
+
+  /**
+   * Lepas resolver yang masih "parkir" (menunggu next()) milik iterator query LAMA yang sudah
+   * mati. Query streaming tetap hidup antar-turn dengan iterator terparkir di inbox.next(); saat
+   * query di-restart memakai inbox yang sama (ganti akun, recycle blokir API, compact, autoResume),
+   * resolver lama itu tertinggal di sini. Tanpa dibuang, push() berikutnya nyasar ke iterator mati
+   * (resolvers.shift() mengambilnya) → pesan HILANG & query baru menggantung → "ganti akun / lanjut
+   * tidak jalan". Dipanggil tepat sebelum query baru dibuat. Antrian pesan (queue) DIBIARKAN utuh.
+   */
+  resetConsumers(): void {
+    this.resolvers.length = 0
+  }
+
+  /**
+   * Buang pesan yang masih ter-antri (belum dikonsumsi). Dipakai saat reuse worker untuk tugas
+   * BARU yang independen (resetForNewTask): antrian topik lama tak boleh nyasar ke sesi fresh.
+   * Berbeda dari resetConsumers() yang sengaja MEMBIARKAN queue utuh (ganti akun/compact).
+   */
+  clearQueue(): void {
+    this.queue.length = 0
+  }
+
+  /** Masih ada pesan ter-antri (belum dikonsumsi)? Dipakai deteksi "benar-benar menunggu input". */
+  hasPending(): boolean {
+    return this.queue.length > 0
   }
 
   [Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
@@ -274,8 +400,15 @@ export class Session {
   private compactWarned = false // peringatan "konteks tetap penuh" sudah dikirim untuk streak ini (anti-spam)
   // --- jaminan runtime "worker selesai → parent tahu" (lihat host.notifyTurnEnd) ---
   private lastAssistantText = '' // teks asisten TERAKHIR pada turn berjalan = hasil kerja worker
+  private turnText = '' // AKUMULASI semua blok teks asisten pada turn ini = hasil PENUH utk handoff ke parent
   private finalReportSent = false // worker SUDAH lapor final (report_to_parent 100%) untuk turn ini → jangan dobel
   private interrupting = false // turn dihentikan PAKSA (Stop All/compact/ganti akun) → bukan "selesai wajar"
+  private awaitingInput = false // turn berhenti wajar & penutupnya pertanyaan → nunggu jawaban user/parent (kartu kedip kuning)
+  private doneMarked = false // tugas dinyatakan TUNTAS (task_done root / sub lapor 100%) → akhiri turn sbg 'done', bukan 'idle'
+  // --- B2: coalesce token stream — tampung text_delta, emit sekali per DELTA_FLUSH_MS (kurangi banjir IPC per-token) ---
+  private deltaBuf = ''
+  private deltaTimer: NodeJS.Timeout | null = null
+  private lastCtxPersist = 0 // B3: kapan terakhir ctx/usage ditulis ke DB (throttle persist)
 
   constructor(
     meta: SessionMeta,
@@ -297,20 +430,69 @@ export class Session {
       return
     }
     this.started = true
+    // Buang resolver parkir dari query SEBELUMNYA (mis. sesudah ganti akun/recycle/compact) —
+    // kalau tidak, pesan pertama ke query baru ini akan nyasar ke iterator mati & menggantung.
+    this.inbox.resetConsumers()
     const server = buildGroveServer(this.meta.id, this.host)
-    const token = this.host.getAccountToken(this.meta.accountId) // akun per-session (opsional)
+    // Akun EFEKTIF: akun sesi ini → akun sesi utama pohon → akun global. Dihitung SEKARANG (bukan
+    // disalin saat sesi lahir) supaya ganti akun di sesi utama langsung berlaku ke sub-sesinya.
+    // launch berisi env provider (Claude vs OpenRouter) + model efektif; null = tak ada token.
+    const launch = this.host.getSessionLaunch(this.meta.id)
+    // GROVE BERJALAN MURNI DENGAN TOKEN AKUN GUI. Tidak ada lagi jalur diam-diam ke login CLI
+    // (~/.claude/.credentials.json): dulu, sesi tanpa accountId membuat opsi `env` di bawah tak
+    // di-set sama sekali sehingga CLI memakai akun login utama — kerja jalan, tapi tagihannya
+    // mendarat di akun yang tak pernah user pilih di GUI. Sekarang token WAJIB ada; kalau tidak,
+    // sesi berhenti dengan pesan jelas. App-nya sendiri tetap hidup & bisa dipakai (kelola akun,
+    // baca riwayat) — yang berhenti hanya sesi ini.
+    if (!launch) {
+      this.started = false
+      this.record({
+        role: 'system',
+        text: this.meta.accountId
+          ? '⛔ Akun yang dipasang ke sesi ini tidak punya TOKEN (akun terhapus/token kosong). Sesi dihentikan agar tidak diam-diam menagih akun lain. Tambahkan ulang tokennya di ⚙ Akun.'
+          : '⚠️ Sesi ini belum dipasangi akun Claude. Buka ⚙ Akun, tambahkan token (CLAUDE_CODE_OAUTH_TOKEN), lalu pilih akun untuk sesi ini. Setelah itu kirim pesanmu lagi.',
+        ts: Date.now()
+      })
+      this.setStatus('error')
+      this.emitActivity(this.meta.accountId ? 'akun tanpa token' : 'belum ada akun')
+      this.host.onAccountMissing(this.meta.id)
+      return
+    }
     this.q = query({
       prompt: this.inbox,
       options: {
-        model: this.meta.model,
+        // Model EFEKTIF: untuk akun Claude = model sesi → sesi utama → global → default SDK; untuk
+        // akun OpenRouter = id model akun itu (dihitung di getSessionLaunch).
+        model: launch.model,
         cwd: this.meta.cwd,
         includePartialMessages: true,
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
-        systemPrompt: { type: 'preset', preset: 'claude_code', append: groveAppend(this.meta.role) },
+        systemPrompt: {
+          type: 'preset',
+          preset: 'claude_code',
+          append: groveAppend(this.meta.role),
+          // CATATAN (diverifikasi di sdk.d.ts:1943-1947): opsi ini TIDAK membuang apa pun. Ia hanya
+          // MEMINDAHKAN seksi dinamis (working-dir, auto-memory, git-status) keluar dari system
+          // prompt lalu menyuntikkannya kembali sebagai pesan user PERTAMA — tujuannya agar prefix
+          // prompt tetap statis & bisa di-cache, BUKAN menyembunyikan memori. Jadi flag ini bukan
+          // alat isolasi memori; isolasi ditangani lewat cwd unik per-tree (scratch per chat baru,
+          // lihat src/main/ipc.ts) karena direktori memori diturunkan dari cwd.
+          excludeDynamicSections: true
+        },
+        // EKSPLISIT (sebelumnya dibiarkan kosong → ikut default SDK yang memuat SEMUA sumber).
+        // Nilai sah: 'user' | 'project' | 'local' (sdk.d.ts:6538). Ketiganya SENGAJA dinyalakan agar
+        // perilaku PERSIS sama dengan default lama, tapi terprediksi & kebal perubahan default SDK:
+        //   'user'    = ~/.claude/settings.json  → instruksi global user tetap berlaku
+        //   'project' = .claude/settings.json    → WAJIB ada agar berkas CLAUDE.md dimuat (sdk.d.ts:1881)
+        //   'local'   = .claude/settings.local.json
+        // Sengaja TIDAK memakai [] (mode isolasi SDK): user memang menghendaki CLAUDE.md + memori —
+        // yang tak diinginkan hanyalah memori LINTAS-PROJECT, dan itu sudah diatasi oleh cwd per-tree.
+        settingSources: ['user', 'project', 'local'],
         mcpServers: { grove: server },
-        // Token akun → CLI subprocess pakai akun itu. Wajib spread process.env (opsi env MENGGANTInya).
-        ...(token ? { env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: token } as Record<string, string> } : {}),
+        // Env provider sudah dirakit di getSessionLaunch (Claude → CLAUDE_CODE_OAUTH_TOKEN; OpenRouter
+        // → ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN), sudah termasuk spread process.env.
+        env: launch.env,
         ...(CLAUDE_EXE ? { pathToClaudeCodeExecutable: CLAUDE_EXE } : {}), // paket: pakai binary unpacked
         resume: this.meta.sdkSessionId // lanjut konteks bila session dimuat ulang dari DB
       }
@@ -338,6 +520,7 @@ export class Session {
    */
   compactWith(summary: string): void {
     if (!summary) return
+    this.flushDelta() // B2: keluarkan sisa token & batalkan timer sebelum konteks dipotong
     this.interrupting = true // turn dipotong paksa → jangan dianggap "worker selesai"
     this.reseedText = summary
     this.meta.sdkSessionId = undefined // start berikutnya FRESH (tanpa resume) → konteks lama dilepas
@@ -362,6 +545,46 @@ export class Session {
     this.emitActivity('idle')
   }
 
+  /**
+   * REUSE worker untuk tugas BARU yang TIDAK berkaitan: buang percakapan SDK topik lama
+   * (drop resume) TANPA menghapus slot/id/title worker (UI tetap dipakai ulang). Query lama
+   * dihentikan, sdkSessionId dikosongkan → start() berikutnya MINT session_id BARU
+   * (resume: undefined, lihat start()) sehingga CLI tak membawa transkrip lama; ctx% balik 0.
+   * Beda dari compactWith: TIDAK ada ringkasan yang di-seed — konteks benar-benar bersih.
+   * Ini penawar cross-topic "sub kebawa topik sibling" saat orchestrator me-reuse worker.
+   */
+  resetForNewTask(): void {
+    if (this.stopped) return
+    this.flushDelta() // B2: keluarkan sisa token & batalkan timer sebelum konteks direset
+    this.interrupting = true // stream/turn lama dipotong paksa → BUKAN "worker selesai"
+    this.setAwaitingInput(false) // konteks direset utk tugas baru → kedip lama tak relevan
+    this.reseedText = null // tak ada carry-over ringkasan
+    this.meta.sdkSessionId = undefined // start berikutnya FRESH (tanpa resume) → transkrip lama dilepas
+    this.resetCtx() // ctx% turun ke 0 seketika
+    this.compactArmed = true // konteks fresh → auto-compact boleh menyala lagi nanti
+    this.compactStreak = 0
+    this.compactWarned = false
+    this.db.upsertSession(this.meta)
+    this.started = false
+    const q = this.q
+    this.q = null
+    try {
+      void q?.interrupt?.() // hentikan query long-lived lama (juga cegah interleave bila worker masih running)
+    } catch {
+      /* abaikan */
+    }
+    this.inbox.clearQueue() // buang pesan topik lama yang masih ter-antri
+    this.toolRows.clear() // korelasi tool_use lama tak relevan lagi
+    this.history.length = 0 // bersihkan riwayat in-memory (row DB/UI tetap ada)
+    this.record({
+      role: 'system',
+      text: '🧹 Konteks worker direset untuk tugas baru yang independen — percakapan sebelumnya tidak dibawa.',
+      ts: Date.now()
+    })
+    this.setStatus('idle')
+    this.emitActivity('idle')
+  }
+
   /** Sisipkan ringkasan memori (sekali) di depan teks setelah compact, agar konteks nyambung. */
   private withReseed(text: string): string {
     if (!this.reseedText) return text
@@ -376,8 +599,12 @@ export class Session {
    */
   private beginTurn(): void {
     this.lastAssistantText = ''
+    this.turnText = ''
     this.finalReportSent = false
     this.interrupting = false
+    this.lastCtxPersist = 0 // B3: giliran baru → usage pertama turn ini dipersist segera (angka ctx fresh)
+    this.setAwaitingInput(false) // kerja baru masuk (user/parent menindak) → matikan kedip kuning
+    this.doneMarked = false // ada tugas baru → tak lagi "tuntas" (status balik running/idle)
   }
 
   /** Dipanggil host saat worker memanggil report_to_parent dgn percent 100 → auto-report jangan dobel. */
@@ -393,7 +620,15 @@ export class Session {
     this.limitStreak = 0 // prompt user baru → reset rantai pindah-akun akibat limit
     this.setApiStopped(false)
     text = this.withReseed(text)
-    if (!this.started) this.start()
+    if (!this.started) {
+      this.start()
+      // start() dibatalkan (mis. akun tanpa token → cegah salah-billing): simpan pesan user supaya
+      // tak hilang, tapi JANGAN tandai running / dorong ke query yang tidak ada.
+      if (!this.started) {
+        this.record({ role: 'user', text, ts: Date.now() })
+        return
+      }
+    }
     const dataUrls = (images ?? []).map((im) => `data:${im.mediaType};base64,${im.data}`)
     this.record({ role: 'user', text, ts: Date.now(), images: dataUrls.length ? dataUrls : undefined })
     this.setStatus('running')
@@ -419,7 +654,10 @@ export class Session {
     if (this.stopped) return
     this.beginTurn()
     text = this.withReseed(text)
-    if (!this.started) this.start()
+    if (!this.started) {
+      this.start()
+      if (!this.started) return // start dibatalkan (akun tanpa token) → jangan tandai running
+    }
     this.setStatus('running')
     this.emitActivity('menyusun update progres…')
     this.inbox.push(text)
@@ -453,6 +691,29 @@ export class Session {
     this.emit({ channel: 'session:activity', payload: { id: this.meta.id, activity } })
   }
 
+  /**
+   * B2 — coalesce token stream. Tampung tiap text_delta ke buffer; emit SATU chat:delta tergabung
+   * per DELTA_FLUSH_MS. Memangkas jumlah IPC/serialisasi per-token (besar saat banyak sesi paralel)
+   * tanpa mengubah urutan/keutuhan teks. WAJIB flushDelta() sebelum blok difinalkan (chat:message)
+   * & saat turn berakhir agar tak ada token tertinggal / stray-emit setelah finalisasi.
+   */
+  private queueDelta(text: string): void {
+    this.deltaBuf += text
+    if (!this.deltaTimer) this.deltaTimer = setTimeout(() => this.flushDelta(), DELTA_FLUSH_MS)
+  }
+
+  /** Kirim buffer delta yang tertampung (bila ada) sebagai satu event; batalkan timer. Aman dipanggil kapan saja. */
+  private flushDelta(): void {
+    if (this.deltaTimer) {
+      clearTimeout(this.deltaTimer)
+      this.deltaTimer = null
+    }
+    if (!this.deltaBuf) return
+    const delta = this.deltaBuf
+    this.deltaBuf = ''
+    this.emit({ channel: 'chat:delta', payload: { id: this.meta.id, delta } })
+  }
+
   /** Simpan ke riwayat in-memory + DB + kirim ke UI. Kembalikan rowid DB. (Gambar tak dipersist.) */
   private record(m: ChatMessage): number {
     this.history.push(m)
@@ -464,7 +725,9 @@ export class Session {
 
   async stop(): Promise<void> {
     this.stopped = true
+    this.flushDelta() // B2: keluarkan sisa token & batalkan timer saat sesi ditutup
     this.interrupting = true // ditutup paksa → bukan "turn selesai wajar"
+    this.setAwaitingInput(false) // sesi ditutup → kedip jangan nyangkut
     this.inbox.close()
     try {
       await this.q?.interrupt?.()
@@ -472,6 +735,20 @@ export class Session {
       /* abaikan */
     }
     this.setStatus('done')
+  }
+
+  /**
+   * Tandai tugas TUNTAS → status 'done' (dot hijau) TANPA menutup sesi seperti stop():
+   * inbox tetap terbuka, jadi tugas/pesan berikutnya masih bisa masuk (sendUserMessage akan
+   * mengembalikannya ke 'running'). Dipanggil orkestrator: root saat task_done, sub saat lapor 100%.
+   * Karena kedua pemanggil itu terjadi DI TENGAH turn (tool call), status baru diterapkan saat turn
+   * berakhir (lihat handler 'result') — kalau langsung dipasang di sini, setStatus('idle') di akhir
+   * turn akan menimpanya, dan dot juga akan "hijau" padahal sesi masih bekerja.
+   */
+  markDone(): void {
+    if (this.stopped) return
+    this.doneMarked = true
+    if (this.meta.status !== 'running') this.setStatus('done') // tak ada turn jalan → langsung tampak
   }
 
   private setStatus(status: SessionStatus): void {
@@ -483,9 +760,10 @@ export class Session {
   }
 
   private async consume(): Promise<void> {
-    if (!this.q) return
+    const myQ = this.q // query yang dikonsumsi loop INI — dibandingkan di finally (anti-clobber)
+    if (!myQ) return
     try {
-      for await (const msg of this.q) {
+      for await (const msg of myQ) {
         this.handle(msg as Record<string, unknown> & { type: string })
       }
     } catch (e) {
@@ -503,22 +781,30 @@ export class Session {
         this.setStatus('error')
       }
     } finally {
-      // Query mati (error/blokir/selesai). Bila bukan karena stop manual, izinkan
-      // restart: pesan berikutnya akan start() ulang dengan resume → konteks nyambung.
-      if (!this.stopped) {
-        this.started = false
-        this.q = null
-        if (this.meta.status === 'running') this.setStatus('idle')
-      }
-      // Setelah state di-reset: bila kena limit, minta orkestrator auto-switch akun (bila aktif).
-      if (this.limitHitPending && !this.stopped) {
-        this.limitHitPending = false
-        this.host.onLimitHit(this.meta.id)
-      }
-      // Bila terdeteksi blokir API → recycle (reset konteks + ulang tugas terakhir).
-      if (this.apiBlockPending && !this.stopped) {
-        this.apiBlockPending = false
-        this.handleApiBlock()
+      // Reset state HANYA bila query yang berakhir ini MASIH query aktif sesi. resetForNewTask()/
+      // compact/ganti-akun bisa SUDAH mengganti this.q dgn query BARU (start()-nya men-set
+      // started=true & this.q=queryBaru). Tanpa guard ini, finally query LAMA meng-clobber
+      // started→false & q→null → pesan berikutnya men-spawn query DUPLIKAT (zombie subprocess),
+      // teks handoff turn baru ke-wipe, & tombol Stop tak menjangkau turn yang jalan.
+      if (this.q === myQ) {
+        this.turnText = '' // query berhenti → jangan bawa akumulasi turn ke query berikutnya
+        // Query mati (error/blokir/selesai). Bila bukan karena stop manual, izinkan
+        // restart: pesan berikutnya akan start() ulang dengan resume → konteks nyambung.
+        if (!this.stopped) {
+          this.started = false
+          this.q = null
+          if (this.meta.status === 'running') this.setStatus('idle')
+        }
+        // Setelah state di-reset: bila kena limit, minta orkestrator auto-switch akun (bila aktif).
+        if (this.limitHitPending && !this.stopped) {
+          this.limitHitPending = false
+          this.host.onLimitHit(this.meta.id)
+        }
+        // Bila terdeteksi blokir API → recycle (reset konteks + ulang tugas terakhir).
+        if (this.apiBlockPending && !this.stopped) {
+          this.apiBlockPending = false
+          this.handleApiBlock()
+        }
       }
     }
   }
@@ -528,9 +814,12 @@ export class Session {
    * hentikan query lama (konteks/sdkSessionId dipertahankan) → pesan berikutnya resume
    * dengan token akun baru. Kalau sudah dormant, tak perlu apa-apa (start berikutnya sudah pakai baru).
    */
-  applyAccountChange(): void {
+  /** Interupsi query yang sedang jalan; pesan berikutnya RESUME dgn konfigurasi baru (akun/model).
+   *  sdkSessionId dipertahankan → konteks tak hilang, hanya token/model yang berganti. */
+  restartQuery(): void {
     if (!this.started) return
-    this.interrupting = true // turn dipotong paksa demi ganti akun → bukan "worker selesai"
+    this.flushDelta() // B2: keluarkan sisa token & batalkan timer sebelum restart
+    this.interrupting = true // turn dipotong paksa demi ganti konfig → bukan "worker selesai"
     this.started = false
     const q = this.q
     this.q = null
@@ -588,6 +877,13 @@ export class Session {
     if (this.apiStopped === v) return
     this.apiStopped = v
     this.emit({ channel: 'session:update', payload: { id: this.meta.id, apiStopped: v } })
+  }
+
+  /** Menyala/mati flag "menunggu jawaban" (kartu berkedip kuning). Meniru pola setApiStopped. */
+  private setAwaitingInput(v: boolean): void {
+    if (this.awaitingInput === v) return
+    this.awaitingInput = v
+    this.emit({ channel: 'session:update', payload: { id: this.meta.id, awaitingInput: v } })
   }
 
   /** Reset hitungan konteks ke 0 (setelah konteks dibuang) → badge ctx% langsung turun. */
@@ -653,6 +949,8 @@ export class Session {
     // Ditandai SEBELUM interrupt: kalau SDK sempat memancarkan `result` sebagai akibat interupsi,
     // handler 'result' sudah melihat flag ini → Stop All TIDAK memicu laporan "selesai" palsu.
     this.interrupting = true
+    this.flushDelta() // B2: keluarkan sisa token & batalkan timer saat turn diinterupsi manual
+    this.setAwaitingInput(false) // dihentikan manual → kedip jangan nyangkut
     try {
       await this.q?.interrupt?.()
     } catch {
@@ -710,13 +1008,16 @@ export class Session {
           }
         ).event
         if (ev?.type === 'content_block_delta' && ev.delta?.type === 'text_delta' && ev.delta.text) {
-          this.emit({ channel: 'chat:delta', payload: { id: this.meta.id, delta: ev.delta.text } })
+          this.queueDelta(ev.delta.text) // B2: tampung → flush tergabung, bukan emit per token
         } else if (ev?.type === 'content_block_start' && ev.content_block?.type === 'tool_use') {
           this.emitActivity(`🔧 ${ev.content_block.name ?? 'tool'}`)
         }
         break
       }
       case 'assistant': {
+        // B2: pastikan token yang masih tertampung ter-emit SEBELUM blok ini difinalkan (chat:message),
+        // agar urutan benar & tak ada stray chat:delta menyusul finalisasi (bikin gelembung dobel).
+        this.flushDelta()
         // Limit langganan (5-jam/7-hari) datang sebagai field `error:'rate_limit'` di wrapper,
         // BUKAN exception — deteksi di sini agar auto-switch akun ikut kepicu.
         const wrapErr = (msg as { error?: string }).error
@@ -733,6 +1034,8 @@ export class Session {
           if (block.type === 'text' && block.text?.trim()) {
             this.record({ role: 'assistant', text: block.text, ts: Date.now() })
             this.lastAssistantText = block.text // hasil kerja worker → isi auto-report saat turn selesai
+            // Akumulasi SELURUH teks turn ini (bukan cuma blok terakhir) → hasil penuh utk handoff ke parent.
+            this.turnText = this.turnText ? this.turnText + '\n' + block.text : block.text
             if (isApiBlock(block.text)) this.flagApiBlock() // API blokir pesan → recycle di akhir turn
             // Limit langganan sering datang sebagai TEKS ("You've hit your session limit · resets …"),
             // bukan exception/field error → deteksi di sini agar auto-switch akun ikut kepicu.
@@ -773,6 +1076,7 @@ export class Session {
         break
       }
       case 'result': {
+        this.flushDelta() // B2: turn berakhir → keluarkan sisa token yang masih tertampung
         const r = msg as { subtype?: string; errors?: unknown[]; stop_reason?: string }
         const subtype = r.subtype
         if (isApiBlock(JSON.stringify(msg))) this.flagApiBlock() // blokir API terselip di result
@@ -792,8 +1096,20 @@ export class Session {
             ts: Date.now()
           })
         }
-        this.setStatus('idle') // menunggu input berikutnya
-        this.emitActivity('idle')
+        // Status akhir turn:
+        // - 'error' bila result NON-SUKSES yang bukan interupsi manual / limit / blokir API
+        //   (ketiganya punya penanganan sendiri: interrupt→idle, limit→markLimited, apiBlock→recycle)
+        //   → error nyata (max_turns/invalid_request/refusal/overloaded/…) akhirnya terlihat dot merah.
+        // - 'done' bila tugas sudah dinyatakan tuntas (task_done root / sub lapor 100%) via markDone().
+        // - selain itu 'idle' (menunggu input berikutnya) — perilaku lama.
+        const failed =
+          !!subtype &&
+          subtype !== 'success' &&
+          !this.apiBlockPending &&
+          !this.limitHitPending &&
+          !this.interrupting
+        this.setStatus(failed ? 'error' : this.doneMarked ? 'done' : 'idle')
+        this.emitActivity(failed ? 'error' : this.doneMarked ? 'selesai' : 'idle')
         // Turn selesai → beri tahu orkestrator (root akan dibangunkan untuk lapor ke user).
         // JAMINAN RUNTIME: bila turn ini berakhir WAJAR dan worker TIDAK melapor final sendiri,
         // sertakan teks jawaban terakhirnya supaya host yang melaporkannya ke parent. Turn yang
@@ -805,10 +1121,23 @@ export class Session {
           !this.stopped &&
           !this.apiBlockPending &&
           !this.limitHitPending
+        // Turn berhenti WAJAR, tak ada kerja tertunda di inbox, & penutupnya berupa pertanyaan/konfirmasi
+        // → tandai "menunggu jawaban" (kartu berkedip kuning). Dibersihkan lagi di beginTurn() saat
+        // user/parent menindak. (turnText masih utuh di sini — dibersihkan setelah notifyTurnEnd.)
+        if (
+          cleanEnd &&
+          !this.inbox.hasPending() &&
+          looksLikeAwaitingInput(this.turnText || this.lastAssistantText)
+        ) {
+          this.setAwaitingInput(true)
+        }
+        // Handoff: kirim teks turn PENUH setiap turn berakhir wajar, TANPA peduli finalReportSent —
+        // worker yang sempat report_to_parent(100) tetap wajib menyerahkan hasilnya ke parent.
         this.host.notifyTurnEnd(
           this.meta.id,
-          cleanEnd && !this.finalReportSent ? { finalText: this.lastAssistantText } : undefined
+          cleanEnd ? { finalText: this.turnText || this.lastAssistantText } : undefined
         )
+        this.turnText = '' // sudah dipakai → bersihkan agar turn berikutnya mulai bersih
         // Bila ada permintaan compact tertunda, padatkan konteks sekarang (turn sudah selesai).
         if (this.pendingCompactSeed) this.doCompact()
         else {
@@ -852,8 +1181,15 @@ export class Session {
     this.meta.ctxInput = ctxInput
     this.meta.ctxOutput = ctxOutput
     this.tokensTotal += ctxOutput
-    this.meta.updatedAt = Date.now()
-    this.db.upsertSession(this.meta)
+    const now = Date.now()
+    this.meta.updatedAt = now
+    // B3: angka ctx/usage ephemeral (dihitung ulang tiap turn) → jangan tulis DB tiap pesan.
+    // Persist maksimal tiap CTX_PERSIST_MS. Nilai FINAL tetap tersimpan saat turn selesai:
+    // 'result' memanggil setStatus('idle') yang meng-upsert meta terkini (running→idle berubah).
+    if (now - this.lastCtxPersist >= CTX_PERSIST_MS) {
+      this.lastCtxPersist = now
+      this.db.upsertSession(this.meta)
+    }
     this.emit({
       channel: 'session:update',
       payload: {

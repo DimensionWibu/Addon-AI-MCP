@@ -15,17 +15,23 @@
       <div class="brand">Grove</div>
       <div class="brand-sub">multi-agent Claude orchestrator</div>
       <div id="usage" class="usage" title="Klik untuk detail limit"></div>
+      <button id="usage-refresh" class="usage-refresh" title="Refresh pemakaian sekarang (auto tiap 5 menit)">↻</button>
       <div id="usage-panel" class="usage-panel"></div>
       <div class="legend">
         <span class="dot s-running"></span>running
         <span class="dot s-idle"></span>idle
         <span class="dot s-done"></span>done
         <span class="dot s-error"></span>error
+        <span class="dot s-await await-legend"></span>butuh jawaban
       </div>
+      <select id="global-model" class="model-sel" title="Model default untuk semua sesi (bisa ditimpa per-sesi)"></select>
       <button id="btn-accounts" class="acct-btn" title="Kelola akun Claude (login via setup-token) & switch per-sesi">⚙ Akun</button>
       <div id="acct-panel" class="acct-panel"></div>
       <button id="btn-stop-all" class="stop-all-btn" title="Hentikan turn semua sesi yang sedang berjalan">■ Stop All</button>
     </header>
+    <!-- Banner "belum ada akun". Grove berjalan murni dgn token akun GUI; tanpa itu sesi tak bisa
+         start, tapi APP TETAP JALAN — banner ini yang memberi tahu, bukan crash/diam-diam. -->
+    <div id="auth-banner" class="auth-banner" hidden></div>
 
     <main class="layout">
       <aside class="panel sidebar">
@@ -44,6 +50,7 @@
           <span id="chat-title">Belum ada session</span>
           <span id="chat-badge" class="badge"></span>
           <span id="chat-telem" class="telem"></span>
+          <select id="chat-model" class="model-sel" title="Model sesi ini (kosong = ikut sesi utama / global)"></select>
           <button id="btn-loop" class="loop-btn" title="Auto-check berkala 10 menit: kirim &quot;udah sampe mana?&quot; ke UTAMA biar worker terus jalan (klik untuk on/off)">🔁 Auto</button>
           <button id="btn-compact" class="compact-btn" title="Ringkas laporan sub/sub-sub → simpan ke Memori & padatkan konteks (hanya UTAMA)">🗜 Compact</button>
           <button id="btn-stop" class="stop-btn" title="Interupsi turn yang sedang berjalan">⏹ Stop</button>
@@ -73,7 +80,8 @@
     </main>
 
     <div id="drop-overlay" class="drop-overlay">
-      <div class="drop-inner">📎 Lepas file/folder → jadi referensi chat ini · gambar → lampiran</div>
+      <!-- Teks diganti saat runtime mengikuti ZONA yang di-hover (lihat applyZone di main.ts). -->
+      <div class="drop-inner" id="drop-hint">📎 Lepas file/folder → jadi referensi chat ini · gambar → lampiran</div>
     </div>
 
     <script type="module" src="./main.ts"></script>

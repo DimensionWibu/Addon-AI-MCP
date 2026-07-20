@@ -12,7 +12,8 @@
     "start": "electron-vite dev",
     "test": "tsx test/integration.ts",
     "dist": "electron-vite build && electron-builder --win",
-    "dist:dir": "electron-vite build && electron-builder --win --dir"
+    "dist:dir": "electron-vite build && electron-builder --win --dir",
+    "test:accounts": "esbuild test/account-resolution.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/acct.mjs && electron .tmp/acct.mjs"
   },
   "build": {
     "appId": "com.grove.orchestrator",
