@@ -48,6 +48,19 @@ async function main(): Promise<void> {
   const snap = mgr.getSnapshot()
   ok(snap.trees.length === 1 && snap.trees[0].id === B.id, 'createRoot baru → snapshot benar')
 
+  // ---- Isolasi: menghapus SATU sesi TIDAK merusak sesi lain (regresi "chat rusak global") ----
+  const C = mgr.createRoot(join(TMP, 'c'), 'C')
+  const D = mgr.createRoot(join(TMP, 'd'), 'D')
+  board.addChatMessage(C.id, 'user', 'halo C', Date.now())
+  board.addChatMessage(D.id, 'user', 'halo D', Date.now())
+  ok(mgr.getChat(C.id).length === 1 && mgr.getChat(D.id).length === 1, 'pra-hapus: C & D punya 1 pesan')
+  await mgr.deleteSession(C.id)
+  ok(mgr.getChat(C.id).length === 0, 'pasca-hapus: riwayat C bersih (scoped)')
+  ok(mgr.getChat(D.id).length === 1, 'pasca-hapus C: riwayat D UTUH (tidak hilang global)')
+  ok(!!mgr.getSnapshot().trees.find((t) => t.id === D.id), 'pasca-hapus C: D tetap di snapshot')
+  board.addChatMessage(D.id, 'assistant', 'jawab D', Date.now()) // survivor tetap bisa di-append
+  ok(mgr.getChat(D.id).some((m) => m.text === 'jawab D'), 'pasca-hapus C: pesan baru ter-append ke D')
+
   board.flush()
   console.log(`\n[delete] passed=${passed} failed=${failed}`)
   rmSync(TMP, { recursive: true, force: true })

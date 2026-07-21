@@ -25,7 +25,9 @@ export function registerIpc(manager: SessionManager): void {
   ipcMain.handle('grove:newChat', (_e, { title }: { title?: string }) => {
     const scratch = join(app.getPath('userData'), 'scratch', randomUUID())
     mkdirSync(scratch, { recursive: true }) // recursive → induk ikut dibuat, dan aman bila sudah ada
-    return manager.createRoot(scratch, title || 'Chat baru')
+    // "+Chat" = tanya-tanya solo → mode LITE (CLI-parity, hemat token). Butuh orkestrasi? toggle di
+    // header, atau drag-drop folder (yang default orkestrator penuh).
+    return manager.createRoot(scratch, title || 'Chat baru', true)
   })
 
   // Pilih folder proyek lewat dialog (alternatif drag-drop).
@@ -72,9 +74,18 @@ export function registerIpc(manager: SessionManager): void {
         plan,
         switchPct,
         provider,
-        model
-      }: { label: string; token: string; plan?: number; switchPct?: number; provider?: 'claude' | 'openrouter'; model?: string }
-    ) => manager.addAccount(label, token, plan, switchPct, provider, model)
+        model,
+        baseUrl
+      }: {
+        label: string
+        token: string
+        plan?: number
+        switchPct?: number
+        provider?: 'claude' | 'openrouter' | 'custom'
+        model?: string
+        baseUrl?: string
+      }
+    ) => manager.addAccount(label, token, plan, switchPct, provider, model, baseUrl)
   )
   ipcMain.handle('grove:deleteAccount', (_e, { id }: { id: string }) => manager.deleteAccount(id))
   ipcMain.handle('grove:setAccountSwitchPct', (_e, { id, pct }: { id: string; pct: number | null }) =>
@@ -90,6 +101,7 @@ export function registerIpc(manager: SessionManager): void {
   ipcMain.handle('grove:setSessionModel', (_e, { id, model }: { id: string; model: string | null }) =>
     manager.setSessionModel(id, model)
   )
+  ipcMain.handle('grove:setLite', (_e, { id, lite }: { id: string; lite: boolean }) => manager.setLite(id, lite))
   // Daftar model OpenRouter (live). Gagal jaringan → balikan [] supaya renderer fallback ke saran statis.
   ipcMain.handle('grove:listOpenRouterModels', async (_e, { freeOnly }: { freeOnly?: boolean }) => {
     try {
@@ -107,6 +119,8 @@ export function registerIpc(manager: SessionManager): void {
   ipcMain.handle('grove:interruptSession', (_e, { id }: { id: string }) => manager.interruptSession(id))
 
   ipcMain.handle('grove:deleteSession', (_e, { id }: { id: string }) => manager.deleteSession(id))
+
+  ipcMain.handle('grove:getUsageStats', () => manager.getUsageStats())
 
   ipcMain.handle('grove:getSnapshot', () => manager.getSnapshot())
 

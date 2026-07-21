@@ -22,9 +22,10 @@ const api: GroveApi = {
     token: string,
     plan?: number,
     switchPct?: number,
-    provider?: 'claude' | 'openrouter',
-    model?: string
-  ) => ipcRenderer.invoke('grove:addAccount', { label, token, plan, switchPct, provider, model }),
+    provider?: 'claude' | 'openrouter' | 'custom',
+    model?: string,
+    baseUrl?: string
+  ) => ipcRenderer.invoke('grove:addAccount', { label, token, plan, switchPct, provider, model, baseUrl }),
   deleteAccount: (id: string) => ipcRenderer.invoke('grove:deleteAccount', { id }),
   setAccountSwitchPct: (id: string, pct: number | null) =>
     ipcRenderer.invoke('grove:setAccountSwitchPct', { id, pct }),
@@ -32,7 +33,9 @@ const api: GroveApi = {
   setDefaultAccount: (accountId: string | null) => ipcRenderer.invoke('grove:setDefaultAccount', { accountId }),
   setDefaultModel: (model: string | null) => ipcRenderer.invoke('grove:setDefaultModel', { model }),
   setSessionModel: (id: string, model: string | null) => ipcRenderer.invoke('grove:setSessionModel', { id, model }),
+  setLite: (id: string, lite: boolean) => ipcRenderer.invoke('grove:setLite', { id, lite }),
   listOpenRouterModels: (freeOnly?: boolean) => ipcRenderer.invoke('grove:listOpenRouterModels', { freeOnly }),
+  getUsageStats: () => ipcRenderer.invoke('grove:getUsageStats'),
   setSessionAccount: (id: string, accountId: string | null) =>
     ipcRenderer.invoke('grove:setSessionAccount', { id, accountId }),
   setAutoSwitch: (on: boolean) => ipcRenderer.invoke('grove:setAutoSwitch', { on }),

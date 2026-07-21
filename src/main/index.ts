@@ -158,9 +158,9 @@ app.whenReady().then(async () => {
     if (gen === usageGen) emit({ channel: 'usage:update', payload: snap })
 
     for (const a of manager.listAccounts().accounts) {
-      // Akun OpenRouter tak punya kuota gaya Claude & endpoint /oauth/usage-nya beda → memfetch-nya
-      // ke Anthropic hanya buang request + memunculkan "non-aktif" palsu. Lewati.
-      if (a.provider === 'openrouter') continue
+      // Akun non-Claude (OpenRouter / custom-proxy) tak punya kuota gaya Claude & endpoint /oauth/usage
+      // Anthropic tak berlaku → memfetch-nya hanya buang request + memunculkan "non-aktif" palsu. Lewati.
+      if (a.provider !== 'claude') continue
       // Akun terpilih baru saja di-fetch di atas → pakai cache, jangan tembak endpoint dua kali.
       const r = a.id === t.id ? peekUsage(a.id) : await fetchUsage({ id: a.id, token: manager.getAccountToken(a.id) })
       const pct = r.usage?.fiveHour?.utilization ?? null

@@ -18,7 +18,11 @@ import type {
   Memory,
   SessionMeta,
   TodoItem,
-  TreeNode
+  TreeNode,
+  UsageByAccount,
+  UsageDay,
+  UsageStats,
+  UsageTokens
 } from '../../shared/types'
 import { OPENROUTER_BASE_URL } from '../../shared/types'
 import { Board } from './db'
@@ -107,8 +111,9 @@ export class SessionManager implements GroveHost {
 
   // ---- pembuatan session ---------------------------------------------------
 
-  /** Root baru dari drag-drop folder. Belum ada tugas — menunggu chat pertama user. */
-  createRoot(cwd: string, title?: string): SessionMeta {
+  /** Root baru. `lite` = mode ringan CLI-parity (chat solo tanpa protokol/tool orkestrasi).
+   *  Default dari drag-drop folder: lite=false (orkestrator); "+Chat" folderless: lite=true. */
+  createRoot(cwd: string, title?: string, lite = false): SessionMeta {
     const id = randomUUID()
     const meta = this.newMeta({
       id,
@@ -117,7 +122,8 @@ export class SessionManager implements GroveHost {
       role: 'root',
       title: title || defaultTitle(cwd),
       cwd,
-      model: DEFAULT_MODEL
+      model: DEFAULT_MODEL,
+      lite
     })
     this.db.upsertSession(meta)
     this.registerSession(meta, { emit: true, start: false }) // dormant sampai chat pertama
@@ -293,17 +299,23 @@ export class SessionManager implements GroveHost {
     plan?: number,
     switchPct?: number,
     provider?: AccountProvider,
-    model?: string
+    model?: string,
+    baseUrl?: string
   ): Account {
     const id = randomUUID()
     const now = Date.now()
     const clean = label.trim() || 'Akun'
     const pct = switchPct == null ? undefined : clampPct(switchPct)
-    const prov: AccountProvider = provider === 'openrouter' ? 'openrouter' : 'claude'
-    const orModel = prov === 'openrouter' ? model?.trim() || undefined : undefined
-    this.db.addAccount(id, clean, token.trim(), now, plan, pct, prov, orModel)
+    const prov: AccountProvider =
+      provider === 'openrouter' ? 'openrouter' : provider === 'custom' ? 'custom' : 'claude'
+    // openrouter & custom sama-sama "Anthropic Skin" → keduanya memaksa model akun sendiri.
+    const skin = prov === 'openrouter' || prov === 'custom'
+    const orModel = skin ? model?.trim() || undefined : undefined
+    // base URL hanya untuk 'custom' (proxy sendiri). openrouter pakai konstanta tetap.
+    const url = prov === 'custom' ? baseUrl?.trim() || undefined : undefined
+    this.db.addAccount(id, clean, token.trim(), now, plan, pct, prov, orModel, url)
     this.emitAccounts()
-    return { id, label: clean, plan, switchPct: pct, provider: prov, model: orModel, createdAt: now }
+    return { id, label: clean, plan, switchPct: pct, provider: prov, model: orModel, baseUrl: url, createdAt: now }
   }
 
   deleteAccount(id: string): void {
@@ -408,9 +420,10 @@ export class SessionManager implements GroveHost {
     const token = this.db.getAccountToken(acc.id)
     if (!token) return null
     const env: Record<string, string> = { ...process.env } as Record<string, string>
-    if (acc.provider === 'openrouter') {
-      // OpenRouter "Anthropic Skin": Claude Code kirim format Anthropic, OR yang menerjemahkan.
-      env.ANTHROPIC_BASE_URL = OPENROUTER_BASE_URL
+    if (acc.provider === 'openrouter' || acc.provider === 'custom') {
+      // "Anthropic Skin": Claude Code kirim format Anthropic, endpoint yang menerjemahkan.
+      // openrouter → base URL tetap; custom → base URL milik akun (proxy sendiri, mis. Gemini).
+      env.ANTHROPIC_BASE_URL = acc.provider === 'custom' ? acc.baseUrl || OPENROUTER_BASE_URL : OPENROUTER_BASE_URL
       env.ANTHROPIC_AUTH_TOKEN = token
       delete env.ANTHROPIC_API_KEY // AUTH_TOKEN yang jadi bearer; API_KEY bisa bentrok
       delete env.CLAUDE_CODE_OAUTH_TOKEN // jangan sampai malah dipakai token Claude
@@ -435,6 +448,9 @@ export class SessionManager implements GroveHost {
     // jadi model akun (id OpenRouter) menang mutlak. Kecuali sesi/rootnya sengaja diisi id ber-"/"
     // (juga id OpenRouter) → hormati sebagai override sadar.
     const acc = this.effectiveAccount(sessionId)
+    // Akun 'custom' (proxy): nama model ditentukan proxy, tak ada daftar/alias di Grove → pakai
+    // model akun apa adanya untuk seluruh pohon (buat varian model = buat akun lain ke proxy sama).
+    if (acc?.provider === 'custom') return acc.model || undefined
     if (acc?.provider === 'openrouter') {
       const s = this.sessions.get(sessionId)
       const own = s?.meta.model
@@ -526,6 +542,103 @@ export class SessionManager implements GroveHost {
         hasAccounts: this.db.getAccounts().length > 0
       }
     })
+  }
+
+  /**
+   * GroveHost.recordUsage — catat pemakaian token satu respons API ke bucket jam+akun di DB.
+   * accountId = akun EFEKTIF sesi (resolveAccountId); '__none__' bila tak terpetakan (jaga-jaga).
+   */
+  recordUsage(sessionId: string, u: { input: number; cacheRead: number; cacheCreation: number; output: number }): void {
+    if (u.input <= 0 && u.cacheRead <= 0 && u.cacheCreation <= 0 && u.output <= 0) return
+    const accId = this.resolveAccountId(sessionId)
+    const provider = accId ? (this.db.getAccounts().find((a) => a.id === accId)?.provider ?? 'claude') : null
+    const hourStart = Math.floor(Date.now() / 3_600_000) * 3_600_000
+    this.db.addUsage(hourStart, accId ?? '__none__', provider, u.input, u.cacheRead, u.cacheCreation, u.output)
+  }
+
+  /**
+   * Riwayat pemakaian token PC ini: jendela jam/hari/minggu + breakdown harian + per akun, dihitung
+   * dari bucket jam (TZ LOKAL, pakai new Date main-process). todayVsAvg membantu vonis boros/normal.
+   */
+  getUsageStats(): UsageStats {
+    const now = Date.now()
+    const DAY = 86_400_000
+    const rows = this.db.getUsageRows(now - 15 * DAY) // cukup untuk minggu + tren 14 hari
+    const labels = new Map(this.db.getAccounts().map((a) => [a.id, a.label]))
+    const providers = new Map(this.db.getAccounts().map((a) => [a.id, a.provider ?? 'claude']))
+
+    const blank = (): { input: number; cacheRead: number; cacheCreation: number; output: number; calls: number } => ({
+      input: 0, cacheRead: 0, cacheCreation: 0, output: 0, calls: 0
+    })
+    const add = (acc: ReturnType<typeof blank>, r: (typeof rows)[number]): void => {
+      acc.input += r.input; acc.cacheRead += r.cacheRead; acc.cacheCreation += r.cacheCreation
+      acc.output += r.output; acc.calls += r.calls
+    }
+    const seal = (a: ReturnType<typeof blank>): UsageTokens => ({
+      ...a, total: a.input + a.cacheRead + a.cacheCreation + a.output
+    })
+
+    const hourStartOfNow = Math.floor(now / 3_600_000) * 3_600_000
+    const hour = blank(), day = blank(), week = blank()
+    // Hari LOKAL: kunci = tanggal lokal (YYYY-MM-DD via offset), agar batas hari sesuai zona user.
+    const localDayStart = (ts: number): number => {
+      const d = new Date(ts)
+      d.setHours(0, 0, 0, 0)
+      return d.getTime()
+    }
+    const byDay = new Map<number, ReturnType<typeof blank>>()
+    const byAcct = new Map<string, ReturnType<typeof blank>>()
+
+    for (const r of rows) {
+      if (r.hourStart >= hourStartOfNow) add(hour, r)
+      if (r.hourStart >= now - DAY) add(day, r)
+      if (r.hourStart >= now - 7 * DAY) {
+        add(week, r)
+        const a = byAcct.get(r.accountId) ?? blank()
+        add(a, r); byAcct.set(r.accountId, a)
+      }
+      const dk = localDayStart(r.hourStart)
+      const dd = byDay.get(dk) ?? blank()
+      add(dd, r); byDay.set(dk, dd)
+    }
+
+    const fmtDay = (ts: number): string => {
+      const d = new Date(ts)
+      const days = ['Min', 'Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab']
+      return `${days[d.getDay()]} ${d.getDate()}/${d.getMonth() + 1}`
+    }
+    const daily: UsageDay[] = [...byDay.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([dayStart, t]) => ({ label: fmtDay(dayStart), dayStart, tokens: seal(t) }))
+
+    const byAccount: UsageByAccount[] = [...byAcct.entries()]
+      .map(([id, t]) => ({
+        accountId: id,
+        label: labels.get(id) ?? (id === '__none__' ? 'Tanpa akun' : 'Akun terhapus'),
+        provider: (providers.get(id) ?? 'claude') as AccountProvider,
+        week: seal(t)
+      }))
+      .sort((a, b) => b.week.total - a.week.total)
+
+    // Boros/normal: total HARI INI (lokal) dibanding rata-rata harian 7 hari SEBELUM hari ini.
+    const todayStart = localDayStart(now)
+    const todayTotal = seal(byDay.get(todayStart) ?? blank()).total
+    let priorSum = 0, priorDays = 0
+    for (const [dk, t] of byDay) {
+      if (dk < todayStart && dk >= todayStart - 7 * DAY) { priorSum += seal(t).total; priorDays++ }
+    }
+    const avg = priorDays ? priorSum / priorDays : 0
+    const todayVsAvg = avg > 0 ? todayTotal / avg : null
+
+    return {
+      hour: seal(hour),
+      day: seal(day),
+      week: seal(week),
+      allTime: seal({ ...this.db.getUsageAllTime() }),
+      daily,
+      byAccount,
+      todayVsAvg
+    }
   }
 
   /**
@@ -673,13 +786,16 @@ export class SessionManager implements GroveHost {
     const s = this.sessions.get(sessionId)
     if (!s) return
 
-    // Sesi ber-akun OPENROUTER: "limit" yang terdeteksi hampir selalu upstream provider penuh
-    // ("ResourceExhausted / Worker request limit reached") — itu TRANSIENT & tak ada hubungannya
-    // dgn kuota akun Claude. JANGAN rotasi ke akun Claude (billing nyasar + tak menolong). Beri
-    // pesan jujur: coba lagi / pilih model OpenRouter lain.
-    if (this.effectiveAccount(sessionId)?.provider === 'openrouter') {
+    // Sesi ber-akun OPENROUTER / CUSTOM (proxy): "limit" yang terdeteksi hampir selalu upstream
+    // provider penuh / rate-limit ("ResourceExhausted", Gemini 429 RESOURCE_EXHAUSTED) — TRANSIENT &
+    // tak ada hubungannya dgn kuota akun Claude. JANGAN rotasi ke akun Claude (billing nyasar + tak
+    // menolong). Beri pesan jujur: tunggu/coba lagi.
+    const prov = this.effectiveAccount(sessionId)?.provider
+    if (prov === 'openrouter' || prov === 'custom') {
       s.systemNote(
-        '⚠️ Model OpenRouter gratis sedang penuh di sisi provider (mis. NVIDIA "ResourceExhausted") — ini sementara, BUKAN kuota akunmu. Kirim lagi untuk coba ulang, atau klik-kanan kartu sesi → pilih model OpenRouter lain (mis. Ultra vs Super).'
+        prov === 'custom'
+          ? '⚠️ Endpoint proxy-mu membalas limit/penuh (mis. Gemini free-tier 429 RESOURCE_EXHAUSTED — batas per-menit/per-hari). Ini rate-limit provider, BUKAN kuota Claude. Tunggu sebentar lalu kirim lagi; kalau sering, kurangi jumlah worker atau pakai model yang limitnya lebih longgar.'
+          : '⚠️ Model OpenRouter gratis sedang penuh di sisi provider (mis. NVIDIA "ResourceExhausted") — ini sementara, BUKAN kuota akunmu. Kirim lagi untuk coba ulang, atau klik-kanan kartu sesi → pilih model OpenRouter lain (mis. Ultra vs Super).'
       )
       s.markLimited()
       return
@@ -768,6 +884,7 @@ export class SessionManager implements GroveHost {
     title: string
     cwd: string
     model?: string
+    lite?: boolean
   }): SessionMeta {
     const now = Date.now()
     return {
@@ -778,6 +895,7 @@ export class SessionManager implements GroveHost {
       title: p.title,
       cwd: p.cwd,
       model: p.model,
+      lite: p.lite || undefined,
       status: 'idle',
       ctxInput: 0,
       ctxOutput: 0,
@@ -795,8 +913,25 @@ export class SessionManager implements GroveHost {
     // Auto-title dari pesan pertama bila judul masih default "Chat baru".
     if (s.meta.title === 'Chat baru' && text.trim()) this.setTitle(id, deriveTitle(text))
     s.sendUserMessage(text, images)
-    // Tugas baru ke root → (re)nyalakan thread auto-check "udah sampe mana?".
-    if (s.meta.role === 'root') this.enableLoop(id)
+    // Tugas baru ke root → (re)nyalakan thread auto-check "udah sampe mana?". Root LITE tak punya
+    // worker (tool spawn tak dimuat) → loop mustahil berguna, jangan pasang timernya sama sekali.
+    if (s.meta.role === 'root' && !s.meta.lite) this.enableLoop(id)
+  }
+
+  /** Ubah mode ringan (lite) sebuah root. Berlaku di giliran berikutnya: bila query sedang jalan,
+   *  di-restart (resume) agar opsi baru (server/append) terpasang; bila dorman, start() berikutnya
+   *  sudah membaca meta.lite yang baru. */
+  setLite(id: string, lite: boolean): void {
+    const s = this.sessions.get(id)
+    if (!s) throw new Error(`Session ${id} tidak ditemukan`)
+    const next = lite || undefined
+    if (s.meta.lite === next) return
+    s.meta.lite = next
+    s.meta.updatedAt = Date.now()
+    this.db.upsertSession(s.meta)
+    if (lite) this.stopLoop(id) // ke lite → matikan auto-check bila sempat menyala
+    this.emit({ channel: 'session:update', payload: { id, lite: !!next } })
+    s.restartQuery() // no-op bila dorman; kalau jalan → resume dgn opsi baru pada pesan berikutnya
   }
 
   async stopSession(id: string): Promise<void> {
@@ -1109,7 +1244,15 @@ export class SessionManager implements GroveHost {
   notifyTurnEnd(sessionId: string, outcome?: { finalText: string }): void {
     const s = this.sessions.get(sessionId)
     if (!s || s.meta.role !== 'sub') return // hanya sub-worker; root menyelesaikan turn ≠ pemicu
-    if (outcome) this.autoReportFinal(s, outcome.finalText)
+    if (outcome) {
+      this.autoReportFinal(s, outcome.finalText)
+      // ANTI DOBEL-GILIRAN ROOT: autoReportFinal→queueParentReport SUDAH membangunkan parent. Kalau
+      // parent = root (worker anak-LANGSUNG), scheduleRootStatus di bawah jadi giliran root KEDUA yang
+      // isinya tumpang-tindih dgn laporan gabungan → dua giliran ~74K utk SATU penutupan worker (biang
+      // "banyak langkah kerja"). Lewati utk anak-langsung root; worker lebih dalam tetap pakai ping
+      // board supaya root dapat ringkasan cepat tanpa menunggu kaskade laporan naik level-per-level.
+      if (s.meta.parentId === s.meta.treeId) return
+    }
     this.scheduleRootStatus(s.meta.treeId)
   }
 

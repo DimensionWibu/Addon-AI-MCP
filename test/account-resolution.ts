@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { Board } from '../src/main/orchestrator/db'
 import { SessionManager } from '../src/main/orchestrator/SessionManager'
+import { isTransientError, looksLikeAwaitingInput } from '../src/main/orchestrator/Session'
 import type { GroveEvent } from '../src/shared/types'
 
 let failed = 0
@@ -166,6 +167,98 @@ async function main(): Promise<void> {
     await m4.stopAll()
     b4.flush()
     try { rmSync(oDir, { recursive: true, force: true }) } catch { /* windows lock */ }
+  }
+
+  // --- 12. Klasifikasi error transient (auto-retry) vs fatal/limit (jangan retry) ---
+  check('ECONNRESET → transient', isTransientError('API Error: Connection to the API was lost (ECONNRESET). try again.'), true)
+  check('socket hang up → transient', isTransientError('request failed: socket hang up'), true)
+  check('503 → transient', isTransientError('upstream 503 Service Unavailable'), true)
+  check('overloaded → transient', isTransientError('Error: overloaded_error, please retry'), true)
+  check('provider_unavailable → transient', isTransientError('{"error_type":"provider_unavailable"}'), true)
+  check('401 auth → BUKAN transient (fatal)', isTransientError('401 unauthorized: invalid api key'), false)
+  check('404 model → BUKAN transient (fatal)', isTransientError('404 model not found: no access'), false)
+  check('rate limit → BUKAN transient (itu urusan limit)', isTransientError('429 rate_limit exceeded, quota'), false)
+  check('teks biasa → BUKAN transient', isTransientError('halo, ini jawaban biasa tanpa error'), false)
+
+  // --- 13. Riwayat pemakaian: bucket jam → agregasi jam/hari/minggu ---
+  {
+    const uDir = mkdtempSync(join(tmpdir(), 'grove-usage-'))
+    const b5 = new Board(join(uDir, 't.sqlite'))
+    await b5.init()
+    const m5 = new SessionManager(b5, () => {})
+    const acc = m5.addAccount('AkunU', 'tok-U')
+    const HOUR = 3_600_000, DAY = 86_400_000
+    const now = Date.now()
+    const hb = Math.floor(now / HOUR) * HOUR
+    b5.addUsage(hb, acc.id, 'claude', 50, 0, 0, 100) // jam ini
+    b5.addUsage(hb - 3 * HOUR, acc.id, 'claude', 0, 0, 0, 200) // 3 jam lalu (≤24 jam)
+    b5.addUsage(hb - 2 * DAY, acc.id, 'claude', 0, 0, 0, 300) // 2 hari lalu (≤7 hari)
+    b5.addUsage(hb - 10 * DAY, acc.id, 'claude', 0, 0, 0, 999) // 10 hari lalu (di luar minggu)
+    const st = m5.getUsageStats()
+    check('jam ini: output 100', st.hour.output, 100)
+    check('jam ini: total 150 (input50+out100)', st.hour.total, 150)
+    check('24 jam: output 300 (100+200)', st.day.output, 300)
+    check('7 hari: output 600 (100+200+300)', st.week.output, 600)
+    check('sejak awal: output 1599 (semua)', st.allTime.output, 1599)
+    check('per-akun ada 1 akun di minggu', st.byAccount.length, 1)
+    check('per-akun label benar', st.byAccount[0]?.label, 'AkunU')
+    await m5.stopAll()
+    b5.flush()
+    try { rmSync(uDir, { recursive: true, force: true }) } catch { /* windows lock */ }
+  }
+
+  // --- 14. "butuh jawaban" (kedip kuning): jangan salah-picu saat asisten MELAPOR nanti ---
+  check(
+    'asisten lapor nanti ("kabari begitu … lapor") → BUKAN menunggu',
+    looksLikeAwaitingInput('Delegasi beres. Nanti saya kabari begitu worker lapor temuan/perbaikannya.'),
+    false
+  )
+  check('"saya kabari setelah selesai" → BUKAN menunggu', looksLikeAwaitingInput('Oke, saya kabari setelah selesai.'), false)
+  check('ringkasan selesai biasa → BUKAN menunggu', looksLikeAwaitingInput('Selesai. Semua tes lulus.'), false)
+  check('pertanyaan penutup "Lanjut?" → menunggu', looksLikeAwaitingInput('Sudah saya cek. Lanjut?'), true)
+  check('"kabari saya kalau ada masalah" → menunggu', looksLikeAwaitingInput('Silakan coba. Kabari saya kalau ada masalah.'), true)
+
+  // --- 15. Provider CUSTOM (proxy base-URL sendiri, mis. Gemini via LiteLLM): env pakai baseUrl akun ---
+  {
+    const xDir = mkdtempSync(join(tmpdir(), 'grove-custom-'))
+    const b6 = new Board(join(xDir, 't.sqlite'))
+    await b6.init()
+    const m6 = new SessionManager(b6, () => {})
+    const CU = m6.addAccount('Gemini', 'proxy-key', undefined, undefined, 'custom', 'gemini-2.5-flash', 'http://localhost:4000')
+    check('provider tersimpan = custom', CU.provider, 'custom')
+    check('baseUrl tersimpan di objek akun', CU.baseUrl, 'http://localhost:4000')
+    m6.setDefaultAccount(CU.id)
+    const r6 = await m6.createRoot(xDir, 'R')
+    const l6 = m6.getSessionLaunch(r6.id) // baca via DB → sekaligus uji round-trip kolom base_url
+    check('custom: ANTHROPIC_BASE_URL = baseUrl akun (BUKAN OpenRouter)', l6?.env.ANTHROPIC_BASE_URL, 'http://localhost:4000')
+    check('custom: ANTHROPIC_AUTH_TOKEN = token', l6?.env.ANTHROPIC_AUTH_TOKEN, 'proxy-key')
+    check('custom: CLAUDE_CODE_OAUTH_TOKEN dibuang', l6?.env.CLAUDE_CODE_OAUTH_TOKEN, undefined)
+    check('custom: model = model akun', l6?.model, 'gemini-2.5-flash')
+    m6.setSessionModel(r6.id, 'opus') // alias claude TAK boleh menang atas model akun custom
+    check('custom: alias claude diabaikan (model akun terkunci)', m6.resolveModel(r6.id), 'gemini-2.5-flash')
+    await m6.stopAll()
+    b6.flush()
+    try { rmSync(xDir, { recursive: true, force: true }) } catch { /* windows lock */ }
+  }
+
+  // --- 16. Mode LITE (fix boros): default per entry-point + toggle + persist DB ---
+  {
+    const lDir = mkdtempSync(join(tmpdir(), 'grove-lite-'))
+    const b7 = new Board(join(lDir, 't.sqlite'))
+    await b7.init()
+    const m7 = new SessionManager(b7, () => {})
+    const full = await m7.createRoot(lDir, 'Proyek') // drag-folder = orkestrator (default)
+    const chat = await m7.createRoot(lDir, 'Chat', true) // "+Chat" = lite
+    check('createRoot default → BUKAN lite (orkestrator)', full.lite ?? false, false)
+    check('createRoot(…, lite=true) → lite', chat.lite, true)
+    m7.setLite(chat.id, false) // toggle ke orkestrator
+    check('setLite(false) → mode orkestrator', m7.getSnapshot().trees.find((t) => t.id === chat.id)?.lite ?? false, false)
+    m7.setLite(chat.id, true) // balik ke lite
+    check('setLite(true) → kembali lite', m7.getSnapshot().trees.find((t) => t.id === chat.id)?.lite, true)
+    b7.flush()
+    check('lite persist di DB (round-trip kolom lite)', b7.getAllSessions().find((s) => s.id === chat.id)?.lite, true)
+    await m7.stopAll()
+    try { rmSync(lDir, { recursive: true, force: true }) } catch { /* windows lock */ }
   }
 
   board.flush()

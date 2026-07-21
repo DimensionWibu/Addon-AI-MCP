@@ -82,6 +82,20 @@ CREATE TABLE IF NOT EXISTS session_pins (
   session_id TEXT PRIMARY KEY,
   account_id TEXT
 );
+-- Riwayat pemakaian token PER JAM per akun (persist, biar besok-besok bisa dicek boros/normal).
+-- Bucket per jam menjaga tabel tetap kecil (24 baris/hari/akun). Agregasi jam/hari/minggu dihitung
+-- di SessionManager (timezone lokal) dari baris-baris ini. Dicatat tiap respons API (lihat applyUsage).
+CREATE TABLE IF NOT EXISTS usage_hourly (
+  hour_start INTEGER NOT NULL,
+  account_id TEXT NOT NULL,
+  provider TEXT,
+  input INTEGER NOT NULL DEFAULT 0,
+  cache_read INTEGER NOT NULL DEFAULT 0,
+  cache_creation INTEGER NOT NULL DEFAULT 0,
+  output INTEGER NOT NULL DEFAULT 0,
+  calls INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (hour_start, account_id)
+);
 `
 
 // Debounce simpan-ke-disk. sql.js meng-EXPORT SELURUH image DB tiap simpan (O(ukuran DB),
@@ -125,7 +139,13 @@ export class Board {
       // OpenRouter (dipakai via ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN). or_model = id model
       // OpenRouter yang WAJIB dipakai akun itu (mis. nvidia/nemotron-3-super-120b-a12b:free).
       `ALTER TABLE accounts ADD COLUMN provider TEXT`,
-      `ALTER TABLE accounts ADD COLUMN or_model TEXT`
+      `ALTER TABLE accounts ADD COLUMN or_model TEXT`,
+      // Untuk provider 'custom': base URL endpoint Anthropic-compatible sendiri (proxy lokal), mis.
+      // http://localhost:4000 → dipakai sebagai ANTHROPIC_BASE_URL. NULL untuk claude/openrouter.
+      `ALTER TABLE accounts ADD COLUMN base_url TEXT`,
+      // Mode RINGAN sesi: 1 = tanpa MCP grove + tanpa append protokol (CLI-parity, hemat token).
+      // NULL/0 = orkestrator penuh. Sesi lama → NULL → orkestrator (perilaku lama tak berubah).
+      `ALTER TABLE sessions ADD COLUMN lite INTEGER`
     ]) {
       try {
         this.db.run(sql)
@@ -186,17 +206,17 @@ export class Board {
     this.run(
       `INSERT INTO sessions
         (id, sdk_session_id, tree_id, parent_id, role, title, cwd, model, status,
-         ctx_input, ctx_output, ctx_window, order_index, account_id, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ctx_input, ctx_output, ctx_window, order_index, account_id, lite, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(id) DO UPDATE SET
          sdk_session_id=excluded.sdk_session_id, title=excluded.title, model=excluded.model,
          status=excluded.status, ctx_input=excluded.ctx_input, ctx_output=excluded.ctx_output,
          ctx_window=excluded.ctx_window, order_index=excluded.order_index,
-         account_id=excluded.account_id, updated_at=excluded.updated_at`,
+         account_id=excluded.account_id, lite=excluded.lite, updated_at=excluded.updated_at`,
       [
         m.id, m.sdkSessionId ?? null, m.treeId, m.parentId, m.role, m.title, m.cwd,
         m.model ?? null, m.status, m.ctxInput, m.ctxOutput, m.ctxWindow,
-        m.orderIndex ?? null, m.accountId ?? null, m.createdAt, m.updatedAt
+        m.orderIndex ?? null, m.accountId ?? null, m.lite ? 1 : null, m.createdAt, m.updatedAt
       ]
     )
     this.run(
@@ -274,11 +294,12 @@ export class Board {
     plan?: number,
     switchPct?: number,
     provider?: string,
-    orModel?: string
+    orModel?: string,
+    baseUrl?: string
   ): void {
     this.run(
-      `INSERT INTO accounts (id, label, token, created_at, plan, switch_pct, provider, or_model) VALUES (?,?,?,?,?,?,?,?)`,
-      [id, label, token, ts, plan ?? null, switchPct ?? null, provider ?? null, orModel ?? null]
+      `INSERT INTO accounts (id, label, token, created_at, plan, switch_pct, provider, or_model, base_url) VALUES (?,?,?,?,?,?,?,?,?)`,
+      [id, label, token, ts, plan ?? null, switchPct ?? null, provider ?? null, orModel ?? null, baseUrl ?? null]
     )
   }
 
@@ -299,14 +320,20 @@ export class Board {
   /** Daftar akun TANPA token (aman dikirim ke renderer), termasuk ukuran paket. */
   getAccounts(): Account[] {
     return this.all(
-      `SELECT id, label, created_at, plan, switch_pct, provider, or_model FROM accounts ORDER BY created_at ASC`
+      `SELECT id, label, created_at, plan, switch_pct, provider, or_model, base_url FROM accounts ORDER BY created_at ASC`
     ).map((r) => ({
       id: String(r.id),
       label: String(r.label),
       plan: r.plan == null ? undefined : Number(r.plan),
       switchPct: r.switch_pct == null ? undefined : Number(r.switch_pct),
-      provider: r.provider === 'openrouter' ? ('openrouter' as const) : ('claude' as const),
+      provider:
+        r.provider === 'openrouter'
+          ? ('openrouter' as const)
+          : r.provider === 'custom'
+            ? ('custom' as const)
+            : ('claude' as const),
       model: r.or_model == null ? undefined : String(r.or_model),
+      baseUrl: r.base_url == null ? undefined : String(r.base_url),
       createdAt: Number(r.created_at)
     }))
   }
@@ -324,6 +351,75 @@ export class Board {
     this.run(`INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, [
       key, value
     ])
+  }
+
+  // ---- riwayat pemakaian token (per jam per akun) --------------------------
+
+  /** Tambahkan pemakaian satu respons API ke bucket jam+akunnya (dijumlahkan). */
+  addUsage(
+    hourStart: number,
+    accountId: string,
+    provider: string | null,
+    input: number,
+    cacheRead: number,
+    cacheCreation: number,
+    output: number
+  ): void {
+    this.run(
+      `INSERT INTO usage_hourly (hour_start, account_id, provider, input, cache_read, cache_creation, output, calls)
+       VALUES (?,?,?,?,?,?,?,1)
+       ON CONFLICT(hour_start, account_id) DO UPDATE SET
+         input = input + excluded.input,
+         cache_read = cache_read + excluded.cache_read,
+         cache_creation = cache_creation + excluded.cache_creation,
+         output = output + excluded.output,
+         calls = calls + 1,
+         provider = excluded.provider`,
+      [hourStart, accountId, provider, input, cacheRead, cacheCreation, output]
+    )
+  }
+
+  /** Baris bucket jam sejak `sinceTs` (agregasi jam/hari/minggu dihitung di SessionManager, TZ lokal). */
+  getUsageRows(sinceTs: number): Array<{
+    hourStart: number
+    accountId: string
+    provider: string | null
+    input: number
+    cacheRead: number
+    cacheCreation: number
+    output: number
+    calls: number
+  }> {
+    return this.all(
+      `SELECT hour_start, account_id, provider, input, cache_read, cache_creation, output, calls
+       FROM usage_hourly WHERE hour_start >= ? ORDER BY hour_start ASC`,
+      [sinceTs]
+    ).map((r) => ({
+      hourStart: Number(r.hour_start),
+      accountId: String(r.account_id),
+      provider: r.provider == null ? null : String(r.provider),
+      input: Number(r.input),
+      cacheRead: Number(r.cache_read),
+      cacheCreation: Number(r.cache_creation),
+      output: Number(r.output),
+      calls: Number(r.calls)
+    }))
+  }
+
+  /** Total kumulatif SEPANJANG waktu (untuk baris "sejak dipakai"). */
+  getUsageAllTime(): { input: number; cacheRead: number; cacheCreation: number; output: number; calls: number } {
+    const r = this.all(
+      `SELECT COALESCE(SUM(input),0) i, COALESCE(SUM(cache_read),0) cr,
+              COALESCE(SUM(cache_creation),0) cc, COALESCE(SUM(output),0) o, COALESCE(SUM(calls),0) n
+       FROM usage_hourly`
+    )[0]
+    return {
+      input: Number(r?.i ?? 0),
+      cacheRead: Number(r?.cr ?? 0),
+      cacheCreation: Number(r?.cc ?? 0),
+      output: Number(r?.o ?? 0),
+      calls: Number(r?.n ?? 0)
+    }
   }
 
   setTitle(id: string, title: string, ts: number): void {
@@ -465,6 +561,7 @@ function rowToSession(r: Record<string, unknown>): SessionMeta {
     ctxWindow: Number(r.ctx_window) || 200000,
     orderIndex: r.order_index == null ? undefined : Number(r.order_index),
     accountId: r.account_id == null ? undefined : String(r.account_id),
+    lite: r.lite ? true : undefined,
     createdAt: Number(r.created_at),
     updatedAt: Number(r.updated_at)
   }

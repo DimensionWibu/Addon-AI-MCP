@@ -16,7 +16,7 @@
       <div class="brand-sub">multi-agent Claude orchestrator</div>
       <div id="usage" class="usage" title="Klik untuk detail limit"></div>
       <button id="usage-refresh" class="usage-refresh" title="Refresh pemakaian sekarang (auto tiap 5 menit)">↻</button>
-      <div id="usage-panel" class="usage-panel"></div>
+      <div id="usage-panel" class="usage-panel"><div id="usage-limits"></div><div id="usage-history"></div></div>
       <div class="legend">
         <span class="dot s-running"></span>running
         <span class="dot s-idle"></span>idle
@@ -45,12 +45,15 @@
         <div id="tree" class="tree"></div>
       </aside>
 
+      <div class="col-resizer" id="resize-left" title="Geser untuk atur lebar sidebar (dobel-klik: reset)"></div>
+
       <section class="panel chat" id="chat">
         <div class="panel-head" id="chat-head">
           <span id="chat-title">Belum ada session</span>
           <span id="chat-badge" class="badge"></span>
           <span id="chat-telem" class="telem"></span>
           <select id="chat-model" class="model-sel" title="Model sesi ini (kosong = ikut sesi utama / global)"></select>
+          <button id="btn-lite" class="lite-btn" title="Mode: Chat ringan (hemat token, tanpa orkestrasi) vs Orkestrator (bisa spawn worker). Klik untuk ganti — berlaku di pesan berikutnya.">⚡ Chat</button>
           <button id="btn-loop" class="loop-btn" title="Auto-check berkala 10 menit: kirim &quot;udah sampe mana?&quot; ke UTAMA biar worker terus jalan (klik untuk on/off)">🔁 Auto</button>
           <button id="btn-compact" class="compact-btn" title="Ringkas laporan sub/sub-sub → simpan ke Memori & padatkan konteks (hanya UTAMA)">🗜 Compact</button>
           <button id="btn-stop" class="stop-btn" title="Interupsi turn yang sedang berjalan">⏹ Stop</button>
@@ -68,6 +71,8 @@
           </form>
         </div>
       </section>
+
+      <div class="col-resizer" id="resize-right" title="Geser untuk atur lebar papan (dobel-klik: reset)"></div>
 
       <aside class="panel board">
         <div class="panel-head">PAPAN TULIS</div>

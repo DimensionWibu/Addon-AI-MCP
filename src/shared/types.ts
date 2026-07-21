@@ -31,6 +31,11 @@ export interface SessionMeta {
   // Grove berjalan murni dengan CLAUDE_CODE_OAUTH_TOKEN dari akun GUI; tidak ada lagi jalur diam-diam
   // ke ~/.claude/.credentials.json (login CLI), supaya billing tak pernah nyasar tanpa sepengetahuan user.
   accountId?: string
+  /** Mode RINGAN (CLI-parity): true = TANPA MCP server grove (0 tool orkestrasi) & TANPA append
+   *  protokol multi-agent → prefix prompt = preset claude_code polos, jauh lebih hemat token per
+   *  giliran. Dipakai untuk chat solo sepele. false/undefined = mode orkestrator penuh (bisa
+   *  spawn_worker dkk). Default: sesi "+Chat" folderless = lite; drop-folder = orkestrator. */
+  lite?: boolean
   createdAt: number
   updatedAt: number
 }
@@ -55,19 +60,25 @@ export interface InboxMessage {
 
 /** Provider akun. 'claude' = langganan Claude (CLAUDE_CODE_OAUTH_TOKEN). 'openrouter' = key
  *  OpenRouter, dipakai lewat "Anthropic Skin" (ANTHROPIC_BASE_URL=https://openrouter.ai/api +
- *  ANTHROPIC_AUTH_TOKEN). CATATAN: OpenRouter sendiri hanya MENJAMIN Claude Code untuk provider
- *  Anthropic 1P — model non-Claude (mis. Nemotron) bisa saja tak patuh protokol tool Claude Code. */
-export type AccountProvider = 'claude' | 'openrouter'
+ *  ANTHROPIC_AUTH_TOKEN). 'custom' = endpoint Anthropic-compatible SENDIRI (base URL diisi user) —
+ *  mis. proxy lokal yang menerjemahkan Anthropic→Gemini (LiteLLM / claude-code-router), jadi bisa
+ *  pakai key Gemini gratis langsung. CATATAN: sama seperti OpenRouter, model non-Claude bisa saja
+ *  tak 100% patuh protokol tool Claude Code — uji dulu di satu sesi. */
+export type AccountProvider = 'claude' | 'openrouter' | 'custom'
 
 /** Akun untuk dipakai per-session. Token/key TIDAK pernah dikirim ke renderer. */
 export interface Account {
   id: string
   label: string
-  /** undefined/'claude' = akun Claude; 'openrouter' = key OpenRouter. */
+  /** undefined/'claude' = akun Claude; 'openrouter' = key OpenRouter; 'custom' = proxy base-URL sendiri. */
   provider?: AccountProvider
-  /** Untuk 'openrouter': id model OpenRouter yang WAJIB dipakai akun ini (mis.
-   *  nvidia/nemotron-3-super-120b-a12b:free). Alias claude (opus/sonnet/haiku) tak berlaku di sini. */
+  /** Untuk 'openrouter'/'custom': id model yang WAJIB dipakai akun ini (mis.
+   *  nvidia/nemotron-3-super-120b-a12b:free, atau gemini-2.5-flash lewat proxy). Alias claude
+   *  (opus/sonnet/haiku) tak berlaku di sini. */
   model?: string
+  /** Untuk 'custom': base URL endpoint Anthropic-compatible (proxy), mis. http://localhost:4000.
+   *  Claude Code menambahkan /v1/messages sendiri. Token akun dipakai sebagai ANTHROPIC_AUTH_TOKEN. */
+  baseUrl?: string
   /** Ukuran paket (mis. 20 untuk Max 20x, 5 untuk Max 5x). Dipakai memilih akun terbesar
    *  sebagai cadangan saat SEMUA akun sudah menembus ambang kuota — agar kerja tak terkunci. */
   plan?: number
@@ -80,6 +91,46 @@ export interface Account {
    *  false → ambang tidak aktif; proteksi yang tersisa hanya switch REAKTIF saat kena limit. */
   usageReadable?: boolean
   createdAt: number
+}
+
+/** Ringkasan token untuk satu jendela waktu. total = input mentah + cache + output (semua yang mengalir). */
+export interface UsageTokens {
+  input: number // input "fresh" (non-cache) — paling mahal
+  cacheRead: number // dibaca dari cache (murah)
+  cacheCreation: number // penulisan cache
+  output: number // token keluaran — biasanya penanda "kerja" paling relevan
+  total: number // input + cacheRead + cacheCreation + output
+  calls: number // jumlah respons API tercatat
+}
+
+/** Satu hari pada breakdown riwayat (label lokal + ringkasan tokennya). */
+export interface UsageDay {
+  label: string // mis. "Sen 20/7"
+  dayStart: number // epoch ms awal hari LOKAL
+  tokens: UsageTokens
+}
+
+/** Pemakaian per akun untuk 7 hari terakhir. */
+export interface UsageByAccount {
+  accountId: string
+  label: string
+  provider: AccountProvider
+  week: UsageTokens
+}
+
+/**
+ * Riwayat pemakaian token yang TERCATAT DI PC INI (persist di DB Grove). Bukan angka dari server
+ * Anthropic (itu utilisasi rolling-window terpisah) — ini akumulasi token nyata tiap respons API,
+ * supaya bisa dilihat pola boros/normal lintas hari.
+ */
+export interface UsageStats {
+  hour: UsageTokens // jam berjalan
+  day: UsageTokens // 24 jam terakhir
+  week: UsageTokens // 7 hari terakhir
+  allTime: UsageTokens // sejak mulai tercatat
+  daily: UsageDay[] // breakdown per hari (untuk lihat tren)
+  byAccount: UsageByAccount[] // per akun, 7 hari terakhir
+  todayVsAvg: number | null // token hari ini ÷ rata-rata harian 7 hari (>1 = di atas rata-rata/boros)
 }
 
 /** Kondisi akun + preferensi rotasi, dikirim bareng agar UI tak pernah setengah-sinkron. */
@@ -98,6 +149,19 @@ export interface AccountsState {
 /** Base URL "Anthropic Skin" OpenRouter — Claude Code menambahkan /v1/messages sendiri. */
 export const OPENROUTER_BASE_URL = 'https://openrouter.ai/api'
 
+/** Base URL default untuk akun 'custom' (proxy lokal). Cuma prefill form — user boleh ganti.
+ *  LiteLLM proxy default :4000; claude-code-router default :3456. */
+export const CUSTOM_BASE_URL_DEFAULT = 'http://localhost:4000'
+
+/** Saran nama model untuk akun 'custom' (proxy Gemini). Cuma hint datalist — PROXY yang menentukan
+ *  nama model yang sah (mis. LiteLLM butuh prefix 'gemini/…' bila tak dipetakan di config). */
+export const CUSTOM_MODEL_SUGGESTIONS: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'gemini-2.5-flash', label: 'gemini-2.5-flash · cepat, hemat kuota' },
+  { id: 'gemini-2.5-pro', label: 'gemini-2.5-pro · kualitas tertinggi' },
+  { id: 'gemini-2.0-flash', label: 'gemini-2.0-flash' },
+  { id: 'gemini/gemini-2.5-flash', label: 'gemini/gemini-2.5-flash · format LiteLLM' }
+]
+
 /** Satu model OpenRouter (mendukung tools) untuk dropdown pilih model. */
 export interface OpenRouterModel {
   id: string // mis. nvidia/nemotron-3-super-120b-a12b:free
@@ -114,13 +178,20 @@ export const OPENROUTER_MODEL_SUGGESTIONS: ReadonlyArray<{ id: string; label: st
   { id: 'nvidia/nemotron-3-nano-30b-a3b:free', label: 'Nemotron 3 Nano 30B (free)' }
 ]
 
-/** Pilihan model yang ditawarkan di UI. value '' = mewarisi/default. Alias Claude Code (opus/sonnet/
- *  haiku) sengaja dipakai — ringkas, dikenal CLI, dan memudahkan turun ke model lebih murah demi kuota. */
+/** Sentinel: opsi "ketik model apa pun" di dropdown model (untuk model lama / versi spesifik). */
+export const CUSTOM_MODEL = '__custom__'
+
+/** Pilihan model Claude di UI. value '' = mewarisi/default. Alias (opus/sonnet/haiku) = selalu versi
+ *  TERBARU; id ber-versi (claude-opus-4-x) = PIN ke versi itu, termasuk yang lama. Backend menerima
+ *  string model APA PUN (query({model})), jadi selain daftar ini user bisa ketik id lain via CUSTOM_MODEL. */
 export const MODEL_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
   { value: '', label: 'Default' },
-  { value: 'opus', label: 'Opus' },
-  { value: 'sonnet', label: 'Sonnet' },
-  { value: 'haiku', label: 'Haiku' }
+  { value: 'opus', label: 'Opus (terbaru)' },
+  { value: 'sonnet', label: 'Sonnet (terbaru)' },
+  { value: 'haiku', label: 'Haiku (terbaru)' },
+  { value: 'claude-opus-4-8', label: 'Opus 4.8' },
+  { value: 'claude-opus-4-7', label: 'Opus 4.7' },
+  { value: 'claude-opus-4-6', label: 'Opus 4.6' }
 ]
 
 /** Label pendek untuk sebuah nilai model (untuk badge/pilihan). Nilai tak dikenal → apa adanya. */
@@ -276,7 +347,8 @@ export interface GroveApi {
     plan?: number,
     switchPct?: number,
     provider?: AccountProvider,
-    model?: string
+    model?: string,
+    baseUrl?: string
   ) => Promise<Account>
   deleteAccount: (id: string) => Promise<void>
   /** Ambang auto-switch akun ini; null → kembali ikut default global. */
@@ -289,8 +361,13 @@ export interface GroveApi {
   setDefaultModel: (model: string | null) => Promise<void>
   /** Model sebuah sesi (null = kembali mewarisi dari sesi utama / global). */
   setSessionModel: (id: string, model: string | null) => Promise<void>
+  /** Mode ringan (CLI-parity, tanpa protokol/tool orkestrasi) untuk sebuah root. Berlaku pada
+   *  giliran berikutnya (query di-restart bila sedang jalan). */
+  setLite: (id: string, lite: boolean) => Promise<void>
   /** Daftar model OpenRouter (mendukung tools) untuk dropdown; freeOnly default true. */
   listOpenRouterModels: (freeOnly?: boolean) => Promise<OpenRouterModel[]>
+  /** Riwayat pemakaian token tercatat di PC ini (jam/hari/minggu + tren) untuk cek boros/normal. */
+  getUsageStats: () => Promise<UsageStats>
   setSessionAccount: (id: string, accountId: string | null) => Promise<void>
   setAutoSwitch: (on: boolean) => Promise<void>
   setAutoResume: (on: boolean) => Promise<void>

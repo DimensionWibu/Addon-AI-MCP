@@ -13,7 +13,14 @@ import type {
   UsageUnavailable,
   UsageWindow
 } from '../shared/types'
-import { MODEL_OPTIONS, modelLabel, OPENROUTER_MODEL_SUGGESTIONS } from '../shared/types'
+import {
+  CUSTOM_BASE_URL_DEFAULT,
+  CUSTOM_MODEL,
+  CUSTOM_MODEL_SUGGESTIONS,
+  MODEL_OPTIONS,
+  modelLabel,
+  OPENROUTER_MODEL_SUGGESTIONS
+} from '../shared/types'
 
 let pendingImages: ImageAttachment[] = []
 let pendingRefs: string[] = [] // path file/folder referensi
@@ -124,7 +131,7 @@ function usageReasonText(r?: UsageUnavailable): string {
  */
 function renderUsage(snap: UsageSnapshot): void {
   const box = $('usage')
-  const panel = $('usage-panel')
+  const panel = $('usage-limits') // hanya bagian LIMIT; riwayat ada di #usage-history (persist)
   const u = snap.usage
   const label = escapeHtml(snap.accountLabel)
   // Email lebih informatif daripada label bebas; kalau tak bisa didapat untuk akun ini,
@@ -170,6 +177,127 @@ function renderUsage(snap: UsageSnapshot): void {
   if (u.monthly?.enabled) html += row('Bulanan (kredit)', { utilization: u.monthly.utilization, resetsAt: null })
   html += `<div class="up-updated">Update: ${new Date(u.fetchedAt).toLocaleTimeString()}${u.stale ? ' · data terakhir (refresh gagal)' : ''}</div>`
   panel.innerHTML = html
+}
+
+/** Angka token ringkas: 1234 → "1.2K", 3.4e6 → "3.4M". */
+function fmtTok(n: number): string {
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B'
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M'
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K'
+  return String(Math.round(n))
+}
+
+/**
+ * Riwayat pemakaian token TERCATAT DI PC INI (jam/hari/minggu + tren harian), dari DB lokal.
+ * Ini AKUMULASI token nyata tiap respons API — beda dari "BATAS PEMAKAIAN" di atas yang merupakan
+ * utilisasi rolling-window dari server. Tujuannya: lihat pola boros/normal lintas hari.
+ */
+async function renderUsageHistory(): Promise<void> {
+  const box = $('usage-history')
+  box.innerHTML = '<div class="up-title">PEMAKAIAN PC INI</div><div class="up-empty">memuat…</div>'
+  let s
+  try {
+    s = await window.grove.getUsageStats()
+  } catch {
+    box.innerHTML = '<div class="up-title">PEMAKAIAN PC INI</div><div class="up-empty">gagal memuat.</div>'
+    return
+  }
+  if (!s.allTime.total) {
+    box.innerHTML =
+      '<div class="up-title">PEMAKAIAN PC INI</div><div class="up-empty">Belum ada pemakaian tercatat. Angka akan terkumpul otomatis tiap sesi berjalan, dan tersimpan untuk dicek besok-besok.</div>'
+    return
+  }
+  // Cache = konteks dibaca-ulang tiap langkah tool (murah). "Setara-biaya" memberi bobot mendekati
+  // penagihan: input baru 1×, tulis-cache 1.25×, baca-cache 0.1× (murah), output 5× (paling mahal).
+  // Tanpa ini, cache-read (yang jumlahnya raksasa tapi murah) mendominasi & bikin angka terlihat seram.
+  const cacheOf = (t: typeof s.hour): number => t.cacheRead + t.cacheCreation
+  const eff = (t: typeof s.hour): number =>
+    Math.round(t.input + 1.25 * t.cacheCreation + 0.1 * t.cacheRead + 5 * t.output)
+
+  // Satu baris jendela: PECAH jujur — output (kerja nyata) · input baru · cache (baca-ulang, murah).
+  const win = (name: string, t: typeof s.hour): string => {
+    const tip = `output ${fmtTok(t.output)} · input baru ${fmtTok(t.input)} · baca-cache ${fmtTok(
+      t.cacheRead
+    )} · tulis-cache ${fmtTok(t.cacheCreation)} · ${t.calls} panggilan · setara-biaya ${fmtTok(eff(t))}`
+    return `<div class="uh-row" title="${escapeHtml(name + ' — ' + tip)}"><span class="uh-name">${name}</span><span class="uh-val"><b>${fmtTok(
+      t.output
+    )}</b> out<span class="uh-out"> · ${fmtTok(t.input)} in · ${fmtTok(cacheOf(t))} cache</span></span></div>`
+  }
+  // Susunan SENGAJA menonjolkan 2 hal yang dipakai user:
+  //   (1) seberapa dekat limit → ada di section BATAS PEMAKAIAN (di atas panel ini).
+  //   (2) tren pemakaian lintas hari → VONIS + TREN, ditaruh PALING ATAS di sini.
+  // Rincian token (jam/24h/7d/all) turun ke bawah sebagai pendukung — bukan headline yang bikin panik.
+  const effDaily = s.daily.map((d) => ({ label: d.label, dayStart: d.dayStart, e: eff(d.tokens), out: d.tokens.output }))
+  const todayStart = effDaily.length ? effDaily[effDaily.length - 1].dayStart : 0
+  const todayE = effDaily.find((d) => d.dayStart === todayStart)?.e ?? 0
+  const prior = effDaily.filter((d) => d.dayStart < todayStart)
+  const avgE = prior.length ? prior.reduce((s2, d) => s2 + d.e, 0) / prior.length : 0
+
+  let html = '<div class="up-title">TREN PEMAKAIAN PC INI</div>'
+
+  // (2a) VONIS boros/normal — headline. Butuh ≥1 hari pembanding; kalau belum ada, beri tahu jujur.
+  if (avgE > 0) {
+    const ratio = todayE / avgE
+    const pct = Math.round(ratio * 100)
+    const cls = ratio >= 1.3 ? 'u-err' : ratio >= 1.05 ? 'u-warn' : 'ok'
+    const verdict = ratio >= 1.3 ? 'BOROS' : ratio >= 1.05 ? 'agak tinggi' : 'normal/hemat'
+    html += `<div class="uh-verdict ${cls}" title="setara-biaya hari ini vs rata-rata harian 7 hari sebelumnya">Hari ini ${pct}% dari rata-rata → ${verdict}</div>`
+  } else {
+    html += `<div class="uh-verdict ok" title="belum ada hari pembanding">Hari ini ${fmtTok(todayE)} (setara-biaya) — belum ada hari lain untuk dibandingkan (boros/normal muncul besok).</div>`
+  }
+
+  // (2c) TRAFFIC — jumlah request (panggilan API) dari DB + konteks/call. Inilah metrik yang benar
+  // untuk "boros langkah": cache besar = konteks/call × JUMLAH call. Kalau req melonjak tapi output
+  // tetap kecil, itu tanda banyak langkah agentic (worker/tool-loop), bukan kerja tulis yang besar.
+  const trafficRow = (name: string, t: typeof s.hour): string => {
+    const perCall = t.calls ? Math.round(cacheOf(t) / t.calls) : 0
+    return `<div class="uh-row" title="${escapeHtml(
+      `${name}: ${t.calls} request · rata-rata konteks/request ${fmtTok(perCall)} · output ${fmtTok(t.output)}`
+    )}"><span class="uh-name">${name}</span><span class="uh-val"><b>${fmtTok(
+      t.calls
+    )}</b> req<span class="uh-out"> · ~${fmtTok(perCall)}/call</span></span></div>`
+  }
+  html += '<div class="uh-head">Traffic (request API)</div>'
+  html += trafficRow('Jam ini', s.hour)
+  html += trafficRow('24 jam', s.day)
+  html += trafficRow('7 hari', s.week)
+  html += trafficRow('Sejak awal', s.allTime)
+
+  // (2b) TREN harian (setara-biaya, dinormalisasi ke hari tertinggi). Tooltip juga sebut req/hari.
+  if (effDaily.length) {
+    const callsByDay = new Map(s.daily.map((d) => [d.dayStart, d.tokens.calls]))
+    const max = Math.max(...effDaily.map((d) => d.e), 1)
+    html += '<div class="uh-head">Per hari (setara-biaya)</div>'
+    for (const d of effDaily.slice(-14)) {
+      const w = Math.round((d.e / max) * 100)
+      html += `<div class="uh-day" title="${escapeHtml(
+        `${d.label}: setara-biaya ${fmtTok(d.e)} · output ${fmtTok(d.out)} · ${callsByDay.get(d.dayStart) ?? 0} request`
+      )}"><span class="uh-daylbl">${d.label}</span><span class="uh-daybar"><span class="uh-dayfill" style="width:${w}%"></span></span><span class="uh-dayval">${fmtTok(
+        d.e
+      )}</span></div>`
+    }
+  }
+
+  // Per akun (7 hari) — setara-biaya (bukan cache mentah).
+  if (s.byAccount.length > 1) {
+    html += '<div class="uh-head">Per akun (7 hari · setara-biaya)</div>'
+    for (const a of s.byAccount) {
+      const tag = a.provider === 'custom' ? ' ⟨GM⟩' : a.provider === 'openrouter' ? ' ⟨OR⟩' : ''
+      html += `<div class="uh-row" title="${escapeHtml(
+        `output ${fmtTok(a.week.output)} · cache ${fmtTok(cacheOf(a.week))}`
+      )}"><span class="uh-name">${escapeHtml(a.label)}${tag}</span><span class="uh-val">${fmtTok(eff(a.week))}</span></div>`
+    }
+  }
+
+  // RINCIAN token per window — pendukung, di bawah. Diberi keterangan supaya "cache besar" tak bikin panik.
+  html += '<div class="uh-head">Rincian token (jam/hari/minggu)</div>'
+  html += win('Jam ini', s.hour)
+  html += win('24 jam', s.day)
+  html += win('7 hari', s.week)
+  html += win('Sejak awal', s.allTime)
+  html +=
+    '<div class="up-empty" style="margin-top:6px"><b>cache</b> = konteks dibaca-ulang tiap langkah tool (murah, ~10× lebih ringan dari input baru) — wajar besar untuk multi-agent. Yang menandakan kerja = <b>output</b>. Sisa kuota → lihat BATAS PEMAKAIAN di atas.</div>'
+  box.innerHTML = html
 }
 
 // Beri tahu main sesi mana yang dipilih → usage di header ikut akun sesi itu.
@@ -899,8 +1027,8 @@ function updateChatBadge(): void {
   badge.className = ctxBadgeClass(node)
 }
 
-/** Isi <select> model dengan MODEL_OPTIONS sekali; return elemennya. */
-function fillModelOptions(sel: HTMLSelectElement, inheritLabel?: string): void {
+/** Isi <select> model Claude. `current` = nilai terpasang (bila id custom/lama → ditampilkan sbg opsi). */
+function fillModelOptions(sel: HTMLSelectElement, inheritLabel?: string, current?: string): void {
   sel.textContent = ''
   for (const m of MODEL_OPTIONS) {
     const o = document.createElement('option')
@@ -909,17 +1037,42 @@ function fillModelOptions(sel: HTMLSelectElement, inheritLabel?: string): void {
     o.textContent = m.value === '' && inheritLabel ? inheritLabel : m.label
     sel.append(o)
   }
+  // Model terpasang yang TAK ada di daftar (mis. id lama yang diketik) → tampilkan agar terpilih benar.
+  if (current && !MODEL_OPTIONS.some((m) => m.value === current)) {
+    const o = document.createElement('option')
+    o.value = current
+    o.textContent = current
+    sel.append(o)
+  }
+  // Escape hatch: ketik id model apa pun (versi lama, dsb) — backend menerima string apa pun.
+  const cust = document.createElement('option')
+  cust.value = CUSTOM_MODEL
+  cust.textContent = '✎ Model lain…'
+  sel.append(cust)
+}
+
+/** Minta id model dari user (untuk pilihan "✎ Model lain…"). null = batal; '' = kembali ke default. */
+function promptCustomModel(current?: string | null): string | null {
+  const seed = current && !MODEL_OPTIONS.some((m) => m.value === current) ? current : ''
+  const v = prompt('ID model Claude (mis. claude-opus-4-6, claude-opus-4-7, atau alias opus/sonnet/haiku):', seed)
+  return v == null ? null : v.trim()
 }
 
 /** Dropdown model GLOBAL di topbar → set nilai dari state. */
 function syncGlobalModel(): void {
   const sel = $<HTMLSelectElement>('global-model')
-  if (!sel.options.length) {
-    fillModelOptions(sel)
-    sel.addEventListener('change', () => {
-      void window.grove.setDefaultModel(sel.value || null).catch((e) => alert(`Gagal set model global: ${String(e)}`))
-    })
+  const onchange = (): void => {
+    if (sel.value === CUSTOM_MODEL) {
+      const m = promptCustomModel(defaultModel)
+      sel.value = defaultModel ?? '' // pulihkan tampilan; re-render mengikuti hasil set
+      if (m == null) return // batal
+      void window.grove.setDefaultModel(m || null).catch((e) => alert(`Gagal set model global: ${String(e)}`))
+      return
+    }
+    void window.grove.setDefaultModel(sel.value || null).catch((e) => alert(`Gagal set model global: ${String(e)}`))
   }
+  sel.onchange = onchange
+  fillModelOptions(sel, undefined, defaultModel ?? undefined)
   sel.value = defaultModel ?? ''
 }
 
@@ -940,7 +1093,18 @@ function orShort(id?: string): string {
 /** Isi <select> model sesuai PROVIDER akun efektif: OpenRouter → daftar model OR; Claude → alias. */
 function fillSessionModelSelect(sel: HTMLSelectElement, node: Node): void {
   sel.textContent = ''
+  sel.disabled = false
   const eff = effectiveAccountOf(node)
+  if (eff?.provider === 'custom') {
+    // Akun custom (proxy): nama model ditentukan proxy → tampil sebagai info terkunci, bukan pilihan.
+    const o = document.createElement('option')
+    o.value = ''
+    o.textContent = `model: ${eff.model ?? '?'}`
+    sel.append(o)
+    sel.value = ''
+    sel.disabled = true
+    return
+  }
   if (eff?.provider === 'openrouter') {
     // Akun OpenRouter: model BEBAS dipilih dari daftar OR. Opsi kosong = pakai model default akun.
     const inherit = document.createElement('option')
@@ -958,7 +1122,7 @@ function fillSessionModelSelect(sel: HTMLSelectElement, node: Node): void {
     // node.model dipakai hanya bila ia id OpenRouter (ber-"/"); kalau tidak → pakai default akun.
     sel.value = node.model && node.model.includes('/') ? node.model : ''
   } else {
-    fillModelOptions(sel, inheritedModelFor(node))
+    fillModelOptions(sel, inheritedModelFor(node), node.model ?? undefined)
     sel.value = node.model ?? ''
   }
 }
@@ -971,14 +1135,20 @@ function updateChatHeader(): void {
   const stopBtn = $('btn-stop')
   const compactBtn = $('btn-compact')
   const loopBtn = $('btn-loop')
+  const liteBtn = $<HTMLButtonElement>('btn-lite')
   const modelSel = $<HTMLSelectElement>('chat-model')
   if (node) {
     const act = activities.get(activeId!) || node.status
     const elapsed = fmtDuration(lastElapsed.get(activeId!) ?? 0)
     telem.textContent = `⏱ ${elapsed} · ↓ ${fmtTokens(node.tokensTotal ?? 0)} tokens · ${act}`
     stopBtn.style.display = node.status === 'running' ? 'inline-block' : 'none'
-    compactBtn.style.display = node.role === 'root' ? 'inline-block' : 'none' // hanya UTAMA
-    loopBtn.style.display = node.role === 'root' ? 'inline-block' : 'none' // hanya UTAMA
+    // Toggle mode (root only). Compact & Auto-check hanya relevan untuk orkestrator (ada worker/board)
+    // → sembunyikan saat lite.
+    liteBtn.style.display = node.role === 'root' ? 'inline-block' : 'none'
+    liteBtn.classList.toggle('on', !node.lite) // "on" = mode orkestrator (penuh)
+    liteBtn.textContent = node.lite ? '⚡ Chat' : '🌳 Orkestrator'
+    compactBtn.style.display = node.role === 'root' && !node.lite ? 'inline-block' : 'none' // hanya UTAMA orkestrator
+    loopBtn.style.display = node.role === 'root' && !node.lite ? 'inline-block' : 'none' // hanya UTAMA orkestrator
     loopBtn.classList.toggle('on', !!node.loopActive)
     loopBtn.textContent = node.loopActive ? '🔁 Auto ON' : '🔁 Auto'
     // Dropdown model per-sesi, PROVIDER-AWARE: akun OpenRouter → daftar model OR (bisa dipilih bebas),
@@ -986,6 +1156,13 @@ function updateChatHeader(): void {
     modelSel.style.display = 'inline-block'
     fillSessionModelSelect(modelSel, node)
     modelSel.onchange = (): void => {
+      if (modelSel.value === CUSTOM_MODEL) {
+        const m = promptCustomModel(node.model)
+        modelSel.value = node.model ?? '' // pulihkan; re-render mengikuti hasil set
+        if (m == null) return
+        void window.grove.setSessionModel(node.id, m || null).catch((e) => alert(`Gagal ganti model: ${String(e)}`))
+        return
+      }
       void window.grove
         .setSessionModel(node.id, modelSel.value || null)
         .catch((e) => alert(`Gagal ganti model: ${String(e)}`))
@@ -995,6 +1172,7 @@ function updateChatHeader(): void {
     stopBtn.style.display = 'none'
     compactBtn.style.display = 'none'
     loopBtn.style.display = 'none'
+    liteBtn.style.display = 'none'
     modelSel.style.display = 'none'
   }
 }
@@ -1261,14 +1439,17 @@ function showSessionMenu(node: Node, x: number, y: number): void {
         : '— ikut global (kosong) —'
   menu.append(item(inheritAccLabel, node.accountId == null, () => setSessionAccount(node.id, null)))
   for (const a of accounts) {
-    const tag = a.provider === 'openrouter' ? '  ⟨OR⟩' : ''
+    const tag = a.provider === 'custom' ? '  ⟨GM⟩' : a.provider === 'openrouter' ? '  ⟨OR⟩' : ''
     menu.append(item(a.label + tag, node.accountId === a.id, () => setSessionAccount(node.id, a.id)))
   }
 
   // --- Model ---
   menu.append(el('div', { class: 'ctx-sep' }, 'Model'))
   const eff = effectiveAccountOf(node)
-  if (eff?.provider === 'openrouter') {
+  if (eff?.provider === 'custom') {
+    // Akun custom: model dikunci oleh proxy → info saja (ganti model = ganti akun / edit proxy).
+    menu.append(item(`model akun: ${eff.model ?? '?'} · dikunci proxy`, true, () => {}))
+  } else if (eff?.provider === 'openrouter') {
     // Akun OpenRouter: model BEBAS dipilih dari daftar OR (tak dikunci). Kosong = default akun.
     const selfOr = node.model && node.model.includes('/') ? node.model : null
     menu.append(item(`— default akun: ${orShort(eff.model)} —`, selfOr == null, () => setSessionModel(node.id, null)))
@@ -1286,6 +1467,16 @@ function showSessionMenu(node: Node, x: number, y: number): void {
       if (m.value === '') continue // '' sudah diwakili "ikut warisan" di atas
       menu.append(item(m.label, node.model === m.value, () => setSessionModel(node.id, m.value)))
     }
+    // Model terpasang yang tak ada di daftar (id lama custom) → tampilkan sebagai terpilih.
+    if (node.model && !MODEL_OPTIONS.some((m) => m.value === node.model)) {
+      menu.append(item(node.model, true, () => {}, 'ctx-info'))
+    }
+    menu.append(
+      item('✎ Model lain…', false, () => {
+        const m = promptCustomModel(node.model)
+        if (m != null) setSessionModel(node.id, m || null)
+      })
+    )
   }
 
   menu.style.left = `${x}px`
@@ -1309,6 +1500,61 @@ function setSessionAccount(id: string, accountId: string | null): void {
 }
 function setSessionModel(id: string, model: string | null): void {
   void window.grove.setSessionModel(id, model).catch((e) => alert(`Gagal ganti model: ${String(e)}`))
+}
+
+// ---- kolom yang bisa di-resize (lebar sidebar & board, disimpan di localStorage) --------------
+
+/**
+ * Splitter antar-kolom: geser untuk atur lebar sidebar & papan; chat mengisi sisa. Lebar disimpan
+ * ke localStorage → dipulihkan saat buka lagi (dobel-klik splitter = reset ke default).
+ */
+function setupColumnResizers(): void {
+  const root = document.documentElement
+  const clamp = (v: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, v))
+  const px = (name: string): number => parseInt(getComputedStyle(root).getPropertyValue(name)) || 0
+
+  // Pulihkan lebar tersimpan SEBELUM interaksi → layout langsung benar saat buka.
+  const restore = (key: string, varName: string, lo: number, hi: number): void => {
+    const v = Number(localStorage.getItem(key))
+    if (Number.isFinite(v) && v > 0) root.style.setProperty(varName, clamp(v, lo, hi) + 'px')
+  }
+  restore('grove.wSide', '--w-side', 180, 600)
+  restore('grove.wBoard', '--w-board', 200, 700)
+
+  const wire = (
+    el: HTMLElement,
+    opts: { varName: string; key: string; min: number; max: number; def: number; sign: 1 | -1 }
+  ): void => {
+    el.addEventListener('pointerdown', (e) => {
+      e.preventDefault()
+      el.setPointerCapture(e.pointerId)
+      el.classList.add('dragging')
+      const startX = e.clientX
+      const startW = px(opts.varName)
+      const move = (ev: PointerEvent): void => {
+        const w = clamp(startW + opts.sign * (ev.clientX - startX), opts.min, opts.max)
+        root.style.setProperty(opts.varName, w + 'px')
+      }
+      const up = (): void => {
+        el.classList.remove('dragging')
+        el.removeEventListener('pointermove', move)
+        el.removeEventListener('pointerup', up)
+        localStorage.setItem(opts.key, String(px(opts.varName))) // persist lebar final
+      }
+      el.addEventListener('pointermove', move)
+      el.addEventListener('pointerup', up)
+    })
+    // Dobel-klik = reset ke default.
+    el.addEventListener('dblclick', () => {
+      root.style.setProperty(opts.varName, opts.def + 'px')
+      localStorage.removeItem(opts.key)
+    })
+  }
+
+  // Sidebar di KIRI: geser kanan → makin lebar (sign +1).
+  wire($('resize-left'), { varName: '--w-side', key: 'grove.wSide', min: 180, max: 600, def: 300, sign: 1 })
+  // Board di KANAN: geser kiri → makin lebar (sign -1).
+  wire($('resize-right'), { varName: '--w-board', key: 'grove.wBoard', min: 200, max: 700, def: 320, sign: -1 })
 }
 
 /** Panel kelola akun: auto-switch, daftar akun, tambah (token setup-token), akun sesi aktif. */
@@ -1387,17 +1633,19 @@ function renderAccountsPanel(): void {
         if (confirm(`Hapus akun "${a.label}"?`)) void window.grove.deleteAccount(a.id).catch((e) => alert(String(e)))
       })
       const planTag = a.plan ? el('span', { class: 'ap-plan' }, `Max ${a.plan}x`) : el('span', {})
-      // Badge provider: akun OpenRouter ditandai jelas + model yang dipakainya.
+      // Badge provider: akun OpenRouter / custom-proxy ditandai jelas + model yang dipakainya.
       const provTag =
         a.provider === 'openrouter'
           ? el('span', { class: 'ap-prov', title: a.model ?? '' }, `OR: ${a.model?.split('/').pop() ?? '?'}`)
-          : el('span', {})
+          : a.provider === 'custom'
+            ? el('span', { class: 'ap-prov', title: `${a.baseUrl ?? ''} · ${a.model ?? ''}` }, `GM: ${a.model ?? '?'}`)
+            : el('span', {})
       panel.append(
         el('div', { class: 'ap-item' }, el('span', { class: 'ap-label' }, a.label), provTag, planTag, del)
       )
 
-      // Akun OpenRouter (mis. model gratis) tak punya kuota gaya Claude → ambang tak relevan; lewati.
-      if (a.provider === 'openrouter') continue
+      // Akun non-Claude (OpenRouter / custom-proxy) tak punya kuota gaya Claude → ambang tak relevan; lewati.
+      if (a.provider !== 'claude') continue
 
       // Ambang khusus akun ini. Kosong = ikut ambang default di atas.
       const pct = document.createElement('input')
@@ -1437,12 +1685,13 @@ function renderAccountsPanel(): void {
   }
 
   panel.append(el('div', { class: 'ap-head' }, 'Tambah akun'))
-  // Pilih provider: Claude (langganan) atau OpenRouter (key + model).
+  // Pilih provider: Claude (langganan), OpenRouter (key + model), atau Gemini/Proxy (base-URL sendiri).
   const prov = document.createElement('select')
   prov.className = 'ap-input'
   for (const [v, t] of [
     ['claude', 'Claude (langganan)'],
-    ['openrouter', 'OpenRouter (key + model)']
+    ['openrouter', 'OpenRouter (key + model)'],
+    ['custom', 'Gemini / Proxy (base-URL)']
   ] as const) {
     const o = document.createElement('option')
     o.value = v
@@ -1457,7 +1706,12 @@ function renderAccountsPanel(): void {
   token.className = 'ap-input ap-token'
   token.rows = 2
 
-  // Field khusus OpenRouter: id model (dengan saran gratis) — hanya tampil bila provider = openrouter.
+  // Field khusus 'custom': base URL endpoint Anthropic-compatible (proxy sendiri). Hanya tampil bila custom.
+  const baseUrl = document.createElement('input')
+  baseUrl.className = 'ap-input'
+  baseUrl.placeholder = 'Base URL proxy, mis. http://localhost:4000'
+
+  // Field model (OpenRouter & custom): id/nama model dengan saran. Hanya tampil bila provider skin.
   const orModel = document.createElement('input')
   orModel.className = 'ap-input'
   orModel.setAttribute('list', 'or-model-list')
@@ -1475,18 +1729,17 @@ function renderAccountsPanel(): void {
       datalist.append(o)
     }
   }
-  fillDatalist(OPENROUTER_MODEL_SUGGESTIONS.map((m) => ({ value: m.id, text: m.label })))
+  const orSuggest = OPENROUTER_MODEL_SUGGESTIONS.map((m) => ({ value: m.id, text: m.label }))
+  const customSuggest = CUSTOM_MODEL_SUGGESTIONS.map((m) => ({ value: m.id, text: m.label }))
+  let orLive: ReadonlyArray<{ value: string; text: string }> | null = null
+  fillDatalist(orSuggest)
   void window.grove
     .listOpenRouterModels(true)
     .then((list) => {
       if (!list.length) return // fetch gagal → biarkan saran statis
       const fmtCtx = (n: number): string => (n >= 1e6 ? `${n / 1e6}M` : `${Math.round(n / 1000)}K`)
-      fillDatalist(
-        list.map((m) => ({
-          value: m.id,
-          text: `${m.name} · ${m.paramB || '?'} · ${fmtCtx(m.context)} ctx`
-        }))
-      )
+      orLive = list.map((m) => ({ value: m.id, text: `${m.name} · ${m.paramB || '?'} · ${fmtCtx(m.context)} ctx` }))
+      if (prov.value === 'openrouter') fillDatalist(orLive) // hanya refresh bila OR yang sedang aktif
     })
     .catch(() => {})
 
@@ -1499,13 +1752,27 @@ function renderAccountsPanel(): void {
 
   const hint = el('div', { class: 'ap-hint' }, '')
   const applyProvider = (): void => {
-    const or = prov.value === 'openrouter'
-    token.placeholder = or ? 'OpenRouter API key (sk-or-v1-…)' : 'CLAUDE_CODE_OAUTH_TOKEN (sk-ant-oat01-…)'
-    orModel.style.display = or ? 'block' : 'none'
-    plan.style.display = or ? 'none' : 'block'
-    hint.textContent = or
-      ? '⚠️ OpenRouter hanya MENJAMIN Claude Code untuk model Anthropic. Model lain (mis. Nemotron) bisa saja tak patuh protokol tool Grove — uji dulu di satu sesi sebelum diandalkan. Kuota gaya Claude tak berlaku (auto-switch/ambang diabaikan).'
-      : 'Token `claude setup-token` didukung penuh: menjalankan sesi maupun memantau kuota (usage dibaca dari header rate-limit bila endpoint resmi menolak).'
+    const p = prov.value // 'claude' | 'openrouter' | 'custom'
+    const skin = p === 'openrouter' || p === 'custom'
+    token.placeholder =
+      p === 'openrouter'
+        ? 'OpenRouter API key (sk-or-v1-…)'
+        : p === 'custom'
+          ? 'Token proxy (ANTHROPIC_AUTH_TOKEN) — isi apa saja bila proxy tak memeriksa'
+          : 'CLAUDE_CODE_OAUTH_TOKEN (sk-ant-oat01-…)'
+    baseUrl.style.display = p === 'custom' ? 'block' : 'none'
+    if (p === 'custom' && !baseUrl.value) baseUrl.value = CUSTOM_BASE_URL_DEFAULT
+    orModel.style.display = skin ? 'block' : 'none'
+    orModel.placeholder =
+      p === 'custom' ? 'Nama model yg dikenal proxy, mis. gemini-2.5-flash' : 'Model OpenRouter, mis. nvidia/nemotron-3-super-120b-a12b:free'
+    fillDatalist(p === 'custom' ? customSuggest : (orLive ?? orSuggest))
+    plan.style.display = skin ? 'none' : 'block'
+    hint.textContent =
+      p === 'openrouter'
+        ? '⚠️ OpenRouter hanya MENJAMIN Claude Code untuk model Anthropic. Model lain (mis. Nemotron) bisa saja tak patuh protokol tool Grove — uji dulu di satu sesi sebelum diandalkan. Kuota gaya Claude tak berlaku (auto-switch/ambang diabaikan).'
+        : p === 'custom'
+          ? '🔌 Perlu PROXY penerjemah Anthropic→Gemini yang jalan lokal (LiteLLM / claude-code-router) memegang API key Gemini gratismu. Base URL = alamat proxy itu; Model = nama yang dikenal proxy. Kuota gaya Claude tak berlaku — "limit" = rate-limit Gemini (bukan kuota Claude).'
+          : 'Token `claude setup-token` didukung penuh: menjalankan sesi maupun memantau kuota (usage dibaca dari header rate-limit bila endpoint resmi menolak).'
   }
   prov.addEventListener('change', applyProvider)
 
@@ -1513,22 +1780,27 @@ function renderAccountsPanel(): void {
   add.addEventListener('click', () => {
     const l = label.value.trim()
     const t = token.value.trim()
-    const or = prov.value === 'openrouter'
-    const p = !or && Number(plan.value) > 0 ? Number(plan.value) : undefined
-    const m = or ? orModel.value.trim() : undefined
+    const provider = prov.value as 'claude' | 'openrouter' | 'custom'
+    const skin = provider === 'openrouter' || provider === 'custom'
+    const p = !skin && Number(plan.value) > 0 ? Number(plan.value) : undefined
+    const m = skin ? orModel.value.trim() : undefined
+    const url = provider === 'custom' ? baseUrl.value.trim() : undefined
     if (!l || !t) return alert('Isi label & token/key dulu.')
-    if (or && !m) return alert('Isi id model OpenRouter (mis. nvidia/nemotron-3-super-120b-a12b:free).')
+    if (provider === 'openrouter' && !m) return alert('Isi id model OpenRouter (mis. nvidia/nemotron-3-super-120b-a12b:free).')
+    if (provider === 'custom' && !m) return alert('Isi nama model yang dikenal proxy (mis. gemini-2.5-flash).')
+    if (provider === 'custom' && !url) return alert('Isi base URL proxy (mis. http://localhost:4000).')
     void window.grove
-      .addAccount(l, t, p, undefined, or ? 'openrouter' : 'claude', m)
+      .addAccount(l, t, p, undefined, provider, m, url)
       .then(() => {
         label.value = ''
         token.value = ''
         plan.value = ''
         orModel.value = ''
+        baseUrl.value = ''
       })
       .catch((e) => alert(`Gagal tambah: ${String(e)}`))
   })
-  panel.append(prov, label, token, orModel, datalist, hint, plan, add)
+  panel.append(prov, label, token, baseUrl, orModel, datalist, hint, plan, add)
   applyProvider() // set tampilan awal sesuai provider default (claude)
 
   const node = activeId ? nodes.get(activeId) : null
@@ -1827,6 +2099,17 @@ async function init(): Promise<void> {
     void window.grove.setLoop(activeId, next).catch((err) => alert(`Gagal set auto-check: ${String(err)}`))
   })
 
+  $('btn-lite').addEventListener('click', () => {
+    if (!activeId) return
+    const node = nodes.get(activeId)
+    if (node?.role !== 'root') return
+    const next = !node.lite
+    if (!next && !confirm('Aktifkan mode Orkestrator? Sesi ini bisa spawn worker & memuat 13 tool grove + protokol multi-agent — lebih boros token. Cocok untuk tugas besar/paralel, bukan chat biasa.')) return
+    node.lite = next || undefined // optimistis
+    updateChatHeader()
+    void window.grove.setLite(activeId, next).catch((err) => alert(`Gagal ganti mode: ${String(err)}`))
+  })
+
   $('btn-stop-all').addEventListener('click', () => {
     void window.grove
       .stopAll()
@@ -1838,7 +2121,8 @@ async function init(): Promise<void> {
 
   $('usage').addEventListener('click', (e) => {
     e.stopPropagation()
-    $('usage-panel').classList.toggle('show')
+    const shown = $('usage-panel').classList.toggle('show')
+    if (shown) void renderUsageHistory() // fetch riwayat saat dibuka (bukan tiap tick)
   })
 
   // Refresh MANUAL: fetch usage akun sesi terpilih sekarang. Disable + spin selama cooldown (10s,
@@ -1995,6 +2279,7 @@ async function init(): Promise<void> {
   }, 1000)
 
   window.grove.onEvent(onEvent)
+  setupColumnResizers() // kolom bisa di-resize + pulihkan lebar tersimpan
   // Prefetch daftar model OpenRouter sekali → dropdown/menu model sesi OR langsung terisi.
   void window.grove
     .listOpenRouterModels(true)

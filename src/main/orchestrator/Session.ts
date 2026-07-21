@@ -16,6 +16,7 @@ import { join } from 'node:path'
 import type { Board } from './db'
 import { buildGroveServer, type GroveHost } from './mcpTools'
 import { contextPercent, contextWindowFor } from './contextWindows'
+import { groveAppend } from './prompts'
 
 /**
  * Path claude.exe untuk app TERPAKET. Di dalam paket, SDK menunjuk binary yang berada
@@ -38,70 +39,6 @@ function packagedClaudeExecutable(): string | undefined {
   return existsSync(p) ? p : undefined
 }
 const CLAUDE_EXE = packagedClaudeExecutable()
-
-// Bagian prompt yang SAMA untuk root & sub: cara melapor ke papan tulis + koordinasi.
-const GROVE_COMMON = `
---- GROVE MULTI-AGENT PROTOCOL ---
-You run inside "Grove", a multi-agent orchestrator GUI. Keep the dashboard live and coordinate through the shared board:
-- EARLY (once you understand the request) call mcp__grove__set_title with a concise 3-6 word title for this session.
-- mcp__grove__update_summary — a 1-3 sentence summary of your goal + current result. Call it early.
-- mcp__grove__update_todo — maintain your task checklist.
-- mcp__grove__report_progress — one sentence on what you are doing RIGHT NOW; call it whenever you switch activity.
-- mcp__grove__read_board — read-only awareness of what sessions are doing (scope "tree" = your tree only; "all" = every tree, read-only — you must NEVER act on another tree's task).
-- mcp__grove__send_message — leave a coordination note; ISOLATED to your OWN tree only (you cannot message another root/UTAMA or its workers). It is only a note, not a task.
-- mcp__grove__list_workers — list the sessions in YOUR tree.
-ISOLATION: every action you take (messages, progress reports, spawning, assigning) stays inside YOUR OWN tree; you can never send work or notes into another root/UTAMA tree or its sub-workers.
-BE BRIEF — IT COSTS REAL CONTEXT: whatever you write into the board or a message is re-read by other sessions and re-sent every turn. Summaries ≤3 sentences, progress = one line, messages = conclusions only (no full reports, diffs, file dumps, or code listings; write those to a file and mention the path instead). Long text is hard-truncated anyway, so writing it only wastes your output tokens.
-`.trim()
-
-// Root (UTAMA) = orchestrator. Tugasnya MENDISTRIBUSI, bukan mengeksekusi sendiri.
-const GROVE_ROOT = `
-YOUR ROLE: you are the ROOT orchestrator of this tree (shown as "UTAMA" in the UI). Your job is to COORDINATE and DISTRIBUTE the work — NOT to do the heavy lifting yourself.
-- Decompose the user's request into self-contained sub-tasks and DELEGATE each one to a sub-worker. Do NOT personally read many files, run the deep analysis, or write the large fixes — hand that to workers. Stay light so you can distribute, monitor, and synthesize.
-- MATCH each sub-task to a worker deliberately — a worker's context must never blend two different topics. FIRST call mcp__grove__list_workers.
-  • CONTINUATION of a topic a worker ALREADY worked on → reuse it with mcp__grove__assign_worker and set continuation:true (it keeps its full prior context).
-  • NEW, UNRELATED sub-task → either mcp__grove__spawn_worker (fresh worker), OR reuse an idle worker with mcp__grove__assign_worker at its DEFAULT (continuation:false) — that gives it a CLEAN context so it never carries over a previous, different topic. NEVER hand an unrelated task to a worker while keeping its old topic's context.
-- Each task you hand off must be clear and SELF-CONTAINED, and must NOT reference another worker's topic (so no worker "adopts" a sibling's work by accident).
-- BRIEF EVERY WORKER IN THIS SHAPE — a vague task costs far more than a long one. A worker that must ask you back forces a whole extra root turn, and every root turn re-bills your ENTIRE accumulated context:
-    CONTEXT: the one or two facts the worker needs and cannot infer.
-    GOAL: the end state, stated as a testable outcome — not "look into X".
-    FILES: concrete paths (and line ranges when you know them) so it does not hunt.
-    CONSTRAINTS: what it must not touch, plus how to verify it worked.
-    TASK: the single imperative sentence.
-  Spend the tokens HERE, once, instead of paying for a clarification round-trip later. If you cannot fill GOAL or FILES yourself, that is a sign to first delegate a small scouting task — not to hand over a vague one.
-- After delegating, monitor with mcp__grove__read_board / mcp__grove__read_messages, then synthesize the workers' results into the final answer for the user.
-- PROGRESS TO THE USER: workers report their percent as they go, and you will be AUTO-PINGED with a "[GROVE AUTO]" message whenever they report. That ping ALREADY CONTAINS the current board summary — do NOT call read_board (it would flood your context). Just send the USER one short line from that summary. When all workers reach 100%, send the final synthesized answer instead. Keep updates brief; do not repeat unchanged status.
-- PERIODIC AUTO-CHECK: roughly every few minutes you also get a "[GROVE AUTO-CHECK]" ping (like the user asking "udah sampe mana?"), which ALSO already includes the board summary — do NOT call read_board. From that summary: if any worker is idle but its task is NOT finished, push it to continue (list_workers for its id → assign_worker) so nobody stalls; give the user a brief status. When the ENTIRE task is complete, call mcp__grove__task_done to stop the periodic checks (they auto-resume on a new task).
-- Only exception: a trivial one-off question you can just answer directly — no workers needed.
-`.trim()
-
-// Sub = pekerja. Kerjakan tugasnya sampai tuntas; boleh terima tugas baru lagi (konteks tersimpan).
-const GROVE_SUB = `
-YOUR ROLE: you are a SUB-WORKER. Focus on completing the specific task you were assigned, thoroughly and directly, then report the result.
-- Do the work yourself. Only spawn your OWN sub-workers with mcp__grove__spawn_worker if your task is itself genuinely parallelizable; otherwise just do it.
-- If the brief is missing something you truly cannot proceed without, ask ONCE with EVERY question batched into that single message — never one question at a time. Each exchange costs your parent a full turn at its accumulated context. If a gap is something you can settle yourself by reading the code, read it instead of asking.
-- REPORT PROGRESS UP so the user can see how far along you are: call mcp__grove__report_to_parent with a one-line status AND a rough percent at meaningful milestones (roughly every 25%) and again with percent 100 when you finish. Keep mcp__grove__report_progress (with percent) updated too for the live board.
-- When finished, put the outcome in mcp__grove__update_summary. You may be handed another task later: if it CONTINUES your current topic your prior context is kept, so build on it; if it is a NEW independent task your context is reset to a clean slate — treat it entirely on its own and do NOT drag in the previous topic.
-`.trim()
-
-// HEMAT TOKEN OUTPUT. GROVE_COMMON sudah membatasi teks yang masuk PAPAN (dibaca sesi lain);
-// blok ini membatasi teks yang ditulis ke USER — sumber pemborosan yang berbeda dan sama besarnya.
-// Token output ditagih lebih mahal dari input DAN ikut menumpuk jadi konteks yang dikirim ulang tiap
-// giliran berikutnya, jadi basa-basi bukan cuma panjang: ia dibayar berkali-kali.
-const GROVE_ECONOMY = `
-OUTPUT ECONOMY (Grove runs many sessions in parallel on a shared quota — wasted output is quota taken from other sessions):
-- No preamble, no recap of what was just asked, no restating the plan you already stated. Start with the answer or the action.
-- Do not summarize work the user can already see in the tool log or the board. Report only what is NOT visible there: the conclusion, the surprise, the decision.
-- Never re-emit content you already produced. Reference it (file path + line range) instead of pasting it again.
-- Never paste a whole file back to show a small change; state the file and the lines you touched.
-- Prefer the smallest correct implementation first; add edge-case handling only when it is actually needed or asked for.
-- No filler: no "Great question", no apologies, no closing summaries that repeat the body.
-- Being brief must never mean hiding problems. Failures, uncertainty, and skipped steps are ALWAYS worth the tokens — say them plainly and briefly.
-`.trim()
-
-function groveAppend(role: SessionRole): string {
-  return `${GROVE_COMMON}\n\n${GROVE_ECONOMY}\n\n${role === 'root' ? GROVE_ROOT : GROVE_SUB}`
-}
 
 /** Potong string 1-baris agar rapi di daftar chat. */
 function short(v: unknown, max = 140): string {
@@ -193,6 +130,7 @@ function extractResultText(content: unknown): string {
   return content == null ? '' : JSON.stringify(content)
 }
 
+const MAX_TRANSIENT_RETRIES = 3 // auto-retry beruntun error koneksi transient sebelum menyerah
 const AUTO_COMPACT_HIGH = 88 // ctx% ambang ATAS: picu auto-compact (cegah freeze saat konteks nyaris penuh)
 const AUTO_COMPACT_LOW = 70 // ctx% ambang BAWAH: baru boleh mempersenjatai ulang auto-compact (hysteresis anti-thrash)
 const DELTA_FLUSH_MS = 40 // B2: coalesce token stream → satu emit chat:delta per interval ini (bukan per token)
@@ -213,6 +151,20 @@ function isLimitError(raw: string): boolean {
 function isLimitNotice(text: string): boolean {
   return /(hit|reached|exceeded)\s+your\s+[\w\s-]*limit|(session|weekly|usage|5-hour|five-hour)\s+limit\b[^\n]{0,40}\bresets?\b|limit\s*·\s*resets/i.test(
     text
+  )
+}
+
+/**
+ * Error KONEKSI TRANSIENT yang layak dicoba-ulang otomatis: koneksi diputus/timeout, atau upstream
+ * 5xx / provider sementara tak tersedia. SANGAT sering di OpenRouter free (kapasitas bersama drop
+ * koneksi di tengah stream). SENGAJA TIDAK mencakup:
+ *  - limit langganan (429/quota/"limit reached") → itu urusan isLimitError/onLimitHit.
+ *  - error FATAL (401/403 auth, 404 model tak ada) → retry percuma, harus diberitahu ke user.
+ */
+export function isTransientError(raw: string): boolean {
+  if (/\b(401|403|404)\b|unauthorized|forbidden|not\s*found|invalid.?api.?key|no\s+access/i.test(raw)) return false
+  return /ECONNRESET|ETIMEDOUT|ECONNREFUSED|EPIPE|ENOTFOUND|EAI_AGAIN|socket hang up|connection (was )?(lost|reset|closed|error)|network error|fetch failed|premature close|provider_unavailable|\b(502|503|504|529)\b|bad gateway|service unavailable|gateway time|overloaded/i.test(
+    raw
   )
 }
 
@@ -250,7 +202,7 @@ function isApiBlock(raw: string): boolean {
  * dimasukkan atas permintaan eksplisit karena muncul di kasus nyata. Biayanya rendah: kedip hilang
  * begitu ada giliran baru (beginTurn), dan SET-nya masih dijaga cleanEnd + inbox kosong.
  */
-function looksLikeAwaitingInput(text: string): boolean {
+export function looksLikeAwaitingInput(text: string): boolean {
   const t = (text ?? '').trim()
   if (!t) return false
   const lines = t
@@ -277,8 +229,10 @@ function looksLikeAwaitingInput(text: string): boolean {
   // L3a — frasa SPESIFIK/memblokir (aman di jendela lebar).
   // "kabari" sengaja diikat ke bentuk yang DITUJUKAN KE USER ("kabari saya/ya/kalau"), supaya
   // "nanti saya kabari hasilnya" (asisten yang memberi tahu) tidak salah-picu.
+  // "begitu"/"setelah" DIBUANG: "saya kabari begitu/setelah X" = asisten MELAPOR nanti (bukan
+  // menunggu) — persis false-positive "Nanti saya kabari begitu worker lapor" yang bikin kedip kuning.
   const STRONG_ID =
-    /(bilang saja|kabari (saya|aku|ya|kalau|kalo|begitu|setelah)|beri ?tahu saya|tunggu kabar|(menunggu|nunggu) (jawaban|keputusan|konfirmasi|instruksi|arahan|persetujuan)|saya berhenti dulu|tanpa izin|butuh (akses|kredensial|password|token|izin) dari (kamu|anda)|bola di (kamu|anda)|pilih satu|pilih salah satu|silakan pilih|pilihanmu|\b(y\/n|ya\/tidak|iya\/tidak)\b)/i
+    /(bilang saja|kabari (saya|aku|ya|kalau|kalo)|beri ?tahu saya|tunggu kabar|(menunggu|nunggu) (jawaban|keputusan|konfirmasi|instruksi|arahan|persetujuan)|saya berhenti dulu|tanpa izin|butuh (akses|kredensial|password|token|izin) dari (kamu|anda)|bola di (kamu|anda)|pilih satu|pilih salah satu|silakan pilih|pilihanmu|\b(y\/n|ya\/tidak|iya\/tidak)\b)/i
   const STRONG_EN =
     /\b(let me know|waiting for (your )?(input|confirmation|answer|decision|reply)|please (confirm|choose|clarify|advise|decide)|should i|would you like|do you want|which (one|option))\b/i
   if (STRONG_ID.test(tail) || STRONG_EN.test(tail)) return true
@@ -395,6 +349,10 @@ export class Session {
   private apiBlockPending = false // blokir API terdeteksi → recycle di akhir turn
   private limitHitPending = false // limit pemakaian terdeteksi → auto-switch akun di akhir turn
   private limitStreak = 0 // pindah akun beruntun akibat limit tanpa turn sukses (guard anti-loop)
+  private transientPending = false // error koneksi transient (ECONNRESET/5xx) → auto-retry di akhir turn
+  private transientSeen = false // teks asisten menyebut error koneksi transient pada turn ini
+  private transientRetries = 0 // retry transient beruntun tanpa turn sukses (guard anti-loop; reset saat sukses)
+  private retryTimer: NodeJS.Timeout | null = null // timer backoff auto-retry (di-clear saat stop)
   private compactArmed = true // auto-compact hanya menyala bila konteks NYATA pernah turun < LOW (hysteresis anti-thrash)
   private compactStreak = 0 // compact beruntun tanpa turn yang berakhir < LOW (guard anti-freeze; lihat limitStreak)
   private compactWarned = false // peringatan "konteks tetap penuh" sudah dikirim untuk streak ini (anti-spam)
@@ -433,7 +391,10 @@ export class Session {
     // Buang resolver parkir dari query SEBELUMNYA (mis. sesudah ganti akun/recycle/compact) —
     // kalau tidak, pesan pertama ke query baru ini akan nyasar ke iterator mati & menggantung.
     this.inbox.resetConsumers()
-    const server = buildGroveServer(this.meta.id, this.host)
+    // Mode LITE (CLI-parity): TANPA MCP grove (0 dari 13 tool orkestrasi) & TANPA append protokol
+    // multi-agent → prefix prompt = preset claude_code polos, hemat ~3k token/giliran + tak ada
+    // mandat bookkeeping yang memicu giliran ekstra. Orkestrasi (spawn/board) memang tak ada di sini.
+    const lite = !!this.meta.lite
     // Akun EFEKTIF: akun sesi ini → akun sesi utama pohon → akun global. Dihitung SEKARANG (bukan
     // disalin saat sesi lahir) supaya ganti akun di sesi utama langsung berlaku ke sub-sesinya.
     // launch berisi env provider (Claude vs OpenRouter) + model efektif; null = tak ada token.
@@ -471,7 +432,7 @@ export class Session {
         systemPrompt: {
           type: 'preset',
           preset: 'claude_code',
-          append: groveAppend(this.meta.role),
+          append: lite ? '' : groveAppend(this.meta.role),
           // CATATAN (diverifikasi di sdk.d.ts:1943-1947): opsi ini TIDAK membuang apa pun. Ia hanya
           // MEMINDAHKAN seksi dinamis (working-dir, auto-memory, git-status) keluar dari system
           // prompt lalu menyuntikkannya kembali sebagai pesan user PERTAMA — tujuannya agar prefix
@@ -489,7 +450,8 @@ export class Session {
         // Sengaja TIDAK memakai [] (mode isolasi SDK): user memang menghendaki CLAUDE.md + memori —
         // yang tak diinginkan hanyalah memori LINTAS-PROJECT, dan itu sudah diatasi oleh cwd per-tree.
         settingSources: ['user', 'project', 'local'],
-        mcpServers: { grove: server },
+        // LITE → jangan pasang MCP grove: 13 skema tool (~1.5-2k token) tak ikut tiap request.
+        ...(lite ? {} : { mcpServers: { grove: buildGroveServer(this.meta.id, this.host) } }),
         // Env provider sudah dirakit di getSessionLaunch (Claude → CLAUDE_CODE_OAUTH_TOKEN; OpenRouter
         // → ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN), sudah termasuk spread process.env.
         env: launch.env,
@@ -598,10 +560,14 @@ export class Session {
    * mendorong pekerjaan baru (pesan user, tugas dari orkestrator, auto-check, resume).
    */
   private beginTurn(): void {
+    // Turn baru (user kirim / auto-task / retry sendiri) menggantikan retry yang tertunda → batalkan
+    // timernya supaya tak memicu giliran dobel.
+    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null }
     this.lastAssistantText = ''
     this.turnText = ''
     this.finalReportSent = false
     this.interrupting = false
+    this.transientSeen = false // giliran baru → deteksi error transient dimulai dari nol
     this.lastCtxPersist = 0 // B3: giliran baru → usage pertama turn ini dipersist segera (angka ctx fresh)
     this.setAwaitingInput(false) // kerja baru masuk (user/parent menindak) → matikan kedip kuning
     this.doneMarked = false // ada tugas baru → tak lagi "tuntas" (status balik running/idle)
@@ -725,6 +691,7 @@ export class Session {
 
   async stop(): Promise<void> {
     this.stopped = true
+    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null } // batalkan auto-retry yang tertunda
     this.flushDelta() // B2: keluarkan sisa token & batalkan timer saat sesi ditutup
     this.interrupting = true // ditutup paksa → bukan "turn selesai wajar"
     this.setAwaitingInput(false) // sesi ditutup → kedip jangan nyangkut
@@ -768,10 +735,17 @@ export class Session {
       }
     } catch (e) {
       const raw = String(e)
-      if (isApiBlock(raw)) this.apiBlockPending = true
-      else if (isLimitError(raw)) this.limitHitPending = true // limit via exception → auto-switch
-      // Jangan cetak error generik kalau kita sengaja interupsi (recycle blokir API / switch limit).
-      else if (!this.stopped) {
+      // INTERUPSI DISENGAJA (ganti akun/model via restartQuery, atau stop) → BUKAN error. Kalau tidak
+      // dibedakan, error interupsi (mis. koneksi ke subprocess "premature close") salah dikira transient
+      // → memicu auto-retry siluman yang mengacaukan chat berikutnya ("habis ganti akun gak bisa chat").
+      // apiBlock/limit punya flag sendiri (di-set sebelum interupsi) & TIDAK men-set `interrupting`,
+      // jadi jalur itu tetap jalan lewat cabang di bawah.
+      if (this.interrupting || this.stopped) {
+        /* disengaja — abaikan, jangan tandai error/transient/limit */
+      } else if (isApiBlock(raw)) this.apiBlockPending = true
+      else if (isLimitError(raw)) this.limitHitPending = true // limit via exception → auto-switch (didahulukan)
+      else if (isTransientError(raw) || this.transientSeen) this.transientPending = true // koneksi putus → auto-retry
+      else {
         console.error(`[Session ${this.meta.id}] error:`, e)
         this.record({
           role: 'system',
@@ -795,6 +769,12 @@ export class Session {
           this.q = null
           if (this.meta.status === 'running') this.setStatus('idle')
         }
+        // Error koneksi transient → auto-retry (resume konteks), didahulukan sebelum limit/apiblock
+        // karena ini gangguan sesaat yang paling mungkin sukses bila diulang.
+        if (this.transientPending && !this.stopped) {
+          this.transientPending = false
+          this.scheduleTransientRetry()
+        }
         // Setelah state di-reset: bila kena limit, minta orkestrator auto-switch akun (bila aktif).
         if (this.limitHitPending && !this.stopped) {
           this.limitHitPending = false
@@ -817,6 +797,11 @@ export class Session {
   /** Interupsi query yang sedang jalan; pesan berikutnya RESUME dgn konfigurasi baru (akun/model).
    *  sdkSessionId dipertahankan → konteks tak hilang, hanya token/model yang berganti. */
   restartQuery(): void {
+    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null } // ganti akun/model → batalkan retry lama
+    // Restart DISENGAJA bukan kegagalan koneksi → buang jejak transient supaya tak ada auto-retry siluman.
+    this.transientPending = false
+    this.transientSeen = false
+    this.transientRetries = 0
     if (!this.started) return
     this.flushDelta() // B2: keluarkan sisa token & batalkan timer sebelum restart
     this.interrupting = true // turn dipotong paksa demi ganti konfig → bukan "worker selesai"
@@ -855,6 +840,46 @@ export class Session {
     } catch {
       /* abaikan */
     }
+  }
+
+  /**
+   * Error koneksi TRANSIENT (ECONNRESET/5xx/provider penuh) → coba lagi OTOMATIS: resume konteks
+   * (sdkSessionId dipertahankan) lalu suruh lanjut dari titik terakhir. Backoff naik tiap percobaan.
+   * Dibatasi MAX_TRANSIENT_RETRIES percobaan BERUNTUN tanpa turn sukses (counter direset saat sukses)
+   * supaya tak jadi loop tak berujung saat upstream benar-benar down. Sesuai jelas dengan permintaan:
+   * hanya untuk gangguan transient, BUKAN error fatal (auth/model — sudah disaring isTransientError).
+   */
+  private scheduleTransientRetry(): void {
+    if (this.stopped) return
+    if (this.transientRetries >= MAX_TRANSIENT_RETRIES) {
+      this.transientRetries = 0
+      this.record({
+        role: 'system',
+        text: `🚫 Koneksi ke API putus ${MAX_TRANSIENT_RETRIES}× berturut (retry otomatis menyerah). Ini biasanya kapasitas gratis OpenRouter yang sedang penuh — kirim pesan lagi untuk coba manual, atau klik-kanan kartu sesi → pilih model lain / OpenRouter berbayar yang lebih stabil.`,
+        ts: Date.now()
+      })
+      this.setStatus('error')
+      this.emitActivity('koneksi putus')
+      return
+    }
+    this.transientRetries++
+    const n = this.transientRetries
+    const delayMs = 1500 * n // backoff naik: 1.5s, 3s, 4.5s
+    this.record({
+      role: 'system',
+      text: `🔁 Koneksi terputus (transient) — mencoba lagi otomatis (${n}/${MAX_TRANSIENT_RETRIES}) dalam ${Math.round(delayMs / 1000)}s…`,
+      ts: Date.now()
+    })
+    this.emitActivity('mencoba ulang koneksi…')
+    if (this.retryTimer) clearTimeout(this.retryTimer)
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null
+      if (this.stopped) return
+      // injectAutoTask meng-start() ulang (resume) lalu mendorong lanjut dari titik terakhir.
+      this.injectAutoTask(
+        '[GROVE] Koneksi ke API sempat terputus lalu tersambung lagi. LANJUTKAN pekerjaan dari titik terakhir — jangan mengulang dari awal.'
+      )
+    }, delayMs)
   }
 
   /** Catat satu baris system ke chat (dipakai orkestrator: memberi tahu switch akun / limit). */
@@ -1040,6 +1065,9 @@ export class Session {
             // Limit langganan sering datang sebagai TEKS ("You've hit your session limit · resets …"),
             // bukan exception/field error → deteksi di sini agar auto-switch akun ikut kepicu.
             else if (isLimitNotice(block.text)) this.flagLimitHit()
+            // "Connection to the API was lost (ECONNRESET)…" datang sebagai TEKS asisten dari CLI,
+            // sedang result-nya cuma subtype generik → catat di sini supaya finally bisa auto-retry.
+            else if (isTransientError(block.text)) this.transientSeen = true
           } else if (block.type === 'tool_use') {
             const input = formatToolInput(block.input)
             const rowId = this.record({
@@ -1083,13 +1111,31 @@ export class Session {
         // Limit bisa muncul sbg result error (errors[]/stop_reason). JANGAN stringify seluruh msg
         // untuk isLimitError — field "usage"/"modelUsage" akan false-positive; cek yang spesifik saja.
         if (subtype && subtype !== 'success') {
+          const errStr = Array.isArray(r.errors) ? r.errors.map((x) => String(x)).join(' ') : ''
           const hit =
             (Array.isArray(r.errors) && r.errors.some((x) => isLimitError(String(x)))) ||
             (r.stop_reason ? isLimitError(r.stop_reason) : false)
           if (hit) this.flagLimitHit()
+          // Result gagal + jejak koneksi transient (dari errors[] atau teks asisten "ECONNRESET…")
+          // → tandai auto-retry. subtype generik 'error_during_execution' pun dianggap transient bila
+          // teks turn menyebut koneksi hilang (transientSeen).
+          else if (!this.apiBlockPending && (isTransientError(errStr) || this.transientSeen)) {
+            this.transientPending = true
+          }
         }
-        if (subtype === 'success') this.limitStreak = 0 // turn sukses → rantai limit direset
-        if (subtype && subtype !== 'success' && !this.apiBlockPending && !this.limitHitPending) {
+        if (subtype === 'success') {
+          this.limitStreak = 0 // turn sukses → rantai limit direset
+          this.transientRetries = 0 // turn sukses → rantai retry transient direset
+        }
+        // Jangan cetak error generik bila turn ini akan di-retry otomatis (transient) — nanti retry
+        // punya notanya sendiri; dua pesan malah membingungkan.
+        if (
+          subtype &&
+          subtype !== 'success' &&
+          !this.apiBlockPending &&
+          !this.limitHitPending &&
+          !this.transientPending
+        ) {
           this.record({
             role: 'system',
             text: `⚠️ ${friendlyError(subtype)}  (session tetap bisa dilanjut — kirim pesan lagi)`,
@@ -1107,6 +1153,7 @@ export class Session {
           subtype !== 'success' &&
           !this.apiBlockPending &&
           !this.limitHitPending &&
+          !this.transientPending && // akan di-retry → jangan tandai error (dot merah) dulu
           !this.interrupting
         this.setStatus(failed ? 'error' : this.doneMarked ? 'done' : 'idle')
         this.emitActivity(failed ? 'error' : this.doneMarked ? 'selesai' : 'idle')
@@ -1178,6 +1225,13 @@ export class Session {
       (usage.cache_creation_input_tokens ?? 0)
     const ctxOutput = usage.output_tokens ?? 0
     if (ctxInput <= 0 && ctxOutput <= 0) return
+    // Catat pemakaian NYATA respons ini ke riwayat lokal (per jam/akun) → bisa dicek boros/normal.
+    this.host.recordUsage(this.meta.id, {
+      input: usage.input_tokens ?? 0,
+      cacheRead: usage.cache_read_input_tokens ?? 0,
+      cacheCreation: usage.cache_creation_input_tokens ?? 0,
+      output: ctxOutput
+    })
     this.meta.ctxInput = ctxInput
     this.meta.ctxOutput = ctxOutput
     this.tokensTotal += ctxOutput

@@ -153,16 +153,41 @@ button, input { font-family: var(--mono); }
 .up-fill.u-warn { background: var(--warn); }
 .up-fill.u-err { background: var(--err); }
 .up-updated { color: #5a5a5a; font-size: 10px; margin-top: 4px; }
+/* Riwayat pemakaian token PC ini (bagian bawah panel usage). */
+#usage-history { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; }
+.uh-row { display: flex; justify-content: space-between; align-items: baseline; padding: 3px 0; font-size: 12px; }
+.uh-name { color: var(--text-dim); }
+.uh-val { color: #f0ede2; font-variant-numeric: tabular-nums; }
+.uh-out { color: var(--text-dim); font-size: 10px; }
+.uh-verdict { margin: 8px 0; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;
+  background: rgba(143,181,115,.12); color: var(--ok); }
+.uh-verdict.u-warn { background: rgba(217,164,65,.14); color: var(--warn); }
+.uh-verdict.u-err { background: rgba(224,108,108,.14); color: var(--err); }
+.uh-head { color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: .5px; margin: 12px 0 5px; }
+.uh-day { display: flex; align-items: center; gap: 6px; font-size: 10px; padding: 1px 0; }
+.uh-daylbl { color: var(--text-dim); width: 54px; flex: none; }
+.uh-daybar { flex: 1; height: 7px; background: #2a2a28; border-radius: 3px; overflow: hidden; }
+.uh-dayfill { display: block; height: 100%; background: var(--accent); }
+.uh-dayval { color: var(--text); width: 48px; text-align: right; flex: none; font-variant-numeric: tabular-nums; }
 
 /* ---- layout ---- */
+/* Lebar sidebar & board via variabel (disimpan ke localStorage, dipulihkan saat buka).
+   Kolom resizer tipis di antara panel; chat (1fr) mengisi sisa. */
+:root { --w-side: 300px; --w-board: 320px; }
 .layout {
   flex: 1;
   display: grid;
-  grid-template-columns: 300px 1fr 320px;
+  grid-template-columns: var(--w-side) 5px 1fr 5px var(--w-board);
   gap: 1px;
   background: var(--border);
   min-height: 0;
 }
+.col-resizer {
+  background: var(--border); cursor: col-resize; position: relative; z-index: 5;
+}
+.col-resizer:hover, .col-resizer.dragging { background: var(--accent); }
+/* Zona tangkap lebih lebar dari garis tipisnya supaya gampang di-grab. */
+.col-resizer::after { content: ''; position: absolute; inset: 0 -3px; }
 .panel { background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
 .panel-head {
   padding: 7px 12px;
@@ -270,6 +295,14 @@ body.reordering .node { cursor: grabbing; }
 }
 .loop-btn:hover { border-color: var(--accent); color: var(--accent); }
 .loop-btn.on { color: var(--ok); border-color: var(--ok); background: rgba(143, 181, 115, .12); }
+/* Toggle mode Chat(lite)↔Orkestrator. Default (lite) = netral; .on = orkestrator (mode berat) → accent. */
+.lite-btn {
+  display: none; margin-left: auto; background: transparent; color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 3px; padding: 2px 8px; font-size: 11px;
+  cursor: pointer; font-family: var(--mono); white-space: nowrap;
+}
+.lite-btn:hover { border-color: var(--accent); color: var(--accent); }
+.lite-btn.on { color: var(--accent); border-color: var(--accent); background: rgba(217, 119, 87, .12); }
 /* ---- panel MEMORI ---- */
 .mem-list { overflow: auto; padding: 8px; max-height: 220px; display: flex; flex-direction: column; gap: 6px; }
 .mem-empty { color: var(--text-dim); font-size: 11px; }

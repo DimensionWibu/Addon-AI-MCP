@@ -38,6 +38,8 @@ export interface GroveHost {
   getSessionLaunch(sessionId: string): { env: Record<string, string>; model?: string } | null
   /** Dipanggil Session saat ia tak bisa jalan karena belum ada akun/token → UI memunculkan notifikasi. */
   onAccountMissing(sessionId: string): void
+  /** Dipanggil Session tiap respons API → catat token ke riwayat pemakaian lokal (per jam/akun). */
+  recordUsage(sessionId: string, u: { input: number; cacheRead: number; cacheCreation: number; output: number }): void
   /** Dipanggil Session saat turn gagal karena limit — untuk auto-switch akun bila aktif. */
   onLimitHit(sessionId: string): void
   /** Dipanggil Session saat ctx% ≥ ambang → auto-compact (padatkan konteks, cegah freeze). */
