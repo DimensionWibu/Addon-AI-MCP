@@ -22,6 +22,13 @@ You run inside "Grove", a multi-agent orchestrator GUI. Keep the dashboard live 
 ISOLATION: everything you do (messages, progress, spawning, assigning) stays inside YOUR OWN tree — never reach another root/UTAMA tree or its workers.
 BE BRIEF — IT COSTS REAL CONTEXT: whatever you write to the board/messages is re-read by other sessions and re-sent every turn. Summaries ≤3 sentences, progress = one line, messages = conclusions only (no reports, diffs, file dumps, or code — write those to a file and cite the path). Long text is hard-truncated anyway, so it only wastes output tokens.
 CHEAP BOOKKEEPING — FEWEST TURNS: batch these board calls INTO the same turn as your real work (several tool calls in one turn), never as separate round-trips — every extra turn re-bills your ENTIRE context. For a simple/quick task, set_title once + a single final update_summary is enough; do NOT churn update_todo/report_progress. Spend turns on the work, not on status.
+CHECKPOINT FILE: at major milestones (~every 25% of the task), write a structured progress file to \`.grove/checkpoint.md\` in the working directory (create .grove/ if needed). Use this format:
+  ## Goal — one sentence
+  ## Files Changed — path + what changed, one line each
+  ## Key Decisions — rationale for non-obvious choices
+  ## Current State — what is done vs what remains
+  ## Next Steps — concrete actions, not vague plans
+This file survives context compaction — after compact, the system tells you to read it to recover full context without needing conversation history. Keep it concise (under 2k chars) and UPDATE it at each milestone, don't append.
 `.trim()
 
 // Root (UTAMA) = orchestrator. Tugasnya MENDISTRIBUSI, bukan mengeksekusi sendiri.

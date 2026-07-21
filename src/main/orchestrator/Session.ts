@@ -367,6 +367,8 @@ export class Session {
   private deltaBuf = ''
   private deltaTimer: NodeJS.Timeout | null = null
   private lastCtxPersist = 0 // B3: kapan terakhir ctx/usage ditulis ke DB (throttle persist)
+  /** Waktu terakhir API merespons (dari applyUsage). Dipakai SessionManager untuk tahu kapan cache perlu di-warm. */
+  lastApiActivity = 0
 
   constructor(
     meta: SessionMeta,
@@ -634,6 +636,17 @@ export class Session {
     if (this.stopped) return
     this.record({ role: 'system', text: '🔁 Auto-check berkala: "udah sampe mana?"', ts: Date.now() })
     this.injectAutoTask(prompt)
+  }
+
+  /**
+   * Cache warm: inject prompt minimal untuk menjaga prefix ter-cache di API (Pro TTL 1 jam).
+   * TIDAK merekam ke chat/DB (injectAutoTask); model hanya balas 1 kata → biaya output minimal.
+   * Dipanggil SessionManager saat sesi idle mendekati batas TTL cache.
+   */
+  cacheWarm(): void {
+    if (this.stopped) return
+    this.record({ role: 'system', text: '🔄 Cache prefix di-refresh', ts: Date.now() })
+    this.injectAutoTask('[GROVE CACHE-WARM] Prefix cache refresh. Reply with exactly one word: OK — no tools, no analysis, no other text.')
   }
 
   /** Saat app dibuka lagi: sesi yang tadinya kerja → resume konteks & dorong lanjut. */
@@ -1232,6 +1245,7 @@ export class Session {
       cacheCreation: usage.cache_creation_input_tokens ?? 0,
       output: ctxOutput
     })
+    this.lastApiActivity = Date.now()
     this.meta.ctxInput = ctxInput
     this.meta.ctxOutput = ctxOutput
     this.tokensTotal += ctxOutput

@@ -35,8 +35,12 @@ const DEFAULT_MODEL: string | undefined = undefined // undefined = ikut default 
 // Tiap wake = SATU giliran root penuh (konteks root dikirim ulang → biaya usage nyata).
 // Debounce panjang menggabungkan banyak laporan worker jadi 1 giliran saja (hemat besar).
 const ROOT_STATUS_DEBOUNCE_MS = 60_000
-const LOOP_INTERVAL_MS = 10 * 60_000 // auto-check "udah sampe mana?" tiap 10 menit (bisa diubah)
-const IDLE_CHECK_LIMIT = 3 // auto-check beruntun tanpa perubahan → stop loop (cegah bakar usage)
+const LOOP_INTERVAL_MS = 10 * 60_000 // auto-check "udah sampe mana?" tiap 10 menit
+const IDLE_CHECK_LIMIT = 3 // auto-check beruntun tanpa perubahan → beralih ke mode cache-warm
+// Cache warm: setelah auto-check berhenti (idle-strike), lanjut ping ringan agar prefix prompt tetap
+// ter-cache di API. Pro plan = TTL 1 jam; interval HARUS di bawah TTL supaya cache tak expire.
+const CACHE_WARM_INTERVAL_MS = 45 * 60_000 // 45 menit — aman di bawah TTL 1 jam (Pro)
+const CACHE_WARM_STALE_MS = 50 * 60_000 // anggap cache stale bila tak ada API call selama ini
 const LIMIT_COOLDOWN_MS = 30 * 60_000 // akun yang kena limit dianggap "tak tersedia" selama ini
 // Ambang BAWAAN: pindah akun SEBELUM kena limit (bukan setelah). Dipakai akun yang tak menyetel
 // ambangnya sendiri (Account.switchPct). Nilai efektif per akun → switchPctFor().
@@ -86,6 +90,7 @@ export class SessionManager implements GroveHost {
   private readonly limitedAt = new Map<string, number>() // accountKey → kapan terbukti kena limit
   private readonly loopTimers = new Map<string, NodeJS.Timeout>() // rootId → timer auto-check berkala
   private readonly loopEnabled = new Set<string>() // rootId dengan auto-check aktif
+  private readonly loopCacheWarmMode = new Set<string>() // rootId yang sudah beralih ke mode cache-warm (setelah idle-strike habis)
   // Buffer coalesce laporan worker → parentId → (workerId → laporan TERBARU worker itu).
   // Map per-worker = DEDUPE otomatis: progres lama ditimpa, hanya yang terakhir yang dikirim.
   private readonly pendingReports = new Map<string, Map<string, PendingWorkerReport>>()
@@ -986,10 +991,10 @@ export class SessionManager implements GroveHost {
       if (b?.progress) lines.push(`    progres: ${b.progress}`)
       if (b?.todo?.length) lines.push(`    todo: ${b.todo.map((t) => `${t.done ? '✓' : '○'} ${t.text}`).join('; ')}`)
     }
-    const summary = `Ringkasan tugas pohon ini (dari laporan worker, hasil compact):\n${lines.join('\n') || '(belum ada laporan board)'}`
+    const summary = `Ringkasan tugas pohon ini (dari laporan worker, hasil compact):\n${lines.join('\n') || '(belum ada laporan board)'}\n\nJika ada file .grove/checkpoint.md di working directory, BACA file itu untuk konteks detail (file list, keputusan, next steps) yang tidak terekam di ringkasan ini.`
     const mem = this.db.addMemory(treeId, rootId, summary, Date.now())
     this.emit({ channel: 'memory:new', payload: mem })
-    root.compactWith(summary) // reset konteks seketika + seed ringkasan untuk pesan berikutnya
+    root.compactWith(summary)
   }
 
   /** GroveHost.notifyHighContext — ctx% ≥ ambang → auto-compact sesi ini (root=pohon, sub=diri). */
@@ -1006,6 +1011,7 @@ export class SessionManager implements GroveHost {
     if (b?.summary) parts.push(`Ringkasan: ${b.summary}`)
     if (b?.progress) parts.push(`Progres terakhir: ${b.progress}`)
     if (b?.todo?.length) parts.push(`Todo: ${b.todo.map((t) => `${t.done ? '✓' : '○'} ${t.text}`).join('; ')}`)
+    parts.push(`Jika ada file .grove/checkpoint.md di working directory, BACA file itu untuk konteks detail.`)
     const summary = `Ringkasan tugasmu (auto-compact karena konteks nyaris penuh):\n${parts.join('\n')}`
     const mem = this.db.addMemory(s.meta.treeId, sessionId, summary, Date.now())
     this.emit({ channel: 'memory:new', payload: mem })
@@ -1028,6 +1034,7 @@ export class SessionManager implements GroveHost {
     if (!root || root.meta.role !== 'root') return
     const wasOff = !this.loopEnabled.has(rootId)
     this.loopEnabled.add(rootId)
+    this.loopCacheWarmMode.delete(rootId) // tugas baru → keluar mode cache-warm, kembali auto-check normal
     this.loopIdleStreak.delete(rootId) // tugas baru → rantai "tanpa perubahan" direset
     this.lastLoopSummary.delete(rootId)
     this.loopDonePinged.delete(rootId) // tugas baru → ping penutup boleh dikirim lagi nanti
@@ -1037,6 +1044,7 @@ export class SessionManager implements GroveHost {
 
   private stopLoop(rootId: string): void {
     this.clearLoopTimer(rootId)
+    this.loopCacheWarmMode.delete(rootId)
     if (this.loopEnabled.delete(rootId)) {
       this.emit({ channel: 'session:update', payload: { id: rootId, loopActive: false } })
     }
@@ -1048,9 +1056,9 @@ export class SessionManager implements GroveHost {
     this.loopTimers.delete(rootId)
   }
 
-  private scheduleLoop(rootId: string): void {
+  private scheduleLoop(rootId: string, intervalMs?: number): void {
     this.clearLoopTimer(rootId)
-    this.loopTimers.set(rootId, setTimeout(() => this.runLoopCheck(rootId), LOOP_INTERVAL_MS))
+    this.loopTimers.set(rootId, setTimeout(() => this.runLoopCheck(rootId), intervalMs ?? LOOP_INTERVAL_MS))
   }
 
   /**
@@ -1060,6 +1068,10 @@ export class SessionManager implements GroveHost {
    *
    * Tick DILEWATI (tanpa giliran) bila: root sedang running, belum ada worker, semua worker masih
    * running, ATAU sudah tak ada info baru (lihat aturan streak di bawah).
+   *
+   * Setelah IDLE_CHECK_LIMIT tercapai: TIDAK berhenti total — beralih ke MODE CACHE-WARM: ping
+   * ringan (cacheWarm) dengan interval CACHE_WARM_INTERVAL_MS agar prefix prompt tetap ter-cache
+   * di API (Pro plan TTL 1 jam). Cache-warm dihentikan hanya oleh task_done atau tugas baru.
    */
   private runLoopCheck(rootId: string): void {
     this.loopTimers.delete(rootId)
@@ -1069,19 +1081,24 @@ export class SessionManager implements GroveHost {
       this.stopLoop(rootId)
       return
     }
+
+    // ---- MODE CACHE-WARM: ping ringan, interval panjang, tujuannya hanya refresh cache prefix ----
+    if (this.loopCacheWarmMode.has(rootId)) {
+      if (root.meta.status !== 'running') {
+        const stale = Date.now() - root.lastApiActivity > CACHE_WARM_STALE_MS
+        if (stale) root.cacheWarm()
+      }
+      this.scheduleLoop(rootId, CACHE_WARM_INTERVAL_MS)
+      return
+    }
+
+    // ---- MODE AUTO-CHECK NORMAL ----
     const subs = [...this.sessions.values()].filter((s) => s.meta.treeId === rootId && s.meta.role === 'sub')
-    // BEDAKAN dgn hati-hati: 'done' = benar-benar tuntas (markDone / report_to_parent 100%).
-    // 'idle'/'error' = tak jalan TAPI belum tuntas = MANDEK — justru inilah yang auto-check ada untuk
-    // mengejarnya, jadi TIDAK boleh disamakan dengan selesai. (Dulu `status !== 'running'` menyatukan
-    // keduanya, sehingga tree yang seluruh workernya SUDAH SELESAI tetap dipingg berkali-kali.)
     const stalled = subs.filter((s) => s.meta.status !== 'running' && s.meta.status !== 'done')
     const allDone = subs.length > 0 && subs.every((s) => s.meta.status === 'done')
-    if (!allDone) this.loopDonePinged.delete(rootId) // keadaan berubah → ping penutup boleh lagi nanti
-    // Layak ditanya kalau ada worker MANDEK, atau tree baru saja tuntas (butuh 1 ping penutup).
+    if (!allDone) this.loopDonePinged.delete(rootId)
     const worthAsking = subs.length > 0 && (stalled.length > 0 || allDone)
     if (root.meta.status !== 'running' && worthAsking) {
-      // Signature dari baris SUB saja (status+percent+progress) — stabil terhadap aksi root sendiri,
-      // sehingga hitungan 3-strike deterministik dan loop PASTI berhenti.
       const sig = this.subBoardSignature(rootId)
       const unchanged = this.lastLoopSummary.get(rootId) === sig
       const streak = unchanged ? (this.loopIdleStreak.get(rootId) ?? 0) + 1 : 0
@@ -1089,27 +1106,26 @@ export class SessionManager implements GroveHost {
       this.lastLoopSummary.set(rootId, sig)
       if (streak >= IDLE_CHECK_LIMIT) {
         root.systemNote(
-          `⏹ Auto-check dihentikan: ${IDLE_CHECK_LIMIT}× berturut tak ada perubahan (kemungkinan sudah selesai). Nyala lagi otomatis saat kamu kirim tugas baru.`
+          `⏹ Auto-check dihentikan: ${IDLE_CHECK_LIMIT}× berturut tak ada perubahan. Cache prefix tetap dijaga. Nyala lagi otomatis saat kamu kirim tugas baru.`
         )
-        this.stopLoop(rootId)
+        this.loopCacheWarmMode.add(rootId)
+        this.scheduleLoop(rootId, CACHE_WARM_INTERVAL_MS)
         return
       }
       if (allDone) {
-        // Tree TUNTAS → cukup SATU ping penutup (ajak sintesis akhir + task_done). Tick berikutnya
-        // diam; streak tetap naik sehingga loop berhenti sendiri lewat cabang IDLE_CHECK_LIMIT.
         if (!this.loopDonePinged.has(rootId)) {
           this.loopDonePinged.add(rootId)
           root.autoCheck(this.loopCheckPrompt(rootId))
         }
       } else if (streak <= 1) {
-        // Ping PERTAMA (streak 0) + SATU pengulangan (streak 1). Pengulangan itu WAJIB: worker yang
-        // MANDEK justru TIDAK mengubah board, jadi kalau semua tick unchanged di-skip, kasus mandek
-        // tak akan pernah terkejar. Mulai streak ≥2 board tetap sama & root sudah 2× diberi tahu →
-        // giliran tambahan murni redundan (payload byte-identik) → dilewati.
         root.autoCheck(this.loopCheckPrompt(rootId))
       }
+    } else if (root.meta.status !== 'running' && !worthAsking) {
+      // Tak ada worker / semua worker baik-baik saja → tak perlu auto-check, tapi jaga cache.
+      const stale = Date.now() - root.lastApiActivity > CACHE_WARM_STALE_MS
+      if (stale) root.cacheWarm()
     }
-    this.scheduleLoop(rootId) // ulangi sampai task_done / dimatikan manual
+    this.scheduleLoop(rootId)
   }
 
   /**
@@ -1164,6 +1180,7 @@ export class SessionManager implements GroveHost {
       await this.sessions.get(sid)?.stop()
       this.clearLoopTimer(sid)
       this.loopEnabled.delete(sid)
+      this.loopCacheWarmMode.delete(sid)
       this.loopIdleStreak.delete(sid) // state auto-check milik sesi ini → jangan tinggalkan sisa
       this.lastLoopSummary.delete(sid)
       this.loopDonePinged.delete(sid)
