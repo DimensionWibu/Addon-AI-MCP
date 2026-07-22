@@ -7,6 +7,9 @@ export function contextWindowFor(model?: string): number {
   if (!model) return DEFAULT_WINDOW
   const m = model.toLowerCase()
   if (m.includes('[1m]') || m.includes('-1m') || m.includes('1m]')) return 1_000_000
+  // DeepSeek v4 (pro/flash) = ~1 juta token → tanpa ini, % konteks tampil 5× lebih besar dari nyata
+  // dan auto-compact akan memotong percakapan jauh sebelum waktunya.
+  if (m.startsWith('deepseek')) return 1_000_000
   // opus / sonnet / haiku modern = 200k
   return DEFAULT_WINDOW
 }

@@ -10,11 +10,14 @@
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "start": "electron-vite dev",
+    "app": "electron-vite build && electron-vite preview",
     "test": "tsx test/integration.ts",
     "test:cost": "tsx test/token-cost.ts",
+    "test:deepseek": "tsx test/deepseek-live.ts",
     "dist": "electron-vite build && electron-builder --win",
     "dist:dir": "electron-vite build && electron-builder --win --dir",
-    "test:accounts": "esbuild test/account-resolution.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/acct.mjs && electron .tmp/acct.mjs"
+    "test:accounts": "esbuild test/account-resolution.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/acct.mjs && electron .tmp/acct.mjs",
+    "test:wake": "tsx test/wake-cost.ts && esbuild test/wake-integration.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/wake.mjs && electron .tmp/wake.mjs"
   },
   "build": {
     "appId": "com.grove.orchestrator",
@@ -60,6 +63,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.214",
+    "js-yaml": "^4.1.0",
     "sql.js": "^1.14.1",
     "zod": "^4.4.3"
   },

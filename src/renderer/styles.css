@@ -84,6 +84,63 @@ button, input { font-family: var(--mono); }
 .ap-pct { width: 56px; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 3px; padding: 2px 5px; font-size: 11px; font-family: var(--mono); }
 .ap-dead { color: var(--err); cursor: help; }
 .ap-prov { font-size: 9px; color: var(--accent); border: 1px solid var(--accent); border-radius: 8px; padding: 0 6px; white-space: nowrap; }
+
+/* ---- Panel Tools: diff checker berwarna + formatter JSON/YAML (renderer-only) ---- */
+.tools-panel {
+  position: absolute; top: 46px; right: 12px; z-index: 60; width: 620px; max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 64px); overflow-y: auto;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+  padding: 12px 14px; display: none; box-shadow: 0 10px 30px rgba(0, 0, 0, .55);
+}
+.tools-panel.show { display: block; }
+.tools-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+.tools-tab {
+  background: var(--panel); color: var(--text-dim); border: 1px solid var(--border);
+  border-radius: 3px; padding: 4px 14px; font-size: 12px; cursor: pointer; font-family: var(--mono);
+}
+.tools-tab:hover { border-color: var(--accent); color: var(--accent); }
+.tools-tab.active { background: var(--accent); color: #1a0e08; border-color: var(--accent); font-weight: 700; }
+.tools-sec { display: flex; flex-direction: column; gap: 8px; }
+.tools-grid2 { display: flex; gap: 10px; }
+.tools-col { flex: 1; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.tools-lbl { color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: .5px; }
+.tools-ta {
+  width: 100%; background: var(--panel); color: var(--text); border: 1px solid var(--border);
+  border-radius: 3px; padding: 6px 8px; font-size: 12px; font-family: var(--mono); line-height: 1.5; resize: vertical;
+}
+.tools-ta:focus { outline: none; border-color: var(--accent); }
+.tools-out { background: #191817; }
+.tools-sel {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 3px; padding: 3px 6px; font-size: 12px; font-family: var(--mono); cursor: pointer;
+}
+.tools-sel:hover { border-color: var(--accent); }
+.tools-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tools-btn {
+  background: var(--panel); color: var(--text); border: 1px solid var(--border);
+  border-radius: 3px; padding: 5px 12px; font-size: 12px; cursor: pointer; font-family: var(--mono);
+}
+.tools-btn:hover { border-color: var(--accent); color: var(--accent); }
+.tools-btn.primary { background: var(--accent); color: #1a0e08; border-color: var(--accent); font-weight: 700; }
+.tools-btn.primary:hover { background: var(--accent-2); color: #1a0e08; }
+.tools-stat { color: var(--text-dim); font-size: 11px; margin-left: auto; }
+.tools-msg { font-size: 11px; min-height: 14px; color: var(--text-dim); }
+.tools-msg.ok { color: var(--ok); }
+.tools-msg.err { color: var(--err); white-space: pre-wrap; word-break: break-word; }
+/* Output diff: monospace, satu baris per baris, warna add (hijau) / hapus (merah) / sama (abu). */
+.diff-out {
+  background: #191817; border: 1px solid var(--border); border-radius: 3px;
+  padding: 6px 0; max-height: 340px; overflow: auto; font-size: 12px; line-height: 1.5;
+}
+.diff-line { display: block; width: max-content; min-width: 100%; white-space: pre; padding: 0 8px; }
+.diff-sign { display: inline-block; width: 1.4ch; color: var(--text-dim); user-select: none; }
+.diff-eq { color: var(--text-dim); }
+.diff-add { background: rgba(143, 181, 115, .14); color: #b6d89a; }
+.diff-add .diff-sign { color: var(--ok); }
+.diff-del { background: rgba(224, 108, 108, .14); color: #e8a0a0; }
+.diff-del .diff-sign { color: var(--err); }
+.diff-msg { padding: 4px 8px; color: var(--text-dim); font-size: 11px; }
+
 /* Context menu klik-kanan kartu sesi (akun & model per-chat). */
 .ctx-menu {
   position: fixed; z-index: 200; min-width: 210px; max-width: 320px; background: var(--panel-2);
@@ -157,6 +214,8 @@ button, input { font-family: var(--mono); }
 #usage-history { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; }
 .uh-row { display: flex; justify-content: space-between; align-items: baseline; padding: 3px 0; font-size: 12px; }
 .uh-name { color: var(--text-dim); }
+/* baris turunan (mis. rincian biaya di bawah baris saldo akun DeepSeek) */
+.uh-name.uh-sub { padding-left: 10px; opacity: .8; font-size: 10px; }
 .uh-val { color: #f0ede2; font-variant-numeric: tabular-nums; }
 .uh-out { color: var(--text-dim); font-size: 10px; }
 .uh-verdict { margin: 8px 0; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;
@@ -332,7 +391,66 @@ body.reordering .node { cursor: grabbing; }
   border-left: 2px solid var(--accent); border-radius: 3px; font-family: var(--mono); font-size: 11px;
   color: var(--text); white-space: pre-wrap; word-break: break-word; overflow: auto; max-height: 340px;
 }
+/* antrian pesan yang ditahan selama turn jalan — masih bisa diedit (✎) / dibatalkan (✕) */
+.chat-queue { display: none; flex-wrap: wrap; gap: 6px; padding: 4px 0; }
+.queue-chip {
+  display: flex; align-items: center; gap: 6px; max-width: 100%;
+  background: var(--panel-2); border: 1px dashed var(--border); border-radius: 4px; padding: 3px 8px;
+  font-size: 11px; color: var(--text-dim);
+}
+.queue-chip.editing { border-color: var(--accent); color: var(--text); border-style: solid; }
+.queue-chip .queue-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 46ch; }
+.queue-btn {
+  background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 11px; padding: 0 2px;
+}
+.queue-btn:hover { color: var(--accent); }
+/* kolom chat sedang MENGEDIT antrian → beri tanda jelas supaya Enter tak dikira kirim pesan baru */
+form.editing-queue textarea { border-color: var(--accent); }
+
+/* dialog konfirmasi DALAM halaman (pengganti window.confirm native yang mencuri fokus keyboard) */
+.modal-back {
+  position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center;
+  justify-content: center; z-index: 999;
+}
+.modal-box {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 16px 18px;
+  max-width: 520px; box-shadow: 0 10px 40px rgba(0,0,0,.5);
+}
+.modal-text { color: var(--text); font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+.modal-btn {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 4px;
+  padding: 6px 12px; font-size: 12px; cursor: pointer; font-family: inherit;
+}
+.modal-btn:hover { border-color: var(--accent); }
+.modal-btn.danger { background: var(--accent); color: #1a1a19; border-color: var(--accent); font-weight: 600; }
+
+/* diff tool file: pratinjau (tertutup) & detail penuh (dibuka) — warna sama supaya konsisten */
+.msg.tool .tool-preview {
+  margin: 2px 0 2px 14px; padding: 3px 8px; border-left: 2px solid var(--border);
+  font-family: var(--mono); font-size: 11px; white-space: pre-wrap; word-break: break-word;
+  max-height: 120px; overflow: hidden; cursor: pointer;
+}
+.d-add { color: #7ec77a; }
+.d-del { color: #e06c6c; }
+.d-hunk { color: var(--accent); }
+.d-out { color: var(--text-dim); }
+.d-more { color: var(--text-dim); font-style: italic; }
 .msg.system { color: var(--err); }
+/* /btw — tanya-jawab SAMPINGAN. Sengaja dibedakan tajam dari percakapan utama: ini TIDAK masuk
+   konteks sesi & tidak mengubah pekerjaan yang sedang jalan. */
+.msg.side {
+  border-left: 2px solid var(--accent); padding: 4px 0 4px 8px; margin: 4px 0;
+  color: var(--text-dim); font-size: 12px; white-space: pre-wrap;
+}
+.msg.side::before { content: '💬 btw '; color: var(--accent); font-size: 10px; letter-spacing: .4px; }
+/* metrik satu respons API, inline di chat (dulu hanya ada di panel LOG → tampil dobel).
+   Sengaja redup & kecil: penanda biaya di tempat kejadian, bukan isi percakapan. */
+.msg.meter {
+  color: var(--text-dim); font-size: 10px; font-family: var(--mono); font-variant-numeric: tabular-nums;
+  opacity: .75; margin: 1px 0 1px 12px; cursor: help;
+}
+.msg.meter:hover { opacity: 1; }
 /* garis pembatas reset konteks (recycle/compact) */
 .msg.divider { display: flex; align-items: center; gap: 10px; margin: 12px 0; }
 .msg.divider .divider-line { flex: 1; height: 1px; background: var(--accent); opacity: .35; }
@@ -387,6 +505,50 @@ body.reordering .node { cursor: grabbing; }
 }
 .chat-form button:hover { background: var(--accent-2); }
 .chat-form button:disabled, .chat-form textarea:disabled { opacity: .5; cursor: not-allowed; }
+
+/* ---- panel LOG (pohon per-turn di bawah composer) ---- */
+.logpanel { flex: none; border-top: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; max-height: 240px; min-height: 0; }
+.logpanel-head {
+  display: flex; align-items: center; gap: 6px; padding: 6px 12px; cursor: pointer; user-select: none;
+  font-size: 11px; letter-spacing: .5px; text-transform: uppercase; color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+}
+.logpanel-head:hover { color: var(--accent); }
+.logpanel-head .log-caret { color: var(--accent); font-size: 10px; width: 10px; }
+.logpanel-head .log-hint { margin-left: auto; text-transform: none; letter-spacing: 0; color: #5a5a5a; font-size: 10px; }
+.log-tree { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 6px 8px; display: flex; flex-direction: column; gap: 4px; }
+.log-tree[hidden] { display: none; }
+.log-turn { border-left: 2px solid var(--accent); background: var(--panel-2); border-radius: 3px; }
+.log-turn-head { display: flex; align-items: baseline; gap: 6px; padding: 5px 8px; cursor: pointer; }
+.log-turn-head:hover { background: rgba(217, 119, 87, .08); }
+.log-turn-head .log-caret2 { color: var(--accent); font-size: 10px; width: 10px; flex: none; }
+.log-turn-label { flex: 1; color: var(--accent); font-weight: 600; font-size: 12px; word-break: break-word; }
+.log-turn-meta { color: var(--text-dim); font-size: 10px; white-space: nowrap; display: flex; align-items: baseline; }
+.log-turn-time { font-variant-numeric: tabular-nums; }
+/* ringkasan token per-turn di header (Nx call · out Σ · ctx▲) — penanda "berat" */
+.log-turn-usage { color: var(--accent-2); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.log-done { color: var(--ok); }
+.log-turn-body { padding: 0 6px 5px 16px; display: flex; flex-direction: column; gap: 2px; }
+.log-turn-body[hidden] { display: none; }
+.log-child { font-size: 11px; }
+.log-child-head { display: flex; align-items: baseline; gap: 4px; cursor: pointer; color: var(--text-dim); border-radius: 3px; }
+.log-child-head:hover { color: var(--text); }
+.log-child-head .log-caret2 { color: var(--text-dim); font-size: 9px; width: 9px; flex: none; }
+.log-child-head .log-resp { color: var(--text); }
+.log-child-head .log-tool { color: var(--text-dim); }
+/* node REQUEST: teks mentah yang Grove kirim ke query() (bukan body HTTP byte-exact — lihat tooltip) */
+.log-child-head .log-req { color: var(--accent); font-weight: 600; }
+/* ukuran byte per node (di-update saat output tool tiba) */
+.log-bytes { color: #6f6c63; font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* baris rincian token per-call (bukti "berat"): non-expandable, dim, tabular */
+.log-usage { color: var(--text-dim); font-size: 10px; font-variant-numeric: tabular-nums; padding-left: 13px; opacity: .85; }
+.log-sys { color: var(--err); padding-left: 13px; }
+.log-child-detail {
+  margin: 2px 0 3px; padding: 6px 8px; background: var(--bg); border: 1px solid var(--border);
+  border-left: 2px solid var(--accent); border-radius: 3px; font-family: var(--mono); font-size: 11px;
+  color: var(--text); white-space: pre-wrap; word-break: break-word; overflow: auto; max-height: 260px;
+}
+.log-child-detail[hidden] { display: none; }
 
 /* gambar di dalam pesan */
 .msg-img { display: block; max-width: 280px; max-height: 220px; border-radius: 4px; border: 1px solid var(--border); margin-top: 5px; }

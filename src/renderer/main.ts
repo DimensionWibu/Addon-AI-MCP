@@ -2,6 +2,8 @@ import type {
   Account,
   BoardEntry,
   ChatMessage,
+  DeepseekAccountCost,
+  EffortSetting,
   GroveEvent,
   ImageAttachment,
   InboxMessage,
@@ -14,13 +16,24 @@ import type {
   UsageWindow
 } from '../shared/types'
 import {
+  CURSOR_BASE_URL_DEFAULT,
+  CURSOR_MODEL_SUGGESTIONS,
   CUSTOM_BASE_URL_DEFAULT,
   CUSTOM_MODEL,
   CUSTOM_MODEL_SUGGESTIONS,
+  DEEPSEEK_MODEL_DEFAULT,
+  DEEPSEEK_MODEL_SUGGESTIONS,
+  deepseekCostUsd,
+  deepseekPriceLabel,
+  EFFORT_OPTIONS,
+  effortLabel,
+  isDeepSeekModel,
   MODEL_OPTIONS,
   modelLabel,
-  OPENROUTER_MODEL_SUGGESTIONS
+  OPENROUTER_MODEL_SUGGESTIONS,
+  usesOwnBaseUrl
 } from '../shared/types'
+import { dump as yamlDump, load as yamlLoad } from 'js-yaml'
 
 let pendingImages: ImageAttachment[] = []
 let pendingRefs: string[] = [] // path file/folder referensi
@@ -56,6 +69,7 @@ let autoResume = false // lanjutkan sesi yang tadi kerja saat app dibuka lagi
 let defaultSwitchPct = 90 // ambang untuk akun yang tak punya ambang sendiri
 let defaultAccountId: string | null = null // akun global (dipakai pohon yang tak menentukan sendiri)
 let defaultModel: string | null = null // model global (dipakai sesi yang tak menentukan sendiri)
+let defaultEffort: EffortSetting | null = null // tingkat mikir global (null = default model)
 let orModels: OpenRouterModel[] = [] // daftar model OpenRouter (dukung tools) untuk sesi ber-akun OR
 let activeId: string | null = null
 let pendingEl: HTMLElement | null = null
@@ -68,6 +82,32 @@ const activities = new Map<string, string>()
 
 // Panel detail tool (untuk update saat output tool tiba) — key = toolUseId, di sesi aktif.
 const toolDetailEls = new Map<string, HTMLElement>()
+
+// ---- panel REQUEST (bekas panel LOG) state ---------------------------------
+// Daftar teks MENTAH yang Grove kirim ke query() per giliran, untuk SESI AKTIF. Murni renderer.
+type LogChild = Record<string, never>
+
+// Nomor call API dalam giliran berjalan → dipakai baris metrik inline di chat ("↳ call 3 · ctx …").
+let chatCallSeq = 0
+// Panel bawah TIDAK LAGI menyalin isi chat (dulu tiap tool/respons tampil dua kali: di chat DAN di
+// LOG). Sekarang ia hanya menampung yang TAK ADA di chat: teks REQUEST mentah yang Grove kirim ke
+// query() — termasuk auto-task & recycle yang memang tak pernah direkam ke chat. Metrik per-call
+// (ctx/fresh/cache/out) pindah jadi baris inline di chat.
+type LogTurn = {
+  wrap: HTMLElement
+  caret: HTMLElement
+  body: HTMLElement // container node REQUEST
+  meta: HTMLElement // label jam + penanda selesai
+  usageEl: HTMLElement // ringkasan token per-turn (n× call · Σout · ctx▲) di header
+  children: LogChild[]
+  done: boolean
+  calls: number // jumlah respons API (call) di turn ini
+  outSum: number // total token output turn ini
+  ctxMax: number // konteks call terbesar (bukti "berat": tokens yang dikirim tiap call)
+}
+const logTurns: LogTurn[] = []
+let logCollapsed = true // panel diagnosa → tertutup secara default (isi chat sudah lengkap)
+const MAX_LOG_TURNS = 60 // batasi node → anti-lag (mirip MAX_CHAT_DOM)
 
 // Kapan tiap sesi terakhir aktif — dipakai menampilkan jam kerja terakhir untuk idle/done.
 const lastActive = new Map<string, number>()
@@ -187,6 +227,13 @@ function fmtTok(n: number): string {
   return String(Math.round(n))
 }
 
+/** Uang: kecil-kecil tetap harus kelihatan (biaya per hari bisa < 1 sen). */
+function fmtUsd(n: number): string {
+  if (n >= 1) return `$${n.toFixed(2)}`
+  if (n >= 0.01) return `$${n.toFixed(3)}`
+  return `$${n.toFixed(4)}`
+}
+
 /**
  * Riwayat pemakaian token TERCATAT DI PC INI (jam/hari/minggu + tren harian), dari DB lokal.
  * Ini AKUMULASI token nyata tiap respons API — beda dari "BATAS PEMAKAIAN" di atas yang merupakan
@@ -282,12 +329,34 @@ async function renderUsageHistory(): Promise<void> {
   if (s.byAccount.length > 1) {
     html += '<div class="uh-head">Per akun (7 hari · setara-biaya)</div>'
     for (const a of s.byAccount) {
-      const tag = a.provider === 'custom' ? ' ⟨GM⟩' : a.provider === 'openrouter' ? ' ⟨OR⟩' : ''
+      const tag =
+        a.provider === 'custom'
+          ? ' ⟨GM⟩'
+          : a.provider === 'cursor'
+            ? ' ⟨CR⟩'
+            : a.provider === 'openrouter'
+              ? ' ⟨OR⟩'
+              : a.provider === 'deepseek'
+                ? ' ⟨DS⟩'
+                : ''
+      // Akun DeepSeek: tampilkan DOLAR NYATA — "setara-biaya" itu bobot ala Claude, tak berlaku di sini.
+      const dsUsd =
+        a.provider === 'deepseek'
+          ? deepseekCostUsd(a.week, accounts.find((x) => x.id === a.accountId)?.model)
+          : null
       html += `<div class="uh-row" title="${escapeHtml(
-        `output ${fmtTok(a.week.output)} · cache ${fmtTok(cacheOf(a.week))}`
-      )}"><span class="uh-name">${escapeHtml(a.label)}${tag}</span><span class="uh-val">${fmtTok(eff(a.week))}</span></div>`
+        `output ${fmtTok(a.week.output)} · cache ${fmtTok(cacheOf(a.week))}${
+          dsUsd != null ? ` · biaya nyata ${fmtUsd(dsUsd)}` : ''
+        }`
+      )}"><span class="uh-name">${escapeHtml(a.label)}${tag}</span><span class="uh-val">${
+        dsUsd != null ? fmtUsd(dsUsd) : fmtTok(eff(a.week))
+      }</span></div>`
     }
   }
+
+  // SALDO & BIAYA DeepSeek — disisipkan setelah render utama (butuh fetch ke platform, jangan
+  // menahan panel). Saldo = angka OTORITATIF dari DeepSeek; biaya per-jendela = perkiraan lokal.
+  html += '<div id="uh-deepseek"></div>'
 
   // RINCIAN token per window — pendukung, di bawah. Diberi keterangan supaya "cache besar" tak bikin panik.
   html += '<div class="uh-head">Rincian token (jam/hari/minggu)</div>'
@@ -298,6 +367,52 @@ async function renderUsageHistory(): Promise<void> {
   html +=
     '<div class="up-empty" style="margin-top:6px"><b>cache</b> = konteks dibaca-ulang tiap langkah tool (murah, ~10× lebih ringan dari input baru) — wajar besar untuk multi-agent. Yang menandakan kerja = <b>output</b>. Sisa kuota → lihat BATAS PEMAKAIAN di atas.</div>'
   box.innerHTML = html
+  void renderDeepseekCosts()
+}
+
+/**
+ * Blok DeepSeek di panel usage: SALDO dari platform (otoritatif) + biaya terpakai per jendela waktu
+ * (perkiraan lokal: token tercatat × harga publik model akun).
+ *
+ * Dua angka itu SENGAJA dipisah dan diberi label berbeda. Saldo tahu segalanya (promo, harga jam
+ * sibuk, pemakaian dari aplikasi LAIN dengan key yang sama); perkiraan lokal hanya tahu apa yang
+ * Grove kirim. Menyatukannya jadi satu angka akan menyesatkan begitu keduanya berbeda.
+ */
+async function renderDeepseekCosts(): Promise<void> {
+  const slot = document.getElementById('uh-deepseek')
+  if (!slot) return
+  let rows: DeepseekAccountCost[]
+  try {
+    rows = await window.grove.getDeepseekCosts()
+  } catch {
+    return
+  }
+  if (!rows.length || !document.getElementById('uh-deepseek')) return
+  let h = '<div class="uh-head">DeepSeek — saldo &amp; biaya</div>'
+  for (const r of rows) {
+    const bal = r.balance
+    const balTxt = bal
+      ? `${bal.currency === 'USD' ? fmtUsd(bal.total) : `${bal.total} ${bal.currency}`}${bal.available ? '' : ' ⚠️'}`
+      : '—'
+    const balTitle = bal
+      ? `Saldo platform DeepSeek (otoritatif)\ntop-up ${bal.toppedUp} · kredit hadiah ${bal.granted} ${bal.currency}\n` +
+        `${bal.available ? 'akun aktif' : '⚠️ saldo habis / akun tak bisa dipakai'}\ndiambil ${new Date(bal.fetchedAt).toLocaleTimeString()}`
+      : `Saldo tak terbaca: ${r.error ?? 'tak diketahui'}`
+    h += `<div class="uh-row" title="${escapeHtml(balTitle)}"><span class="uh-name">${escapeHtml(
+      r.label
+    )} <span class="uh-out">· saldo</span></span><span class="uh-val"><b>${balTxt}</b></span></div>`
+    const c = r.cost
+    const costTitle =
+      `Perkiraan biaya dari token yang TERCATAT DI PC INI × harga publik ${r.model}.\n` +
+      `${deepseekPriceLabel(r.model)}\n` +
+      'Bukan tagihan resmi: promo, harga jam sibuk, dan pemakaian key ini di aplikasi lain tak terlihat dari sini — saldo di atas yang otoritatif.'
+    h += `<div class="uh-row" title="${escapeHtml(costTitle)}"><span class="uh-name uh-sub">${escapeHtml(
+      r.model
+    )} · terpakai</span><span class="uh-val"><span class="uh-out">jam ${fmtUsd(c.hour)} · 24j ${fmtUsd(
+      c.day
+    )} · 7h ${fmtUsd(c.week)} · total </span><b>${fmtUsd(c.allTime)}</b></span></div>`
+  }
+  slot.innerHTML = h
 }
 
 // Beri tahu main sesi mana yang dipilih → usage di header ikut akun sesi itu.
@@ -909,16 +1024,65 @@ function countDescendants(id: string): number {
   return c
 }
 
-function confirmDelete(id: string): void {
+/**
+ * Konfirmasi DALAM HALAMAN — pengganti window.confirm bawaan.
+ *
+ * BUG YANG DIPERBAIKI: dialog native Electron (confirm/alert) sering membuat jendela kehilangan
+ * fokus keyboard di level OS setelah ditutup. Gejalanya persis seperti yang dilaporkan — sesudah
+ * menghapus chat, kolom ketik tampak normal (caret ada) dan PASTE tetap jalan (itu lewat accelerator
+ * menu Edit), tapi ketikan tak masuk sama sekali. Dialog HTML tak pernah meninggalkan fokus di luar
+ * halaman, dan di akhir kita kembalikan fokus ke kolom chat secara eksplisit.
+ */
+function uiConfirm(message: string, okLabel = 'Ya, lanjut'): Promise<boolean> {
+  return new Promise((resolve) => {
+    const no = el('button', { class: 'modal-btn' }, 'Batal')
+    const yes = el('button', { class: 'modal-btn danger' }, okLabel)
+    const box = el(
+      'div',
+      { class: 'modal-box' },
+      el('div', { class: 'modal-text' }, message),
+      el('div', { class: 'modal-actions' }, no, yes)
+    )
+    const back = el('div', { class: 'modal-back' }, box)
+    const done = (v: boolean): void => {
+      document.removeEventListener('keydown', onKey, true)
+      back.remove()
+      const input = document.getElementById('chat-input') as HTMLTextAreaElement | null
+      input?.focus() // fokus balik ke kolom ketik — jangan tinggalkan halaman tanpa target ketik
+      resolve(v)
+    }
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        done(false)
+      } else if (e.key === 'Enter') {
+        e.preventDefault()
+        done(true)
+      }
+    }
+    document.addEventListener('keydown', onKey, true)
+    no.addEventListener('click', () => done(false))
+    yes.addEventListener('click', () => done(true))
+    back.addEventListener('click', (e) => {
+      if (e.target === back) done(false)
+    })
+    document.body.append(back)
+    yes.focus()
+  })
+}
+
+async function confirmDelete(id: string): Promise<void> {
   const n = nodes.get(id)
   const kids = countDescendants(id)
   const extra = kids ? ` beserta ${kids} sub-session` : ''
-  if (!confirm(`Hapus session "${n?.title ?? id}"${extra}?`)) return
+  if (!(await uiConfirm(`Hapus session "${n?.title ?? id}"${extra}?`, 'Hapus'))) return
   // Terapkan segera dari id yang dikembalikan (jangan tunggu event) → tutup race "target basi".
-  window.grove
-    .deleteSession(id)
-    .then(applyRemoved)
-    .catch((err) => alert(`Gagal hapus: ${String(err)}`))
+  try {
+    applyRemoved(await window.grove.deleteSession(id))
+  } catch (err) {
+    appendChatMessage({ role: 'system', text: `⚠️ Gagal hapus: ${String(err)}`, ts: Date.now() })
+  }
+  ;(document.getElementById('chat-input') as HTMLTextAreaElement | null)?.focus()
 }
 
 /** Bersihkan sesi yang dihapus dari state; bila sesi AKTIF ikut terhapus, pindah ke sesi lain. */
@@ -946,6 +1110,7 @@ function applyRemoved(ids: string[]): void {
     pendingText = ''
     $('chat-log').textContent = ''
     toolDetailEls.clear()
+    logReset()
     renderMemories()
     updateChatHeader()
   }
@@ -989,6 +1154,20 @@ async function selectSession(id: string): Promise<void> {
     loadDraft(id)
   }
   syncUsageSession() // usage di header ikut akun sesi yang baru dipilih
+  void refreshReferences(id) // daftar referensi sesi ini (untuk menu klik-kanan)
+  // Antrian & riwayat prompt milik SESI INI (jangan bawa punya sesi sebelumnya).
+  resetHistoryNav()
+  queueItems = []
+  sentPrompts = []
+  renderQueueStrip()
+  void window.grove
+    .listQueued(id)
+    .then((items) => {
+      if (activeId !== id) return
+      queueItems = items
+      renderQueueStrip()
+    })
+    .catch(() => {})
   pendingEl = null
   pendingTextNode = null
   pendingText = ''
@@ -1003,14 +1182,21 @@ async function selectSession(id: string): Promise<void> {
   const log = $('chat-log')
   log.textContent = ''
   toolDetailEls.clear() // panel detail milik sesi lama tak relevan lagi
+  logReset() // pohon LOG ikut di-rebuild untuk sesi baru
   const history = await window.grove.getChat(id)
   // Balapan async: kalau pilihan berubah selama getChat berjalan (klik sesi lain, ATAU sesi ini
   // dihapus lalu applyRemoved auto-pindah ke sesi lain), JANGAN tempel riwayat basi ke chat-log
   // yang kini menampilkan sesi berbeda. Tanpa guard ini, menghapus sesi (yang memicu auto-pindah)
   // bisa "menyuntik" riwayat sesi lama/terhapus ke chat sesi aktif → chat tampak rusak lintas-sesi.
   if (activeId !== id) return
-  for (const m of history.slice(-MAX_CHAT_DOM)) appendChatMessage(m, false) // hanya N terakhir → anti-lag
+  sentPrompts = history.filter((m) => m.role === 'user').map((m) => m.text) // bahan riwayat ↑
+  for (const m of history.slice(-MAX_CHAT_DOM)) {
+    appendChatMessage(m, false) // hanya N terakhir → anti-lag
+    logIngest(m, false) // bangun pohon LOG dari riwayat yang sama
+  }
   log.scrollTop = log.scrollHeight
+  const lt = document.getElementById('log-tree')
+  if (lt) lt.scrollTop = lt.scrollHeight
   updateActiveHighlight()
   renderMemories() // memori pohon sesi ini
 }
@@ -1076,6 +1262,36 @@ function syncGlobalModel(): void {
   sel.value = defaultModel ?? ''
 }
 
+/** Isi <select> tingkat mikir. inheritLabel diisi untuk dropdown per-sesi (opsi '' = mewarisi). */
+function fillEffortOptions(sel: HTMLSelectElement, inheritLabel?: string): void {
+  sel.textContent = ''
+  for (const e of EFFORT_OPTIONS) {
+    const o = document.createElement('option')
+    o.value = e.value
+    o.textContent = e.value === '' && inheritLabel ? inheritLabel : e.label
+    sel.append(o)
+  }
+}
+
+/** Tingkat mikir EFEKTIF sebuah node bila ia mewarisi (label "ikut …"): node → root → global. */
+function inheritedEffortFor(node: Node): string {
+  const root = node.role === 'sub' ? nodes.get(node.treeId) : null
+  const eff = root?.effort ?? defaultEffort ?? null
+  return `🧠 ikut ${node.role === 'sub' ? 'sesi utama' : 'global'}: ${effortLabel(eff)}`
+}
+
+/** Dropdown tingkat mikir GLOBAL di topbar → set nilai dari state. */
+function syncGlobalEffort(): void {
+  const sel = $<HTMLSelectElement>('global-effort')
+  fillEffortOptions(sel)
+  sel.value = defaultEffort ?? ''
+  sel.onchange = (): void => {
+    void window.grove
+      .setDefaultEffort((sel.value || null) as EffortSetting | null)
+      .catch((e) => alert(`Gagal set tingkat mikir global: ${String(e)}`))
+  }
+}
+
 /** Model EFEKTIF sebuah node bila ia mewarisi (untuk label "ikut …"): node → root → global. */
 function inheritedModelFor(node: Node): string {
   const root = node.role === 'sub' ? nodes.get(node.treeId) : null
@@ -1095,14 +1311,30 @@ function fillSessionModelSelect(sel: HTMLSelectElement, node: Node): void {
   sel.textContent = ''
   sel.disabled = false
   const eff = effectiveAccountOf(node)
-  if (eff?.provider === 'custom') {
-    // Akun custom (proxy): nama model ditentukan proxy → tampil sebagai info terkunci, bukan pilihan.
+  if (usesOwnBaseUrl(eff?.provider)) {
+    // Akun custom/cursor (proxy): nama model ditentukan proxy → tampil sebagai info terkunci, bukan pilihan.
     const o = document.createElement('option')
     o.value = ''
-    o.textContent = `model: ${eff.model ?? '?'}`
+    o.textContent = `model: ${eff!.model ?? '?'}`
     sel.append(o)
     sel.value = ''
     sel.disabled = true
+    return
+  }
+  if (eff?.provider === 'deepseek') {
+    // Akun DeepSeek: daftar model tertutup (pro/flash). Opsi kosong = pakai model default akun.
+    const inherit = document.createElement('option')
+    inherit.value = ''
+    inherit.textContent = `— default akun: ${eff.model ?? DEEPSEEK_MODEL_DEFAULT} —`
+    sel.append(inherit)
+    for (const m of DEEPSEEK_MODEL_SUGGESTIONS) {
+      const o = document.createElement('option')
+      o.value = m.id
+      o.textContent = m.label
+      sel.append(o)
+    }
+    // Model warisan yang BUKAN DeepSeek (mis. alias "opus" dari global) tak sah di sini → tampil kosong.
+    sel.value = isDeepSeekModel(node.model) ? node.model! : ''
     return
   }
   if (eff?.provider === 'openrouter') {
@@ -1137,6 +1369,7 @@ function updateChatHeader(): void {
   const loopBtn = $('btn-loop')
   const liteBtn = $<HTMLButtonElement>('btn-lite')
   const modelSel = $<HTMLSelectElement>('chat-model')
+  const effortSel = $<HTMLSelectElement>('chat-effort')
   if (node) {
     const act = activities.get(activeId!) || node.status
     const elapsed = fmtDuration(lastElapsed.get(activeId!) ?? 0)
@@ -1155,6 +1388,15 @@ function updateChatHeader(): void {
     // akun Claude → alias + warisan. Opsi kosong = ikut warisan / default akun.
     modelSel.style.display = 'inline-block'
     fillSessionModelSelect(modelSel, node)
+    // Tingkat mikir per-sesi — satu dropdown di sebelah model, berlaku untuk Claude & DeepSeek.
+    effortSel.style.display = 'inline-block'
+    fillEffortOptions(effortSel, inheritedEffortFor(node))
+    effortSel.value = node.effort ?? ''
+    effortSel.onchange = (): void => {
+      void window.grove
+        .setSessionEffort(node.id, (effortSel.value || null) as EffortSetting | null)
+        .catch((e) => alert(`Gagal ganti tingkat mikir: ${String(e)}`))
+    }
     modelSel.onchange = (): void => {
       if (modelSel.value === CUSTOM_MODEL) {
         const m = promptCustomModel(node.model)
@@ -1174,6 +1416,7 @@ function updateChatHeader(): void {
     loopBtn.style.display = 'none'
     liteBtn.style.display = 'none'
     modelSel.style.display = 'none'
+    effortSel.style.display = 'none'
   }
 }
 
@@ -1181,6 +1424,44 @@ function ensureNode(meta: SessionMeta, ctxPercent = 0): void {
   if (!nodes.has(meta.id)) {
     nodes.set(meta.id, { ...meta, ctxPercent, tokensTotal: 0 })
     renderTree()
+  }
+}
+
+/**
+ * Isi detail tool dengan PEWARNAAN diff: baris "- " merah (dibuang), "+ " hijau (ditambah),
+ * "@@ … @@" aksen (penanda hunk), sisanya netral. Dipakai saat baris dibuka DAN saat output tool
+ * menyusul (chat:detail) — satu jalur render supaya warnanya tak hilang setelah di-patch.
+ */
+function renderToolDetail(pre: HTMLElement, detail: string): void {
+  pre.textContent = ''
+  for (const line of detail.split('\n')) {
+    const cls = line.startsWith('- ')
+      ? 'd-del'
+      : line.startsWith('+ ')
+        ? 'd-add'
+        : line.startsWith('@@')
+          ? 'd-hunk'
+          : line.startsWith('--- OUTPUT')
+            ? 'd-out'
+            : ''
+    pre.append(el('span', cls ? { class: cls } : {}, `${line}\n`))
+  }
+}
+
+/** Pratinjau saat baris tool BELUM diklik: beberapa baris yang benar-benar berubah saja. */
+const PREVIEW_LINES = 6
+function renderDiffPreview(pre: HTMLElement, detail: string): void {
+  const changed = detail.split('\n').filter((l) => l.startsWith('- ') || l.startsWith('+ '))
+  pre.textContent = ''
+  if (!changed.length) {
+    pre.hidden = true // tool non-edit (Read/Bash/…) → tak ada yang perlu dipratinjau
+    return
+  }
+  for (const line of changed.slice(0, PREVIEW_LINES)) {
+    pre.append(el('span', { class: line.startsWith('- ') ? 'd-del' : 'd-add' }, `${clip1(line, 160)}\n`))
+  }
+  if (changed.length > PREVIEW_LINES) {
+    pre.append(el('span', { class: 'd-more' }, `… ${changed.length - PREVIEW_LINES} baris lagi — klik untuk lihat lengkap\n`))
   }
 }
 
@@ -1203,19 +1484,24 @@ function appendChatMessage(m: ChatMessage, scroll = true): HTMLElement {
   if (m.role === 'assistant') {
     node.innerHTML = renderMarkdown(m.text)
   } else if (m.role === 'tool' && m.detail) {
-    // Baris tool: klik header untuk expand/collapse detail (input + output), ala Ctrl+O.
+    // Baris tool: TERTUTUP → pratinjau ringkas baris yang diubah; DIKLIK → detail penuh (diff
+    // berwarna + output tool). Ala Ctrl+O, tapi perubahan file langsung terbaca tanpa dibuka.
     const caret = el('span', { class: 'tool-caret' }, '▸')
     const head = el('div', { class: 'tool-head' }, caret, el('span', {}, ` ${m.text}`))
     const pre = document.createElement('pre')
     pre.className = 'tool-detail'
     pre.hidden = true
-    pre.textContent = m.detail
+    renderToolDetail(pre, m.detail)
+    const preview = document.createElement('pre')
+    preview.className = 'tool-preview'
+    renderDiffPreview(preview, m.detail)
     head.addEventListener('click', () => {
       pre.hidden = !pre.hidden
+      preview.hidden = !pre.hidden ? true : !preview.textContent // tampil lagi hanya bila ada isinya
       caret.textContent = pre.hidden ? '▸' : '▾'
       if (!pre.hidden) scrollChatToBottom()
     })
-    node.append(head, pre)
+    node.append(head, preview, pre)
     if (m.toolUseId) toolDetailEls.set(m.toolUseId, pre)
   } else {
     if (m.text) node.appendChild(document.createTextNode(m.text))
@@ -1230,6 +1516,259 @@ function appendChatMessage(m: ChatMessage, scroll = true): HTMLElement {
   capChatLog()
   if (scroll) scrollChatToBottom()
   return node
+}
+
+// ---- panel LOG (pohon per-turn) --------------------------------------------
+
+/** Ringkas jadi satu baris, buang whitespace berlebih, potong ke n char. */
+function clip1(s: string, n: number): string {
+  s = s.replace(/\s+/g, ' ').trim()
+  return s.length > n ? `${s.slice(0, n - 1)}…` : s
+}
+
+function updateLogHint(): void {
+  const hint = document.getElementById('log-hint')
+  if (hint) hint.textContent = logTurns.length ? `${logTurns.length} prompt` : 'belum ada'
+}
+
+/** Kosongkan pohon LOG (pindah sesi / sesi dihapus / chat baru). */
+function logReset(): void {
+  logTurns.length = 0
+  chatCallSeq = 0
+  const t = document.getElementById('log-tree')
+  if (t) t.textContent = ''
+  updateLogHint()
+}
+
+/** Format byte → "820 B" / "1.4 KB" / "2.3 MB" (ukuran nyata yang dikirim/diterima). */
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1048576).toFixed(1)} MB`
+}
+/** Auto-scroll ke dasar HANYA bila sudah dekat dasar → jangan rebut scroll user yang lagi baca atas. */
+function scrollLogToBottom(): void {
+  const t = document.getElementById('log-tree')
+  if (!t || logCollapsed) return
+  if (t.scrollHeight - t.scrollTop - t.clientHeight < 60) t.scrollTop = t.scrollHeight
+}
+
+/** Node anak expandable (request/respons/tool) — tiru pola baris tool di chat. bytesEl bisa di-update. */
+function makeLogChild(
+  label: string,
+  detail: string,
+  labelCls: string,
+  bytes?: number
+): { row: HTMLElement; pre: HTMLElement; bytesEl: HTMLElement } {
+  const caret = el('span', { class: 'log-caret2' }, '▸')
+  const bytesEl = el('span', { class: 'log-bytes' }, bytes == null ? '' : ` · ${fmtBytes(bytes)}`)
+  const head = el('div', { class: 'log-child-head' }, caret, el('span', { class: labelCls }, label), bytesEl)
+  const pre = document.createElement('pre')
+  pre.className = 'log-child-detail'
+  pre.hidden = true
+  pre.textContent = detail
+  head.addEventListener('click', () => {
+    pre.hidden = !pre.hidden
+    caret.textContent = pre.hidden ? '▸' : '▾'
+    if (!pre.hidden) scrollLogToBottom()
+  })
+  const row = el('div', { class: 'log-child' }, head, pre)
+  return { row, pre, bytesEl }
+}
+
+/** Mulai node turn baru (prompt user = header level-atas collapsible). */
+function logStartTurn(text: string, ts: number): LogTurn {
+  const caret = el('span', { class: 'log-caret2' }, '▾')
+  const usageEl = el('span', { class: 'log-turn-usage' }) // diisi logAddCallUsage saat call API tercatat
+  const meta = el('span', { class: 'log-turn-meta' }, usageEl, el('span', { class: 'log-turn-time' }, fmtClock(ts)))
+  const head = el(
+    'div',
+    { class: 'log-turn-head' },
+    caret,
+    el('span', { class: 'log-turn-label' }, `❯ ${clip1(text, 90) || '(prompt kosong)'}`),
+    meta
+  )
+  const body = el('div', { class: 'log-turn-body' })
+  const wrap = el('div', { class: 'log-turn' }, head, body)
+  head.addEventListener('click', () => {
+    body.hidden = !body.hidden
+    caret.textContent = body.hidden ? '▸' : '▾'
+  })
+  const turn: LogTurn = { wrap, caret, body, meta, usageEl, children: [], done: false, calls: 0, outSum: 0, ctxMax: 0 }
+  ;(document.getElementById('log-tree') as HTMLElement).append(wrap)
+  logTurns.push(turn)
+  // cap: buang turn tertua bila melewati batas (lepas juga ref detail tool-nya).
+  while (logTurns.length > MAX_LOG_TURNS) logTurns.shift()!.wrap.remove()
+  updateLogHint()
+  return turn
+}
+
+/** Turn berjalan; buat turn implisit bila anak datang tanpa header prompt (mis. riwayat mulai di tengah). */
+function currentTurn(ts: number): LogTurn {
+  return logTurns.length ? logTurns[logTurns.length - 1] : logStartTurn('(tanpa prompt)', ts)
+}
+
+/**
+ * Serap ChatMessage ke panel LOG. SENGAJA hanya pesan USER — itu membuka node turn baru sebagai
+ * wadah REQUEST-nya. Respons/tool/system TIDAK lagi disalin ke sini: semuanya sudah tampil utuh
+ * (beserta detail expandable) di chat, dan menampilkannya dua kali cuma bikin panel ini jadi
+ * cermin yang harus dibaca bolak-balik.
+ */
+function logIngest(m: ChatMessage, live = true): void {
+  if (m.role !== 'user') return
+  logStartTurn(m.text, m.ts)
+  chatCallSeq = 0 // giliran baru → penomoran call di chat mulai lagi dari 1
+  if (live) scrollLogToBottom()
+}
+
+/** Node "REQUEST": teks mentah yang Grove kirim ke query() (prompt+reseed / auto-task / recycle). */
+function logAddRequest(kind: 'user' | 'auto' | 'recycle', text: string, bytes: number, images: number): void {
+  // kind 'user' → tempel ke turn yang barusan dibuat pesan user; 'auto'/'recycle' TAK direkam ke chat
+  // sehingga tak ada turn induk → buat node turn sintetis agar aktivitas tersembunyi ini terlihat.
+  const turn =
+    kind === 'user'
+      ? currentTurn(Date.now())
+      : logStartTurn(kind === 'recycle' ? '♻ recycle (Grove auto)' : '⚙ auto-task (Grove)', Date.now())
+  const imgNote = images ? ` · ${images} gambar` : ''
+  const { row } = makeLogChild(`→ REQUEST${imgNote}`, text, 'log-req', bytes)
+  row.title =
+    'Teks yang Grove kirim ke query() tiap giliran (prompt user + reseed konteks + auto-task). ' +
+    'BUKAN body HTTP byte-exact: system prompt, seluruh transcript, & skema tools dirakit di subprocess ' +
+    'SDK dan tak ter-expose ke JS. Untuk byte-exact, log lewat proxy (akun base-URL sendiri).'
+  turn.body.prepend(row) // REQUEST paling atas di badan turn
+  turn.children.push({})
+  scrollLogToBottom()
+}
+
+/**
+ * Rincian token SATU respons API (call). Barisnya ditaruh INLINE DI CHAT — persis di tempat kejadian,
+ * jadi mahal/tidaknya sebuah langkah terbaca tanpa pindah panel. Panel LOG hanya menyimpan ringkasan
+ * per-turn di headernya (n× call · Σout · ctx▲).
+ *
+ * Arti angkanya: ctx = seluruh input yang diproses call ini (fresh+cache) · fresh = bagian yang
+ * ditagih harga penuh (cache miss) · cache = konteks lama yang dibaca-ulang (murah) · out = keluaran.
+ */
+function logAddCallUsage(u: { input: number; cacheRead: number; cacheCreation: number; output: number }): void {
+  const ctxIn = u.input + u.cacheRead + u.cacheCreation
+  const cache = u.cacheRead + u.cacheCreation
+  chatCallSeq += 1
+  const turn = logTurns[logTurns.length - 1]
+  if (turn) {
+    turn.calls += 1
+    turn.outSum += u.output
+    turn.ctxMax = Math.max(turn.ctxMax, ctxIn)
+    turn.usageEl.textContent = `${turn.calls}× · out ${fmtTokens(turn.outSum)} · ctx▲${fmtTokens(turn.ctxMax)} · `
+  }
+  const row = el(
+    'div',
+    {
+      class: 'msg meter',
+      title:
+        `call ${chatCallSeq} giliran ini\n` +
+        `ctx ${ctxIn.toLocaleString()} = fresh ${u.input.toLocaleString()} + cache ${cache.toLocaleString()} token\n` +
+        `fresh = ditagih penuh (cache miss) · cache = konteks dibaca-ulang, jauh lebih murah\n` +
+        `output ${u.output.toLocaleString()} token`
+    },
+    `↳ call ${chatCallSeq} · ctx ${fmtTokens(ctxIn)} · fresh ${fmtTokens(u.input)}` +
+      (cache ? ` · cache ${fmtTokens(cache)}` : '') +
+      ` · out ${fmtTokens(u.output)}`
+  )
+  $('chat-log').append(row)
+  capChatLog()
+  scrollChatToBottom()
+}
+
+/** Tandai turn terakhir "selesai" saat sesi aktif kembali idle/done (penanda akhir-turn). */
+function logMarkTurnDone(): void {
+  const turn = logTurns[logTurns.length - 1]
+  if (!turn || turn.done) return
+  turn.done = true
+  turn.meta.prepend(el('span', { class: 'log-done' }, '✓ '))
+}
+
+// ---- antrian pesan + riwayat prompt (↑/↓ di kolom chat) --------------------------------------
+// queueItems  = pesan yang DITAHAN Grove karena turn masih jalan (belum dikirim ke model).
+// sentPrompts = prompt yang SUDAH terkirim (dari riwayat chat) — ini yang jadi bahan ↑ "prompt baru".
+// editingQid  = sedang mengedit item antrian nomor ini (Enter menyimpan ke antrian, bukan mengirim baru).
+let queueItems: Array<{ qid: number; text: string }> = []
+let sentPrompts: string[] = []
+let histIdx = -1 // -1 = tidak sedang menelusuri riwayat
+let histDraft = '' // teks yang sedang diketik sebelum menelusuri, dipulihkan saat kembali ke bawah
+let editingQid: number | null = null
+
+/** Daftar yang ditelusuri ↑: antrian dulu (paling dekat & masih bisa diubah), lalu prompt terkirim. */
+function historyEntries(): Array<{ text: string; qid: number | null }> {
+  return [
+    ...[...queueItems].reverse().map((q) => ({ text: q.text, qid: q.qid })),
+    ...[...sentPrompts].reverse().map((t) => ({ text: t, qid: null }))
+  ]
+}
+
+function setEditingQid(qid: number | null): void {
+  editingQid = qid
+  const form = document.getElementById('chat-form')
+  form?.classList.toggle('editing-queue', qid != null)
+}
+
+/** ↑/↓ menelusuri riwayat prompt. Item antrian → masuk mode EDIT ANTRIAN; sisanya → prompt baru. */
+function navigateHistory(dir: 1 | -1): void {
+  const input = $<HTMLTextAreaElement>('chat-input')
+  const list = historyEntries()
+  if (!list.length) return
+  if (histIdx === -1 && dir === 1) histDraft = input.value // mulai menelusuri → simpan ketikan
+  const next = histIdx + dir
+  if (next < -1) return
+  if (next >= list.length) return
+  histIdx = next
+  if (histIdx === -1) {
+    input.value = histDraft
+    setEditingQid(null)
+  } else {
+    const e = list[histIdx]
+    input.value = e.text
+    setEditingQid(e.qid) // qid null = prompt yang sudah dijawab → perlakukan sebagai prompt BARU
+  }
+  autoGrow(input)
+  input.setSelectionRange(input.value.length, input.value.length)
+}
+
+/** Keluar dari mode telusur (mis. user mulai mengetik lagi / kirim). */
+function resetHistoryNav(): void {
+  histIdx = -1
+  histDraft = ''
+  setEditingQid(null)
+}
+
+function renderQueueStrip(): void {
+  const strip = $('chat-queue')
+  strip.textContent = ''
+  strip.style.display = queueItems.length ? 'flex' : 'none'
+  for (const q of queueItems) {
+    const chip = el('div', { class: `queue-chip${editingQid === q.qid ? ' editing' : ''}` })
+    chip.append(el('span', { class: 'queue-num' }, '⏳'), el('span', { class: 'queue-text' }, clip1(q.text, 90)))
+    const edit = el('button', { class: 'queue-btn', title: 'Edit pesan ini (↑ juga bisa)' }, '✎')
+    edit.addEventListener('click', () => {
+      const input = $<HTMLTextAreaElement>('chat-input')
+      histDraft = input.value
+      input.value = q.text
+      autoGrow(input)
+      setEditingQid(q.qid)
+      renderQueueStrip()
+      input.focus()
+    })
+    const del = el('button', { class: 'queue-btn', title: 'Batalkan pesan ini' }, '✕')
+    del.addEventListener('click', () => {
+      if (!activeId) return
+      void window.grove.cancelQueued(activeId, q.qid).then(() => {
+        if (editingQid === q.qid) {
+          setEditingQid(null)
+          $<HTMLTextAreaElement>('chat-input').value = histDraft
+        }
+      })
+    })
+    chip.append(edit, del)
+    strip.append(chip)
+  }
 }
 
 function renderAttachStrip(): void {
@@ -1401,6 +1940,43 @@ function closeSessionMenu(): void {
   ctxMenuEl = null
 }
 
+// ---- referensi antar-sesi (cache renderer; sumber kebenaran ada di main/DB) -------------------
+const refsByHelper = new Map<string, Array<{ id: string; title: string; status: string; cwd: string }>>()
+
+function referencesOf(helperId: string): Array<{ id: string; title: string; status: string; cwd: string }> {
+  return refsByHelper.get(helperId) ?? []
+}
+
+async function refreshReferences(helperId: string): Promise<void> {
+  try {
+    refsByHelper.set(helperId, await window.grove.listReferences(helperId))
+  } catch {
+    /* sesi baru dihapus → abaikan */
+  }
+}
+
+/** Terima teks "grove:ref:<id>" (atau id polos) → tautkan sebagai referensi milik `helperId`. */
+function linkReferenceFromText(helperId: string, raw: string): void {
+  const m = /^(?:grove:ref:)?\s*([0-9a-fA-F-]{6,})\s*$/.exec(raw.trim())
+  if (!m) {
+    appendChatMessage({
+      role: 'system',
+      text: '⚠️ Clipboard tak berisi ID referensi. Klik-kanan chat sumber → "Salin ID referensi sesi ini" dulu.',
+      ts: Date.now()
+    })
+    return
+  }
+  const targetId = nodes.has(m[1]) ? m[1] : [...nodes.keys()].find((id) => id.startsWith(m[1]))
+  if (!targetId) {
+    appendChatMessage({ role: 'system', text: `⚠️ Sesi ${m[1]} tidak ditemukan.`, ts: Date.now() })
+    return
+  }
+  void window.grove
+    .linkReference(helperId, targetId)
+    .then(() => refreshReferences(helperId))
+    .catch((e) => appendChatMessage({ role: 'system', text: `⚠️ Gagal menautkan: ${String(e)}`, ts: Date.now() }))
+}
+
 /** Akun EFEKTIF sebuah node dari sisi renderer: akun sesi → akun sesi utama → akun global. */
 function effectiveAccountOf(node: Node): Account | undefined {
   const rootAcc = node.role === 'sub' ? nodes.get(node.treeId)?.accountId : undefined
@@ -1439,16 +2015,82 @@ function showSessionMenu(node: Node, x: number, y: number): void {
         : '— ikut global (kosong) —'
   menu.append(item(inheritAccLabel, node.accountId == null, () => setSessionAccount(node.id, null)))
   for (const a of accounts) {
-    const tag = a.provider === 'custom' ? '  ⟨GM⟩' : a.provider === 'openrouter' ? '  ⟨OR⟩' : ''
+    const tag =
+      a.provider === 'custom'
+        ? '  ⟨GM⟩'
+        : a.provider === 'cursor'
+          ? '  ⟨CR⟩'
+          : a.provider === 'openrouter'
+            ? '  ⟨OR⟩'
+            : a.provider === 'deepseek'
+              ? '  ⟨DS⟩'
+              : ''
     menu.append(item(a.label + tag, node.accountId === a.id, () => setSessionAccount(node.id, a.id)))
+  }
+
+  // --- Referensi (satu arah) --- salin ID sesi ini, atau jadikan sesi lain referensi sesi ini.
+  menu.append(el('div', { class: 'ctx-sep' }, 'Referensi'))
+  menu.append(
+    item('📋 Salin ID referensi sesi ini', false, () => {
+      void navigator.clipboard
+        .writeText(`grove:ref:${node.id}`)
+        .then(() =>
+          appendChatMessage({
+            role: 'system',
+            text: `📋 ID referensi "${node.title}" disalin. Buka chat lain → klik-kanan → "Tempel referensi", atau tempel langsung ke kolom chat-nya.`,
+            ts: Date.now()
+          })
+        )
+        .catch(() => {})
+    })
+  )
+  menu.append(
+    item('🔗 Tempel referensi dari clipboard', false, () => {
+      void navigator.clipboard
+        .readText()
+        .then((t) => linkReferenceFromText(node.id, t))
+        .catch(() => alert('Clipboard tak bisa dibaca.'))
+    })
+  )
+  for (const r of referencesOf(node.id)) {
+    menu.append(
+      item(`✕ lepas: ${r.title} (${r.id.slice(0, 6)})`, false, () => {
+        void window.grove.unlinkReference(node.id, r.id).then(() => void refreshReferences(node.id))
+      })
+    )
+  }
+
+  // --- Tingkat mikir (reasoning) --- berlaku untuk Claude & DeepSeek.
+  menu.append(el('div', { class: 'ctx-sep' }, 'Mikir'))
+  menu.append(
+    item(
+      node.role === 'sub' ? '— ikut sesi utama —' : `— ikut global: ${effortLabel(defaultEffort)} —`,
+      node.effort == null,
+      () => setSessionEffort(node.id, null)
+    )
+  )
+  for (const e of EFFORT_OPTIONS) {
+    if (e.value === '') continue // '' sudah diwakili "ikut warisan" di atas
+    menu.append(item(e.label, node.effort === e.value, () => setSessionEffort(node.id, e.value as EffortSetting)))
   }
 
   // --- Model ---
   menu.append(el('div', { class: 'ctx-sep' }, 'Model'))
   const eff = effectiveAccountOf(node)
-  if (eff?.provider === 'custom') {
-    // Akun custom: model dikunci oleh proxy → info saja (ganti model = ganti akun / edit proxy).
-    menu.append(item(`model akun: ${eff.model ?? '?'} · dikunci proxy`, true, () => {}))
+  if (usesOwnBaseUrl(eff?.provider)) {
+    // Akun custom/cursor: model dikunci oleh proxy → info saja (ganti model = ganti akun / edit proxy).
+    menu.append(item(`model akun: ${eff!.model ?? '?'} · dikunci proxy`, true, () => {}))
+  } else if (eff?.provider === 'deepseek') {
+    // Akun DeepSeek: pilih di antara pro/flash. Kosong = model default akun.
+    const selfDs = isDeepSeekModel(node.model) ? node.model! : null
+    menu.append(
+      item(`— default akun: ${eff.model ?? DEEPSEEK_MODEL_DEFAULT} —`, selfDs == null, () =>
+        setSessionModel(node.id, null)
+      )
+    )
+    for (const m of DEEPSEEK_MODEL_SUGGESTIONS) {
+      menu.append(item(m.label, selfDs === m.id, () => setSessionModel(node.id, m.id)))
+    }
   } else if (eff?.provider === 'openrouter') {
     // Akun OpenRouter: model BEBAS dipilih dari daftar OR (tak dikunci). Kosong = default akun.
     const selfOr = node.model && node.model.includes('/') ? node.model : null
@@ -1500,6 +2142,10 @@ function setSessionAccount(id: string, accountId: string | null): void {
 }
 function setSessionModel(id: string, model: string | null): void {
   void window.grove.setSessionModel(id, model).catch((e) => alert(`Gagal ganti model: ${String(e)}`))
+}
+
+function setSessionEffort(id: string, effort: EffortSetting | null): void {
+  void window.grove.setSessionEffort(id, effort).catch((e) => alert(`Gagal ganti tingkat mikir: ${String(e)}`))
 }
 
 // ---- kolom yang bisa di-resize (lebar sidebar & board, disimpan di localStorage) --------------
@@ -1639,7 +2285,18 @@ function renderAccountsPanel(): void {
           ? el('span', { class: 'ap-prov', title: a.model ?? '' }, `OR: ${a.model?.split('/').pop() ?? '?'}`)
           : a.provider === 'custom'
             ? el('span', { class: 'ap-prov', title: `${a.baseUrl ?? ''} · ${a.model ?? ''}` }, `GM: ${a.model ?? '?'}`)
-            : el('span', {})
+            : a.provider === 'cursor'
+              ? el('span', { class: 'ap-prov', title: `${a.baseUrl ?? ''} · ${a.model ?? ''}` }, `CR: ${a.model ?? '?'}`)
+              : a.provider === 'deepseek'
+                ? el(
+                    'span',
+                    {
+                      class: 'ap-prov',
+                      title: `api.deepseek.com · ${a.model ?? DEEPSEEK_MODEL_DEFAULT}\n${deepseekPriceLabel(a.model)}`
+                    },
+                    `DS: ${a.model ?? DEEPSEEK_MODEL_DEFAULT}`
+                  )
+                : el('span', {})
       panel.append(
         el('div', { class: 'ap-item' }, el('span', { class: 'ap-label' }, a.label), provTag, planTag, del)
       )
@@ -1690,8 +2347,10 @@ function renderAccountsPanel(): void {
   prov.className = 'ap-input'
   for (const [v, t] of [
     ['claude', 'Claude (langganan)'],
+    ['deepseek', 'DeepSeek (token saja)'],
     ['openrouter', 'OpenRouter (key + model)'],
-    ['custom', 'Gemini / Proxy (base-URL)']
+    ['custom', 'Gemini / Proxy (base-URL)'],
+    ['cursor', 'Cursor (token free + proxy)']
   ] as const) {
     const o = document.createElement('option')
     o.value = v
@@ -1710,6 +2369,17 @@ function renderAccountsPanel(): void {
   const baseUrl = document.createElement('input')
   baseUrl.className = 'ap-input'
   baseUrl.placeholder = 'Base URL proxy, mis. http://localhost:4000'
+
+  // Field model DeepSeek: daftar TERTUTUP (pro/flash) → dropdown, bukan ketik bebas.
+  const dsModel = document.createElement('select')
+  dsModel.className = 'ap-input'
+  for (const m of DEEPSEEK_MODEL_SUGGESTIONS) {
+    const o = document.createElement('option')
+    o.value = m.id
+    o.textContent = m.label
+    dsModel.append(o)
+  }
+  dsModel.value = DEEPSEEK_MODEL_DEFAULT
 
   // Field model (OpenRouter & custom): id/nama model dengan saran. Hanya tampil bila provider skin.
   const orModel = document.createElement('input')
@@ -1731,6 +2401,7 @@ function renderAccountsPanel(): void {
   }
   const orSuggest = OPENROUTER_MODEL_SUGGESTIONS.map((m) => ({ value: m.id, text: m.label }))
   const customSuggest = CUSTOM_MODEL_SUGGESTIONS.map((m) => ({ value: m.id, text: m.label }))
+  const cursorSuggest = CURSOR_MODEL_SUGGESTIONS.map((m) => ({ value: m.id, text: m.label }))
   let orLive: ReadonlyArray<{ value: string; text: string }> | null = null
   fillDatalist(orSuggest)
   void window.grove
@@ -1752,27 +2423,47 @@ function renderAccountsPanel(): void {
 
   const hint = el('div', { class: 'ap-hint' }, '')
   const applyProvider = (): void => {
-    const p = prov.value // 'claude' | 'openrouter' | 'custom'
-    const skin = p === 'openrouter' || p === 'custom'
+    const p = prov.value // 'claude' | 'deepseek' | 'openrouter' | 'custom' | 'cursor'
+    const proxy = p === 'custom' || p === 'cursor' // pakai base URL sendiri (proxy lokal)
+    const skin = p === 'openrouter' || p === 'deepseek' || proxy
     token.placeholder =
-      p === 'openrouter'
+      p === 'deepseek'
+        ? 'DeepSeek API key (sk-…) — ambil di platform.deepseek.com'
+        : p === 'openrouter'
         ? 'OpenRouter API key (sk-or-v1-…)'
-        : p === 'custom'
-          ? 'Token proxy (ANTHROPIC_AUTH_TOKEN) — isi apa saja bila proxy tak memeriksa'
-          : 'CLAUDE_CODE_OAUTH_TOKEN (sk-ant-oat01-…)'
-    baseUrl.style.display = p === 'custom' ? 'block' : 'none'
-    if (p === 'custom' && !baseUrl.value) baseUrl.value = CUSTOM_BASE_URL_DEFAULT
-    orModel.style.display = skin ? 'block' : 'none'
+        : p === 'cursor'
+          ? 'claude-code-proxy: isi "unused" · Cursor-To-OpenAI: WorkosCursorSessionToken'
+          : p === 'custom'
+            ? 'Token proxy (ANTHROPIC_AUTH_TOKEN) — isi apa saja bila proxy tak memeriksa'
+            : 'CLAUDE_CODE_OAUTH_TOKEN (sk-ant-oat01-…)'
+    baseUrl.style.display = proxy ? 'block' : 'none'
+    // Prefill base URL saat kosong ATAU masih salah satu default bawaan → ganti provider ganti default,
+    // tapi URL yang sudah user-ketik tetap dipertahankan.
+    const knownDefaults: string[] = [CUSTOM_BASE_URL_DEFAULT, CURSOR_BASE_URL_DEFAULT]
+    if (proxy && (!baseUrl.value || knownDefaults.includes(baseUrl.value))) {
+      baseUrl.value = p === 'cursor' ? CURSOR_BASE_URL_DEFAULT : CUSTOM_BASE_URL_DEFAULT
+    }
+    // DeepSeek punya daftar model TERTUTUP → dropdown sendiri; provider skin lain tetap ketik-bebas.
+    dsModel.style.display = p === 'deepseek' ? 'block' : 'none'
+    orModel.style.display = skin && p !== 'deepseek' ? 'block' : 'none'
     orModel.placeholder =
-      p === 'custom' ? 'Nama model yg dikenal proxy, mis. gemini-2.5-flash' : 'Model OpenRouter, mis. nvidia/nemotron-3-super-120b-a12b:free'
-    fillDatalist(p === 'custom' ? customSuggest : (orLive ?? orSuggest))
+      p === 'cursor'
+        ? 'Nama model Cursor, mis. claude-3.5-sonnet'
+        : p === 'custom'
+          ? 'Nama model yg dikenal proxy, mis. gemini-2.5-flash'
+          : 'Model OpenRouter, mis. nvidia/nemotron-3-super-120b-a12b:free'
+    fillDatalist(p === 'cursor' ? cursorSuggest : p === 'custom' ? customSuggest : (orLive ?? orSuggest))
     plan.style.display = skin ? 'none' : 'block'
     hint.textContent =
-      p === 'openrouter'
+      p === 'deepseek'
+        ? '🚀 Langsung ke endpoint Anthropic RESMI DeepSeek (https://api.deepseek.com/anthropic) — TANPA proxy lokal: cukup API key. Streaming, tool, & reasoning sudah diuji jalan di Grove. Pilih modelnya di dropdown: deepseek-v4-pro (paling pintar, ~1jt konteks) atau deepseek-v4-flash (lebih cepat & hemat) — bisa diganti per-sesi lewat klik-kanan kartu sesi. Kuota gaya Claude tak berlaku — yang berlaku saldo & rate-limit DeepSeek.'
+        : p === 'openrouter'
         ? '⚠️ OpenRouter hanya MENJAMIN Claude Code untuk model Anthropic. Model lain (mis. Nemotron) bisa saja tak patuh protokol tool Grove — uji dulu di satu sesi sebelum diandalkan. Kuota gaya Claude tak berlaku (auto-switch/ambang diabaikan).'
-        : p === 'custom'
-          ? '🔌 Perlu PROXY penerjemah Anthropic→Gemini yang jalan lokal (LiteLLM / claude-code-router) memegang API key Gemini gratismu. Base URL = alamat proxy itu; Model = nama yang dikenal proxy. Kuota gaya Claude tak berlaku — "limit" = rate-limit Gemini (bukan kuota Claude).'
-          : 'Token `claude setup-token` didukung penuh: menjalankan sesi maupun memantau kuota (usage dibaca dari header rate-limit bila endpoint resmi menolak).'
+        : p === 'cursor'
+          ? '🔌 Butuh PROXY Anthropic-native untuk Cursor. Termudah: raine/claude-code-proxy → jalankan "claude-code-proxy cursor auth login" lalu "claude-code-proxy serve" (:18765); di form token isi "unused" (auth disimpan proxy), Model = cursor / composer-2.5. Alternatif: Cursor-To-OpenAI + bridge Anthropic→OpenAI, token = WorkosCursorSessionToken. Kuota gaya Claude tak berlaku — "limit" = batas request Cursor.'
+          : p === 'custom'
+            ? '🔌 Perlu PROXY penerjemah Anthropic→Gemini yang jalan lokal (LiteLLM / claude-code-router) memegang API key Gemini gratismu. Base URL = alamat proxy itu; Model = nama yang dikenal proxy. Kuota gaya Claude tak berlaku — "limit" = rate-limit Gemini (bukan kuota Claude).'
+            : 'Token `claude setup-token` didukung penuh: menjalankan sesi maupun memantau kuota (usage dibaca dari header rate-limit bila endpoint resmi menolak).'
   }
   prov.addEventListener('change', applyProvider)
 
@@ -1780,15 +2471,18 @@ function renderAccountsPanel(): void {
   add.addEventListener('click', () => {
     const l = label.value.trim()
     const t = token.value.trim()
-    const provider = prov.value as 'claude' | 'openrouter' | 'custom'
-    const skin = provider === 'openrouter' || provider === 'custom'
+    const provider = prov.value as 'claude' | 'openrouter' | 'custom' | 'cursor' | 'deepseek'
+    const proxy = provider === 'custom' || provider === 'cursor'
+    const skin = provider === 'openrouter' || provider === 'deepseek' || proxy
     const p = !skin && Number(plan.value) > 0 ? Number(plan.value) : undefined
-    const m = skin ? orModel.value.trim() : undefined
-    const url = provider === 'custom' ? baseUrl.value.trim() : undefined
+    // DeepSeek: dari dropdown (pro/flash), selalu terisi. Skin lain: ketik bebas.
+    const m = provider === 'deepseek' ? dsModel.value || DEEPSEEK_MODEL_DEFAULT : skin ? orModel.value.trim() : undefined
+    const url = proxy ? baseUrl.value.trim() : undefined
     if (!l || !t) return alert('Isi label & token/key dulu.')
     if (provider === 'openrouter' && !m) return alert('Isi id model OpenRouter (mis. nvidia/nemotron-3-super-120b-a12b:free).')
+    if (provider === 'cursor' && !m) return alert('Isi nama model Cursor yang dikenal proxy (mis. claude-3.5-sonnet).')
     if (provider === 'custom' && !m) return alert('Isi nama model yang dikenal proxy (mis. gemini-2.5-flash).')
-    if (provider === 'custom' && !url) return alert('Isi base URL proxy (mis. http://localhost:4000).')
+    if (proxy && !url) return alert('Isi base URL proxy (mis. http://localhost:3000).')
     void window.grove
       .addAccount(l, t, p, undefined, provider, m, url)
       .then(() => {
@@ -1800,7 +2494,7 @@ function renderAccountsPanel(): void {
       })
       .catch((e) => alert(`Gagal tambah: ${String(e)}`))
   })
-  panel.append(prov, label, token, baseUrl, orModel, datalist, hint, plan, add)
+  panel.append(prov, label, token, baseUrl, dsModel, orModel, datalist, hint, plan, add)
   applyProvider() // set tampilan awal sesuai provider default (claude)
 
   const node = activeId ? nodes.get(activeId) : null
@@ -1849,6 +2543,244 @@ function renderAccountsPanel(): void {
   }
 }
 
+// ---- Panel Tools: diff checker + formatter (MURNI renderer / client-side) ----
+// Dua utilitas mandiri, tidak menyentuh DB/IPC/main maupun panel chat LOG.
+
+/** Satu operasi diff per-baris: sama (eq), tambah (add), hapus (del). */
+type DiffOp = { type: 'eq' | 'add' | 'del'; text: string }
+
+/**
+ * Diff per-baris berbasis LCS (longest common subsequence). Baris yang sama dipertahankan,
+ * selebihnya jadi hapus (dari A) / tambah (ke B). O(n·m) memori & waktu — cukup untuk textarea.
+ */
+function lineDiff(a: string[], b: string[]): DiffOp[] {
+  const n = a.length
+  const m = b.length
+  // Tabel LCS diisi dari belakang: dp[i][j] = panjang subsequence sama dari a[i..] & b[j..].
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0))
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1])
+    }
+  }
+  const out: DiffOp[] = []
+  let i = 0
+  let j = 0
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      out.push({ type: 'eq', text: a[i] })
+      i++
+      j++
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      out.push({ type: 'del', text: a[i] })
+      i++
+    } else {
+      out.push({ type: 'add', text: b[j] })
+      j++
+    }
+  }
+  while (i < n) out.push({ type: 'del', text: a[i++] })
+  while (j < m) out.push({ type: 'add', text: b[j++] })
+  return out
+}
+
+let toolsPanelBuilt = false
+
+/** Isi panel Tools SEKALI (lazy) supaya teks yang diketik user tak hilang saat panel dibuka-tutup. */
+function renderToolsPanel(): void {
+  if (toolsPanelBuilt) return
+  toolsPanelBuilt = true
+  const panel = $('tools-panel')
+  panel.textContent = ''
+  panel.append(el('div', { class: 'ap-title' }, 'TOOLS'))
+
+  const tabDiff = el('button', { class: 'tools-tab active' }, 'Diff')
+  const tabFmt = el('button', { class: 'tools-tab' }, 'Formatter')
+  panel.append(el('div', { class: 'tools-tabs' }, tabDiff, tabFmt))
+
+  const secDiff = el('div', { class: 'tools-sec' })
+  const secFmt = el('div', { class: 'tools-sec' })
+  secFmt.hidden = true
+  panel.append(secDiff, secFmt)
+
+  const showTab = (which: 'diff' | 'fmt'): void => {
+    const isDiff = which === 'diff'
+    secDiff.hidden = !isDiff
+    secFmt.hidden = isDiff
+    tabDiff.classList.toggle('active', isDiff)
+    tabFmt.classList.toggle('active', !isDiff)
+  }
+  tabDiff.addEventListener('click', () => showTab('diff'))
+  tabFmt.addEventListener('click', () => showTab('fmt'))
+
+  buildDiffSection(secDiff)
+  buildFormatterSection(secFmt)
+}
+
+/** Seksi Diff: dua textarea (A lama / B baru) → render diff per-baris berwarna. */
+function buildDiffSection(sec: HTMLElement): void {
+  const taA = document.createElement('textarea')
+  taA.className = 'tools-ta'
+  taA.rows = 6
+  taA.placeholder = 'Teks A (lama)…'
+  const taB = document.createElement('textarea')
+  taB.className = 'tools-ta'
+  taB.rows = 6
+  taB.placeholder = 'Teks B (baru)…'
+  sec.append(
+    el(
+      'div',
+      { class: 'tools-grid2' },
+      el('div', { class: 'tools-col' }, el('label', { class: 'tools-lbl' }, 'A · lama'), taA),
+      el('div', { class: 'tools-col' }, el('label', { class: 'tools-lbl' }, 'B · baru'), taB)
+    )
+  )
+
+  const stat = el('span', { class: 'tools-stat' }, '')
+  const out = el('div', { class: 'diff-out' })
+
+  const run = (): void => {
+    // String kosong → 0 baris (bukan [''] satu baris kosong), supaya statistik jujur.
+    const a = taA.value === '' ? [] : taA.value.split('\n')
+    const b = taB.value === '' ? [] : taB.value.split('\n')
+    out.textContent = ''
+    // Guard beban: LCS O(n·m). Cegah UI beku pada input raksasa.
+    if (a.length * b.length > 4_000_000) {
+      out.append(el('div', { class: 'diff-msg' }, 'Terlalu besar untuk dibandingkan per-baris (batas ±2000×2000 baris).'))
+      stat.textContent = ''
+      return
+    }
+    const ops = lineDiff(a, b)
+    let add = 0
+    let del = 0
+    for (const op of ops) {
+      if (op.type === 'add') add++
+      else if (op.type === 'del') del++
+      const sign = op.type === 'add' ? '+' : op.type === 'del' ? '-' : ' '
+      out.append(
+        el(
+          'div',
+          { class: `diff-line diff-${op.type}` },
+          el('span', { class: 'diff-sign' }, sign),
+          el('span', { class: 'diff-txt' }, op.text)
+        )
+      )
+    }
+    if (!ops.length) out.append(el('div', { class: 'diff-msg' }, 'Kedua sisi kosong.'))
+    else if (!add && !del) out.append(el('div', { class: 'diff-msg' }, 'Identik — tak ada perbedaan.'))
+    stat.textContent = add || del ? `+${add} −${del}` : ''
+  }
+
+  const btn = el('button', { class: 'tools-btn primary' }, 'Bandingkan')
+  btn.addEventListener('click', run)
+  // Interaktif juga saat mengetik (debounce ringan), selain klik tombol.
+  let t: number | undefined
+  const onInput = (): void => {
+    window.clearTimeout(t)
+    t = window.setTimeout(run, 250)
+  }
+  taA.addEventListener('input', onInput)
+  taB.addEventListener('input', onInput)
+
+  sec.append(el('div', { class: 'tools-actions' }, btn, stat), out)
+}
+
+/** Seksi Formatter: input + pilih bahasa (JSON/YAML) → output rapi read-only + tombol Salin. */
+function buildFormatterSection(sec: HTMLElement): void {
+  const input = document.createElement('textarea')
+  input.className = 'tools-ta'
+  input.rows = 7
+  input.placeholder = 'Tempel JSON atau YAML berantakan di sini…'
+
+  const lang = document.createElement('select')
+  lang.className = 'tools-sel'
+  for (const [v, tx] of [
+    ['json', 'JSON'],
+    ['yaml', 'YAML']
+  ] as const) {
+    const o = document.createElement('option')
+    o.value = v
+    o.textContent = tx
+    lang.append(o)
+  }
+
+  const out = document.createElement('textarea')
+  out.className = 'tools-ta tools-out'
+  out.rows = 8
+  out.readOnly = true
+  out.placeholder = 'Hasil rapi muncul di sini…'
+
+  const msg = el('div', { class: 'tools-msg' }, '')
+
+  const format = (): void => {
+    const src = input.value
+    if (src.trim() === '') {
+      out.value = ''
+      msg.className = 'tools-msg'
+      msg.textContent = 'Input kosong.'
+      return
+    }
+    try {
+      if (lang.value === 'json') {
+        // Validasi + pretty 2 spasi.
+        out.value = JSON.stringify(JSON.parse(src), null, 2)
+      } else {
+        // Round-trip via js-yaml: load → dump (indent 2, tanpa wrap baris, tanpa anchor/alias).
+        out.value = yamlDump(yamlLoad(src), { indent: 2, lineWidth: -1, noRefs: true })
+      }
+      msg.className = 'tools-msg ok'
+      msg.textContent = '✓ Rapi.'
+    } catch (e) {
+      // Input tak valid → pesan ramah, TIDAK crash.
+      out.value = ''
+      msg.className = 'tools-msg err'
+      msg.textContent = `⛔ ${lang.value.toUpperCase()} tidak valid: ${e instanceof Error ? e.message : String(e)}`
+    }
+  }
+
+  const btnFmt = el('button', { class: 'tools-btn primary' }, 'Rapikan')
+  btnFmt.addEventListener('click', format)
+  lang.addEventListener('change', () => {
+    if (out.value || (msg.textContent && msg.classList.contains('err'))) format() // re-run kalau sudah ada hasil
+  })
+
+  const btnCopy = el('button', { class: 'tools-btn' }, 'Salin')
+  const flash = (label: string): void => {
+    const old = btnCopy.textContent
+    btnCopy.textContent = label
+    window.setTimeout(() => (btnCopy.textContent = old), 1200)
+  }
+  const selectOut = (): void => {
+    out.focus()
+    out.select()
+  }
+  btnCopy.addEventListener('click', () => {
+    if (!out.value) return
+    if (navigator.clipboard?.writeText) {
+      void navigator.clipboard.writeText(out.value).then(
+        () => flash('✓ Tersalin'),
+        () => selectOut() // clipboard ditolak → biarkan user Ctrl+C manual
+      )
+    } else {
+      selectOut()
+      try {
+        if (document.execCommand('copy')) flash('✓ Tersalin')
+      } catch {
+        /* biarkan terseleksi untuk salin manual */
+      }
+    }
+  })
+
+  sec.append(
+    el('label', { class: 'tools-lbl' }, 'Input'),
+    input,
+    el('div', { class: 'tools-actions' }, el('span', { class: 'tools-lbl' }, 'Bahasa:'), lang, btnFmt, btnCopy),
+    msg,
+    el('label', { class: 'tools-lbl' }, 'Output'),
+    out
+  )
+}
+
 // ---- events ----------------------------------------------------------------
 
 function onEvent(ev: GroveEvent): void {
@@ -1872,6 +2804,11 @@ function onEvent(ev: GroveEvent): void {
         updateNodeVisual(ev.payload.id) // incremental, bukan rebuild pohon
         touchActive(ev.payload.id) // catat waktu aktif + refresh label jam idle/done
         if (ev.payload.id === activeId) updateChatHeader()
+        // Rincian token per-call (dari applyUsage) → catat ke turn LOG untuk diagnosa "kenapa berat".
+        if (ev.payload.id === activeId && ev.payload.callUsage) logAddCallUsage(ev.payload.callUsage)
+        // Turn sesi aktif selesai (idle/done) → tandai penanda akhir-turn di pohon LOG.
+        if (ev.payload.id === activeId && (ev.payload.status === 'idle' || ev.payload.status === 'done'))
+          logMarkTurnDone()
         // Akun sesi aktif berganti (manual atau auto-switch saat limit) → usage harus ikut pindah.
         if (ev.payload.id === activeId && 'accountId' in ev.payload) syncUsageSession()
       }
@@ -1906,12 +2843,26 @@ function onEvent(ev: GroveEvent): void {
       } else {
         appendChatMessage(m)
       }
+      if (m.role === 'user') sentPrompts.push(m.text) // bahan riwayat ↑ (prompt yang sudah terkirim)
+      logIngest(m) // pohon LOG live-update (sumber sama)
+      break
+    }
+    case 'queue:update': {
+      if (ev.payload.id !== activeId) break
+      queueItems = ev.payload.items
+      if (editingQid != null && !queueItems.some((q) => q.qid === editingQid)) setEditingQid(null) // sudah terkirim
+      renderQueueStrip()
+      break
+    }
+    case 'log:request': {
+      if (ev.payload.id !== activeId) break
+      logAddRequest(ev.payload.kind, ev.payload.text, ev.payload.bytes, ev.payload.images)
       break
     }
     case 'chat:detail': {
       if (ev.payload.id !== activeId) break
       const pre = toolDetailEls.get(ev.payload.toolUseId)
-      if (pre) pre.textContent = ev.payload.detail // sisipkan output tool yang baru tiba
+      if (pre) renderToolDetail(pre, ev.payload.detail) // output tool tiba → render ulang (warna tetap)
       break
     }
     case 'board:update': {
@@ -1936,7 +2887,9 @@ function onEvent(ev: GroveEvent): void {
       defaultSwitchPct = ev.payload.defaultSwitchPct
       defaultAccountId = ev.payload.defaultAccountId
       defaultModel = ev.payload.defaultModel
+      defaultEffort = ev.payload.defaultEffort
       syncGlobalModel()
+      syncGlobalEffort()
       const panel = $('acct-panel')
       // JANGAN bangun ulang panel saat user sedang mengetik di dalamnya. Event ini juga datang dari
       // latar (watchdog usage tiap 5 mnt → noteUsageReadable); membangun ulang mid-edit menghapus
@@ -2146,20 +3099,52 @@ async function init(): Promise<void> {
   document.addEventListener('click', () => {
     $('usage-panel').classList.remove('show')
     $('acct-panel').classList.remove('show')
+    $('tools-panel').classList.remove('show')
     closeSessionMenu()
   })
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') closeSessionMenu()
   })
-  // Scroll di sidebar / window → posisi menu jadi salah; tutup saja.
-  window.addEventListener('scroll', closeSessionMenu, true)
+  // Scroll yang BENAR-BENAR memindahkan kartu (sidebar/dokumen) membuat posisi menu salah → tutup.
+  // BUG YANG DIPERBAIKI: dulu listener ini menangkap SEMUA scroll (capture=true), termasuk auto-scroll
+  // #chat-log yang terjadi tiap potongan streaming. Akibatnya saat sesi sedang jalan, menu klik-kanan
+  // ditutup ulang beberapa kali per detik → terlihat "kedip-kedip" dan seolah tak bisa dibuka.
+  window.addEventListener(
+    'scroll',
+    (e) => {
+      const t = e.target as (HTMLElement & { closest?: (s: string) => Element | null }) | Document | null
+      if (t && t !== document && !(t as HTMLElement).closest?.('#tree')) return
+      closeSessionMenu()
+    },
+    true
+  )
+
+  // Panel REQUEST: default TERTUTUP (logCollapsed=true) — isi chat sudah lengkap, panel ini alat
+  // diagnosa. Terapkan state awalnya ke DOM supaya caret & isi tak pernah beda dari variabelnya.
+  $('log-tree').hidden = logCollapsed
+  $('log-caret').textContent = logCollapsed ? '▸' : '▾'
+  $('log-head').addEventListener('click', () => {
+    logCollapsed = !logCollapsed
+    $('log-tree').hidden = logCollapsed
+    $('log-caret').textContent = logCollapsed ? '▸' : '▾'
+  })
 
   $('btn-accounts').addEventListener('click', (e) => {
     e.stopPropagation()
+    $('tools-panel').classList.remove('show') // jangan tumpang-tindih dengan panel Tools
     const p = $('acct-panel')
     if (p.classList.toggle('show')) renderAccountsPanel()
   })
   $('acct-panel').addEventListener('click', (e) => e.stopPropagation()) // klik di dalam panel jangan menutup
+
+  $('btn-tools').addEventListener('click', (e) => {
+    e.stopPropagation()
+    $('acct-panel').classList.remove('show') // jangan tumpang-tindih dengan panel Akun
+    $('usage-panel').classList.remove('show')
+    const p = $('tools-panel')
+    if (p.classList.toggle('show')) renderToolsPanel()
+  })
+  $('tools-panel').addEventListener('click', (e) => e.stopPropagation()) // klik di dalam panel jangan menutup
 
   // Drag-reorder sidebar (dengar global agar terus terlacak walau kursor keluar node).
   document.addEventListener('pointermove', onDragMove)
@@ -2171,14 +3156,35 @@ async function init(): Promise<void> {
     const text = input.value.trim()
     const images = pendingImages.slice()
     const refs = pendingRefs.slice()
+    // Sedang mengedit pesan yang MASIH ANTRI → simpan perubahannya ke antrian, jangan kirim baru.
+    // (Kalau item itu sudah terlanjur terkirim, editQueued balikan false → jatuh jadi prompt baru.)
+    if (editingQid != null && activeId) {
+      const qid = editingQid
+      const saved = await window.grove.editQueued(activeId, qid, text).catch(() => false)
+      if (saved) {
+        input.value = ''
+        autoGrow(input)
+        resetHistoryNav()
+        renderQueueStrip()
+        input.focus()
+        return
+      }
+      setEditingQid(null) // sudah dijawab/terkirim → lanjut sebagai prompt baru
+    }
     if (!text && images.length === 0 && refs.length === 0) return
+    resetHistoryNav()
     input.value = ''
     autoGrow(input)
     pendingImages = []
     pendingRefs = []
     renderAttachStrip()
+    // Referensi = TITIK MASUK, bukan perintah baca-semua. Kalimat lama ("baca file/folder ini")
+    // membuat agen menelan seluruh isi folder ke konteks — dibayar penuh sekali lalu dikirim ulang
+    // tiap giliran. Sekarang eksplisit: cari dulu, baca seperlunya.
     const refBlock = refs.length
-      ? `Referensi (baca file/folder ini untuk konteks):\n${refs.map((p) => `- ${p}`).join('\n')}\n\n`
+      ? `Referensi — titik masuk, BUKAN bahan bacaan wajib. Untuk folder: cari dulu (Glob/Grep) lalu baca hanya bagian yang relevan; jangan membaca seluruh isinya:\n${refs
+          .map((p) => `- ${p}`)
+          .join('\n')}\n\n`
       : ''
     const freshChat = async (): Promise<string> => {
       const meta = await window.grove.newChat()
@@ -2186,6 +3192,7 @@ async function init(): Promise<void> {
       activeId = meta.id // set aktif langsung (tanpa await getChat) supaya kirim tidak terhambat
       $('chat-log').textContent = ''
       toolDetailEls.clear()
+      logReset()
       pendingEl = null
       pendingTextNode = null
       pendingText = ''
@@ -2198,6 +3205,29 @@ async function init(): Promise<void> {
       const targetId = activeId && nodes.has(activeId) ? activeId : await freshChat()
       drafts.delete(targetId) // pesan terkirim DARI sesi ini → draft-nya tak berlaku lagi
       updateNodeVisual(targetId) // hapus penanda ✎ bila sempat ada
+      // Tempel "grove:ref:<id>" ke kolom chat = tautkan referensi (bukan kirim pesan).
+      if (/^grove:ref:/i.test(text)) {
+        linkReferenceFromText(targetId, text)
+        input.focus()
+        return
+      }
+      // /btw <pertanyaan> — tanya sisipan: dijawab query TERPISAH, tak masuk antrian & konteks sesi
+      // utama, jadi aman ditanyakan saat sesi sedang bekerja. Lampiran tidak ikut (ini kanal tanya).
+      const btw = /^\/btw\b\s*([\s\S]*)$/.exec(text)
+      if (btw) {
+        const question = btw[1].trim()
+        if (!question) {
+          appendChatMessage({
+            role: 'side',
+            text: 'Pakai: /btw <pertanyaan> — dijawab di samping, tanpa mengganggu pekerjaan sesi ini.',
+            ts: Date.now()
+          })
+        } else {
+          await window.grove.askSide(targetId, question)
+        }
+        input.focus()
+        return
+      }
       try {
         await window.grove.sendChat(targetId, refBlock + text, images)
       } catch (err) {
@@ -2225,6 +3255,28 @@ async function init(): Promise<void> {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault() // Enter kirim; Shift+Enter baris baru
       void doSend()
+      return
+    }
+    // ↑/↓ = telusuri riwayat prompt, HANYA saat kursor di ujung (biar tetap bisa navigasi teks
+    // multi-baris seperti biasa) atau kolom masih kosong.
+    if (e.key === 'ArrowUp' && (inputEl.selectionStart === 0 || histIdx >= 0)) {
+      e.preventDefault()
+      navigateHistory(1)
+      renderQueueStrip()
+      return
+    }
+    if (e.key === 'ArrowDown' && histIdx >= 0) {
+      e.preventDefault()
+      navigateHistory(-1)
+      renderQueueStrip()
+      return
+    }
+    if (e.key === 'Escape' && histIdx >= 0) {
+      e.preventDefault()
+      inputEl.value = histDraft
+      resetHistoryNav()
+      renderQueueStrip()
+      autoGrow(inputEl)
     }
   })
   inputEl.addEventListener('input', () => autoGrow(inputEl))
@@ -2298,7 +3350,9 @@ async function init(): Promise<void> {
       defaultSwitchPct = r.defaultSwitchPct
       defaultAccountId = r.defaultAccountId
       defaultModel = r.defaultModel
+      defaultEffort = r.defaultEffort
       syncGlobalModel()
+      syncGlobalEffort()
       // Startup tanpa akun sama sekali → beri tahu SEKARANG, jangan tunggu user gagal kirim pesan.
       if (!accounts.length) {
         showAuthBanner({ sessionTitle: '', tokenMissing: false, hasAccounts: false })

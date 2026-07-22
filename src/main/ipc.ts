@@ -5,7 +5,9 @@ import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { SessionManager } from './orchestrator/SessionManager'
 import type { ImageAttachment } from '../shared/types'
+import { isEffort } from '../shared/types'
 import { fetchOpenRouterModels } from './openrouter'
+import { fetchDeepseekBalance } from './deepseek'
 
 export function registerIpc(manager: SessionManager): void {
   ipcMain.handle('grove:dropFolder', (_e, { path, title }: { path: string; title?: string }) => {
@@ -51,6 +53,46 @@ export function registerIpc(manager: SessionManager): void {
     }
   )
 
+  // /btw — pertanyaan sampingan: query terpisah, tak mengantre di sesi utama (boleh saat sesi sibuk).
+  ipcMain.handle('grove:askSide', (_e, { id, question }: { id: string; question: string }) =>
+    manager.askSide(id, question)
+  )
+
+  // Saldo DeepSeek (dari platform) + perkiraan biaya lokal per jendela waktu. Saldo di-cache 60s di
+  // deepseek.ts; kegagalan per-akun dilaporkan sebagai `error` — JANGAN tampilkan angka palsu.
+  ipcMain.handle('grove:getDeepseekCosts', async () => {
+    const rows = manager.deepseekCosts()
+    return Promise.all(
+      rows.map(async (r) => {
+        const token = manager.getAccountToken(r.accountId)
+        if (!token) return { ...r, balance: null, error: 'akun tanpa token' }
+        try {
+          return { ...r, balance: await fetchDeepseekBalance(token) }
+        } catch (e) {
+          return { ...r, balance: null, error: String(e) }
+        }
+      })
+    )
+  })
+
+  // Antrian pesan user (ditahan Grove selama turn berjalan → masih bisa diedit/dibatalkan).
+  ipcMain.handle('grove:listQueued', (_e, { id }: { id: string }) => manager.listQueued(id))
+  ipcMain.handle('grove:editQueued', (_e, { id, qid, text }: { id: string; qid: number; text: string }) =>
+    manager.editQueued(id, qid, text)
+  )
+  ipcMain.handle('grove:cancelQueued', (_e, { id, qid }: { id: string; qid: number }) =>
+    manager.cancelQueued(id, qid)
+  )
+
+  // Referensi antar-sesi (satu arah: helper boleh membantu target; target tak tahu & tak punya balik).
+  ipcMain.handle('grove:linkReference', (_e, { helperId, targetId }: { helperId: string; targetId: string }) =>
+    manager.linkReference(helperId, targetId)
+  )
+  ipcMain.handle('grove:unlinkReference', (_e, { helperId, targetId }: { helperId: string; targetId: string }) =>
+    manager.unlinkReference(helperId, targetId)
+  )
+  ipcMain.handle('grove:listReferences', (_e, { helperId }: { helperId: string }) => manager.listReferences(helperId))
+
   ipcMain.handle('grove:stopSession', (_e, { id }: { id: string }) => manager.stopSession(id))
 
   ipcMain.handle('grove:stopAll', () => manager.stopAll())
@@ -81,7 +123,7 @@ export function registerIpc(manager: SessionManager): void {
         token: string
         plan?: number
         switchPct?: number
-        provider?: 'claude' | 'openrouter' | 'custom'
+        provider?: 'claude' | 'openrouter' | 'custom' | 'cursor' | 'deepseek'
         model?: string
         baseUrl?: string
       }
@@ -102,6 +144,13 @@ export function registerIpc(manager: SessionManager): void {
     manager.setSessionModel(id, model)
   )
   ipcMain.handle('grove:setLite', (_e, { id, lite }: { id: string; lite: boolean }) => manager.setLite(id, lite))
+  // Tingkat mikir (reasoning): per-sesi & global. Nilai tak sah → null (kembali mewarisi/default).
+  ipcMain.handle('grove:setSessionEffort', (_e, { id, effort }: { id: string; effort: string | null }) =>
+    manager.setSessionEffort(id, isEffort(effort) ? effort : null)
+  )
+  ipcMain.handle('grove:setDefaultEffort', (_e, { effort }: { effort: string | null }) =>
+    manager.setDefaultEffort(isEffort(effort) ? effort : null)
+  )
   // Daftar model OpenRouter (live). Gagal jaringan → balikan [] supaya renderer fallback ke saran statis.
   ipcMain.handle('grove:listOpenRouterModels', async (_e, { freeOnly }: { freeOnly?: boolean }) => {
     try {

@@ -5,6 +5,7 @@ import initSqlJs, { type Database } from 'sql.js'
 import { readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import type { Account, BoardEntry, ChatMessage, InboxMessage, Memory, SessionMeta, TodoItem } from '../../shared/types'
+import { isEffort } from '../../shared/types'
 
 const require = createRequire(import.meta.url)
 
@@ -96,6 +97,17 @@ CREATE TABLE IF NOT EXISTS usage_hourly (
   calls INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (hour_start, account_id)
 );
+-- REFERENSI ANTAR-SESI, SATU ARAH. helper_id boleh MEMBACA papan/ekor chat target dan MENGIRIM
+-- pesan ke sana; target TIDAK tahu apa-apa dan TIDAK punya akses balik (dua baris berlawanan
+-- sengaja ditolak di SessionManager). Ini murni kanal koordinasi: konteks & cache SDK tetap
+-- terkunci per-sesi (tiap sesi punya sdkSessionId sendiri) — dua sesi di folder kerja yang sama
+-- pun tak pernah berbagi percakapan.
+CREATE TABLE IF NOT EXISTS session_refs (
+  helper_id TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (helper_id, target_id)
+);
 `
 
 // Debounce simpan-ke-disk. sql.js meng-EXPORT SELURUH image DB tiap simpan (O(ukuran DB),
@@ -136,8 +148,9 @@ export class Board {
       // Ambang auto-switch PER AKUN (persen). NULL → pakai default global (DEFAULT_SWITCH_PCT).
       `ALTER TABLE accounts ADD COLUMN switch_pct INTEGER`,
       // Provider akun: NULL/'claude' = token Claude (CLAUDE_CODE_OAUTH_TOKEN); 'openrouter' = key
-      // OpenRouter (dipakai via ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN). or_model = id model
-      // OpenRouter yang WAJIB dipakai akun itu (mis. nvidia/nemotron-3-super-120b-a12b:free).
+      // OpenRouter, 'deepseek' = API key DeepSeek (keduanya via ANTHROPIC_BASE_URL konstanta +
+      // ANTHROPIC_AUTH_TOKEN). or_model = id model yang WAJIB dipakai akun itu (mis.
+      // nvidia/nemotron-3-super-120b-a12b:free, atau deepseek-v4-pro).
       `ALTER TABLE accounts ADD COLUMN provider TEXT`,
       `ALTER TABLE accounts ADD COLUMN or_model TEXT`,
       // Untuk provider 'custom': base URL endpoint Anthropic-compatible sendiri (proxy lokal), mis.
@@ -145,7 +158,10 @@ export class Board {
       `ALTER TABLE accounts ADD COLUMN base_url TEXT`,
       // Mode RINGAN sesi: 1 = tanpa MCP grove + tanpa append protokol (CLI-parity, hemat token).
       // NULL/0 = orkestrator penuh. Sesi lama → NULL → orkestrator (perilaku lama tak berubah).
-      `ALTER TABLE sessions ADD COLUMN lite INTEGER`
+      `ALTER TABLE sessions ADD COLUMN lite INTEGER`,
+      // Tingkat mikir per-sesi ('off'|'low'|'medium'|'high'|'xhigh'|'max'). NULL = mewarisi
+      // (sesi utama → global → default model), persis pola kolom model.
+      `ALTER TABLE sessions ADD COLUMN effort TEXT`
     ]) {
       try {
         this.db.run(sql)
@@ -206,17 +222,19 @@ export class Board {
     this.run(
       `INSERT INTO sessions
         (id, sdk_session_id, tree_id, parent_id, role, title, cwd, model, status,
-         ctx_input, ctx_output, ctx_window, order_index, account_id, lite, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ctx_input, ctx_output, ctx_window, order_index, account_id, lite, effort, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(id) DO UPDATE SET
          sdk_session_id=excluded.sdk_session_id, title=excluded.title, model=excluded.model,
          status=excluded.status, ctx_input=excluded.ctx_input, ctx_output=excluded.ctx_output,
          ctx_window=excluded.ctx_window, order_index=excluded.order_index,
-         account_id=excluded.account_id, lite=excluded.lite, updated_at=excluded.updated_at`,
+         account_id=excluded.account_id, lite=excluded.lite, effort=excluded.effort,
+         updated_at=excluded.updated_at`,
       [
         m.id, m.sdkSessionId ?? null, m.treeId, m.parentId, m.role, m.title, m.cwd,
         m.model ?? null, m.status, m.ctxInput, m.ctxOutput, m.ctxWindow,
-        m.orderIndex ?? null, m.accountId ?? null, m.lite ? 1 : null, m.createdAt, m.updatedAt
+        m.orderIndex ?? null, m.accountId ?? null, m.lite ? 1 : null, m.effort ?? null,
+        m.createdAt, m.updatedAt
       ]
     )
     this.run(
@@ -262,6 +280,31 @@ export class Board {
     this.run(`DELETE FROM messages WHERE from_session=? OR to_session=?`, [id, id])
     this.run(`DELETE FROM chat_messages WHERE session_id=?`, [id])
     this.run(`DELETE FROM memories WHERE session_id=? OR tree_id=?`, [id, id])
+    this.run(`DELETE FROM session_refs WHERE helper_id=? OR target_id=?`, [id, id]) // tautan yatim
+  }
+
+  // ---- referensi antar-sesi (satu arah: helper → target) --------------------
+
+  addRef(helperId: string, targetId: string, ts: number): void {
+    this.run(`INSERT OR IGNORE INTO session_refs (helper_id, target_id, created_at) VALUES (?,?,?)`, [
+      helperId, targetId, ts
+    ])
+  }
+  removeRef(helperId: string, targetId: string): void {
+    this.run(`DELETE FROM session_refs WHERE helper_id=? AND target_id=?`, [helperId, targetId])
+  }
+  /** Target yang boleh dibantu oleh helper ini. */
+  getRefTargets(helperId: string): string[] {
+    return this.all(`SELECT target_id FROM session_refs WHERE helper_id=? ORDER BY created_at ASC`, [helperId]).map(
+      (r) => String(r.target_id)
+    )
+  }
+  /** Semua tautan (dipakai cek arah-balik & bersih-bersih). */
+  getAllRefs(): Array<{ helperId: string; targetId: string }> {
+    return this.all(`SELECT helper_id, target_id FROM session_refs`).map((r) => ({
+      helperId: String(r.helper_id),
+      targetId: String(r.target_id)
+    }))
   }
 
   // ---- memories (hasil compact) --------------------------------------------
@@ -331,7 +374,11 @@ export class Board {
           ? ('openrouter' as const)
           : r.provider === 'custom'
             ? ('custom' as const)
-            : ('claude' as const),
+            : r.provider === 'cursor'
+              ? ('cursor' as const)
+              : r.provider === 'deepseek'
+                ? ('deepseek' as const)
+                : ('claude' as const),
       model: r.or_model == null ? undefined : String(r.or_model),
       baseUrl: r.base_url == null ? undefined : String(r.base_url),
       createdAt: Number(r.created_at)
@@ -403,6 +450,29 @@ export class Board {
       cacheCreation: Number(r.cache_creation),
       output: Number(r.output),
       calls: Number(r.calls)
+    }))
+  }
+
+  /** Total kumulatif SEPANJANG waktu, DIPECAH per akun (untuk biaya per-akun "sejak awal"). */
+  getUsageAllTimeByAccount(): Array<{
+    accountId: string
+    input: number
+    cacheRead: number
+    cacheCreation: number
+    output: number
+    calls: number
+  }> {
+    return this.all(
+      `SELECT account_id, COALESCE(SUM(input),0) i, COALESCE(SUM(cache_read),0) cr,
+              COALESCE(SUM(cache_creation),0) cc, COALESCE(SUM(output),0) o, COALESCE(SUM(calls),0) n
+       FROM usage_hourly GROUP BY account_id`
+    ).map((r) => ({
+      accountId: String(r.account_id),
+      input: Number(r.i),
+      cacheRead: Number(r.cr),
+      cacheCreation: Number(r.cc),
+      output: Number(r.o),
+      calls: Number(r.n)
     }))
   }
 
@@ -562,6 +632,7 @@ function rowToSession(r: Record<string, unknown>): SessionMeta {
     orderIndex: r.order_index == null ? undefined : Number(r.order_index),
     accountId: r.account_id == null ? undefined : String(r.account_id),
     lite: r.lite ? true : undefined,
+    effort: isEffort(r.effort) ? r.effort : undefined,
     createdAt: Number(r.created_at),
     updatedAt: Number(r.updated_at)
   }

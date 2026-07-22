@@ -4,7 +4,7 @@
 
 import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
-import type { BoardEntry, InboxMessage, TodoItem } from '../../shared/types'
+import type { BoardEntry, EffortSetting, InboxMessage, TodoItem } from '../../shared/types'
 
 /** Kontrak yang harus disediakan SessionManager ke tools (hindari circular import). */
 export interface GroveHost {
@@ -35,7 +35,23 @@ export interface GroveHost {
   /** Model EFEKTIF sesi ini (model sesi → model sesi utama → model global → undefined = default SDK). */
   getSessionModel(sessionId: string): string | undefined
   /** Semua yang dibutuhkan query: env provider (Claude/OpenRouter) + model efektif. null = tak ada token. */
-  getSessionLaunch(sessionId: string): { env: Record<string, string>; model?: string } | null
+  getSessionLaunch(
+    sessionId: string
+  ): { env: Record<string, string>; model?: string; effort?: EffortSetting } | null
+  /** Akun efektif sesi ini bisa melihat gambar? (DeepSeek mengabaikan gambar diam-diam → false) */
+  sessionSeesImages(sessionId: string): boolean
+  /** Env+model akun yang bisa melihat gambar, untuk menjembatani gambar milik sesi yang buta gambar. */
+  getVisionLaunch(): { env: Record<string, string>; model?: string; label: string } | null
+  /** Semua kandidat jembatan gambar, terurut — dicoba berurutan saat yang pertama limit/gagal. */
+  getVisionLaunches(): Array<{ env: Record<string, string>; model?: string; label: string }>
+  /** Sesi ini punya referensi satu-arah? Menentukan dipasang/tidaknya tool ref_* (hemat skema token). */
+  hasReferences(sessionId: string): boolean
+  /** Sesi-sesi yang boleh DIBANTU sesi ini (tautan satu arah; target tak punya akses balik). */
+  listReferences(helperId: string): Array<{ id: string; title: string; status: string; cwd: string }>
+  /** Papan + ekor chat sesi referensi (read-only). Melempar bila tautannya tak ada. */
+  readReference(helperId: string, targetId: string, lines?: number): string
+  /** Kirim bantuan ke sesi referensi (masuk sebagai pesan user biasa di sana). */
+  sendToReference(helperId: string, targetId: string, text: string): void
   /** Dipanggil Session saat ia tak bisa jalan karena belum ada akun/token → UI memunculkan notifikasi. */
   onAccountMissing(sessionId: string): void
   /** Dipanggil Session tiap respons API → catat token ke riwayat pemakaian lokal (per jam/akun). */
@@ -215,9 +231,44 @@ export function buildGroveServer(sessionId: string, host: GroveHost) {
     }
   )
 
+  // --- REFERENSI SATU ARAH (hanya dipasang bila sesi ini PUNYA tautan) ---------------------------
+  // Tanpa tautan, tiga skema tool ini tak ikut dikirim tiap giliran → tak ada ongkos token untuk
+  // sesi biasa. Aksesnya divalidasi lagi di host (assertLinked), bukan cuma disembunyikan di sini.
+  const refList = tool(
+    'ref_list',
+    'List the sessions you may assist through a ONE-WAY reference link (they cannot see or reach you).',
+    {},
+    async () => ok(JSON.stringify(host.listReferences(sessionId)))
+  )
+
+  const refRead = tool(
+    'ref_read',
+    'Read a referenced session\'s CURRENT state: its board (summary/progress/todo) plus the tail of its conversation. Read-only. Use it before helping so your help is not a repeat of what it already knows.',
+    {
+      target_id: z.string().describe('Session id from ref_list'),
+      lines: z.number().optional().describe('How many trailing conversation lines to include (default 12, max 40)')
+    },
+    async (args) => ok(host.readReference(sessionId, args.target_id, args.lines))
+  )
+
+  const refSend = tool(
+    'ref_send',
+    'Send help INTO a referenced session — a fix, a missing fact, a concrete instruction. It arrives there as an ordinary user message: that session does NOT know it came from you and cannot reply to you directly. Send only things it does not already know (check ref_read first); be concrete and short, since every message costs that session a full turn.',
+    {
+      target_id: z.string().describe('Session id from ref_list'),
+      message: z.string().describe('The help itself: concrete, self-contained, no meta-talk about references')
+    },
+    async (args) => {
+      host.sendToReference(sessionId, args.target_id, args.message)
+      return ok(`Terkirim ke ${args.target_id}. Sesi itu akan mengerjakannya sebagai permintaan biasa.`)
+    }
+  )
+
+  const refTools = host.hasReferences(sessionId) ? [refList, refRead, refSend] : []
+
   return createSdkMcpServer({
     name: 'grove',
     version: '0.1.0',
-    tools: [spawnWorker, assignWorker, setTitle, updateSummary, updateTodo, reportProgress, reportToParent, saveCompaction, taskDone, readBoard, sendMessage, readMessages, listWorkers]
+    tools: [spawnWorker, assignWorker, setTitle, updateSummary, updateTodo, reportProgress, reportToParent, saveCompaction, taskDone, readBoard, sendMessage, readMessages, listWorkers, ...refTools]
   })
 }

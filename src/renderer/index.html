@@ -25,8 +25,15 @@
         <span class="dot s-await await-legend"></span>butuh jawaban
       </div>
       <select id="global-model" class="model-sel" title="Model default untuk semua sesi (bisa ditimpa per-sesi)"></select>
+      <select
+        id="global-effort"
+        class="model-sel"
+        title="Tingkat mikir default untuk semua sesi (bisa ditimpa per-sesi). low→max = kedalaman penalaran; off = tanpa extended thinking (efektif di Claude; DeepSeek tetap mikir)."
+      ></select>
       <button id="btn-accounts" class="acct-btn" title="Kelola akun Claude (login via setup-token) & switch per-sesi">⚙ Akun</button>
       <div id="acct-panel" class="acct-panel"></div>
+      <button id="btn-tools" class="acct-btn" title="Utilitas: diff checker berwarna & formatter JSON/YAML">🛠 Tools</button>
+      <div id="tools-panel" class="tools-panel"></div>
       <button id="btn-stop-all" class="stop-all-btn" title="Hentikan turn semua sesi yang sedang berjalan">■ Stop All</button>
     </header>
     <!-- Banner "belum ada akun". Grove berjalan murni dgn token akun GUI; tanpa itu sesi tak bisa
@@ -53,6 +60,11 @@
           <span id="chat-badge" class="badge"></span>
           <span id="chat-telem" class="telem"></span>
           <select id="chat-model" class="model-sel" title="Model sesi ini (kosong = ikut sesi utama / global)"></select>
+          <select
+            id="chat-effort"
+            class="model-sel"
+            title="Tingkat mikir (reasoning) sesi ini. low→max mengatur kedalaman penalaran (berlaku untuk Claude & DeepSeek). off = tanpa extended thinking — efektif di Claude; DeepSeek tetap menghasilkan thinking karena default servernya nyala. Kosong = ikut sesi utama / global. Berlaku di giliran berikutnya."
+          ></select>
           <button id="btn-lite" class="lite-btn" title="Mode: Chat ringan (hemat token, tanpa orkestrasi) vs Orkestrator (bisa spawn worker). Klik untuk ganti — berlaku di pesan berikutnya.">⚡ Chat</button>
           <button id="btn-loop" class="loop-btn" title="Auto-check berkala 10 menit: kirim &quot;udah sampe mana?&quot; ke UTAMA biar worker terus jalan (klik untuk on/off)">🔁 Auto</button>
           <button id="btn-compact" class="compact-btn" title="Ringkas laporan sub/sub-sub → simpan ke Memori & padatkan konteks (hanya UTAMA)">🗜 Compact</button>
@@ -60,15 +72,32 @@
         </div>
         <div id="chat-log" class="chat-log"></div>
         <div class="composer">
+          <!-- Pesan yang masih ANTRI (ditahan Grove selama turn jalan): bisa diedit / dibatalkan. -->
+          <div id="chat-queue" class="chat-queue"></div>
           <div id="chat-attach" class="chat-attach"></div>
           <form id="chat-form" class="chat-form">
             <textarea
               id="chat-input"
               rows="1"
-              placeholder="Ketik pesan…  (Enter kirim · Shift+Enter baris baru · tempel gambar dari clipboard)"
+              placeholder="Ketik pesan…  (Enter kirim · ↑ riwayat prompt · Shift+Enter baris baru · /btw tanya di samping)"
             ></textarea>
             <button id="chat-send" type="submit">Kirim</button>
           </form>
+        </div>
+        <!-- Panel REQUEST: teks MENTAH yang Grove kirim ke query() tiap giliran (termasuk auto-task &
+             recycle yang tak direkam ke chat). Isi chat TIDAK diduplikasi di sini — respons, tool,
+             dan metrik per-call semuanya tampil di chat. Tertutup secara default. -->
+        <div class="logpanel" id="logpanel">
+          <div
+            class="logpanel-head"
+            id="log-head"
+            title="Teks mentah yang Grove kirim ke model tiap giliran (prompt + reseed + auto-task) — klik untuk buka/tutup"
+          >
+            <span class="log-caret" id="log-caret">▸</span>
+            <span>REQUEST MENTAH</span>
+            <span class="log-hint" id="log-hint">belum ada</span>
+          </div>
+          <div class="log-tree" id="log-tree"></div>
         </div>
       </section>
 

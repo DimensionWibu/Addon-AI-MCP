@@ -24,23 +24,27 @@ import type {
   UsageStats,
   UsageTokens
 } from '../../shared/types'
-import { OPENROUTER_BASE_URL } from '../../shared/types'
+import {
+  DEEPSEEK_MODEL_DEFAULT,
+  deepseekCostUsd,
+  isDeepSeekModel,
+  providerSeesImages,
+  isEffort,
+  isSkinProvider,
+  skinBaseUrl,
+  usesOwnBaseUrl
+} from '../../shared/types'
+import type { EffortSetting } from '../../shared/types'
 import { Board } from './db'
 import { Session } from './Session'
 import { cap, CAP_MESSAGE, CAP_PROGRESS, type GroveHost } from './mcpTools'
 import { contextPercent, contextWindowFor } from './contextWindows'
+import { WAKE, reportSignature, shouldSkipWake } from './wakePolicy'
 
 const MAX_WORKERS_PER_TREE = 12
 const DEFAULT_MODEL: string | undefined = undefined // undefined = ikut default Claude Code
+// Semua angka tuning jalur-wake ada di ./wakePolicy (WAKE.*) — satu tempat, bisa diuji headless.
 // Tiap wake = SATU giliran root penuh (konteks root dikirim ulang → biaya usage nyata).
-// Debounce panjang menggabungkan banyak laporan worker jadi 1 giliran saja (hemat besar).
-const ROOT_STATUS_DEBOUNCE_MS = 60_000
-const LOOP_INTERVAL_MS = 10 * 60_000 // auto-check "udah sampe mana?" tiap 10 menit
-const IDLE_CHECK_LIMIT = 3 // auto-check beruntun tanpa perubahan → beralih ke mode cache-warm
-// Cache warm: setelah auto-check berhenti (idle-strike), lanjut ping ringan agar prefix prompt tetap
-// ter-cache di API. Pro plan = TTL 1 jam; interval HARUS di bawah TTL supaya cache tak expire.
-const CACHE_WARM_INTERVAL_MS = 45 * 60_000 // 45 menit — aman di bawah TTL 1 jam (Pro)
-const CACHE_WARM_STALE_MS = 50 * 60_000 // anggap cache stale bila tak ada API call selama ini
 const LIMIT_COOLDOWN_MS = 30 * 60_000 // akun yang kena limit dianggap "tak tersedia" selama ini
 // Ambang BAWAAN: pindah akun SEBELUM kena limit (bukan setelah). Dipakai akun yang tak menyetel
 // ambangnya sendiri (Account.switchPct). Nilai efektif per akun → switchPctFor().
@@ -56,10 +60,8 @@ function clampPct(pct: number): number {
 const DEFAULT_ACCT_KEY = '__default__' // penanda sesi yang memakai login CLI (bukan akun tersimpan)
 // COALESCE laporan worker → parent. Pemboros token DOMINAN bukan besar teksnya, melainkan JUMLAH
 // GILIRAN: tiap injectAutoTask membuat giliran baru yang menagih ULANG seluruh konteks parent yang
-// menumpuk. Dengan N worker, parent bisa dapat N giliran per ronde. Jendela ini menggabungkannya
-// jadi SATU giliran berisi ringkasan semua worker yang melapor di dalamnya.
-const WORKER_REPORT_COALESCE_MS = 12_000 // jendela gabung (batching, BUKAN debounce geser)
-const REPORT_PRIORITY_MS = 800 // flush cepat saat ada worker SELESAI (100%) — tetap menggabung burst
+// menumpuk. Dengan N worker, parent bisa dapat N giliran per ronde. Jendela ini (WAKE.coalesceMs)
+// menggabungkannya jadi SATU giliran berisi ringkasan semua worker yang melapor di dalamnya.
 const MAX_BOARD_ROWS = 40 // batas baris read_board agar tak membanjiri konteks pemanggil
 
 /** Satu laporan worker yang menunggu digabung ke parent-nya (hanya yang TERBARU per worker). */
@@ -69,7 +71,14 @@ interface PendingWorkerReport {
   line: string // ringkasan 1-baris hasil worker
   filePath: string // file hasil lengkap (boleh kosong)
   percent?: number
-  done: boolean // worker sudah tuntas → flush diprioritaskan & tak boleh di-skip
+  done: boolean // worker sudah tuntas → flush diprioritaskan
+  /**
+   * Laporan TUNTAS yang datang saat turn worker MASIH JALAN (report_to_parent 100% dipanggil di
+   * tengah turn). Hasil PENUH-nya menyusul beberapa detik lagi lewat notifyTurnEnd → kalau di-flush
+   * sekarang, root dibangunkan DUA kali untuk satu penutupan worker. Ditahan sampai turn-end
+   * (tetap dijaga timer jendela normal, jadi tak mungkin nyangkut kalau turn berakhir tak wajar).
+   */
+  awaitTurnEnd: boolean
   ts: number
 }
 
@@ -79,7 +88,11 @@ interface PendingWorkerReport {
 export class SessionManager implements GroveHost {
   private readonly sessions = new Map<string, Session>()
   private readonly rootStatusTimers = new Map<string, NodeJS.Timeout>() // treeId → debounce timer
-  private readonly lastPingSummary = new Map<string, string>() // treeId → board saat ping terakhir (dedupe)
+  // treeId → SIGNATURE sub-board saat ping board terakhir (dedupe). SENGAJA subBoardSignature,
+  // BUKAN treeBoardSummary: ringkasan itu memuat baris ROOT SENDIRI (+ title), jadi balasan root
+  // atas ping sebelumnya sudah cukup membuat "board berubah" → dedupe tak pernah kena dan tiap
+  // laporan worker berbuah satu giliran root. Lihat catatan sama di lastLoopSummary.
+  private readonly lastPingSummary = new Map<string, string>()
   // rootId → SIGNATURE sub-board saat auto-check terakhir (lihat subBoardSignature). SENGAJA bukan
   // treeBoardSummary: ringkasan itu memuat BARIS ROOT SENDIRI + field volatil (title), sehingga
   // balasan root sendiri (update_summary/set_title/assign_worker) me-reset streak → 3-strike tak
@@ -105,6 +118,7 @@ export class SessionManager implements GroveHost {
   private defaultSwitchPct = DEFAULT_SWITCH_PCT // ambang untuk akun tanpa ambang sendiri
   private defaultAccountId: string | null = null // akun GLOBAL: dipakai pohon yang tak menentukan sendiri
   private defaultModel: string | null = null // model GLOBAL: dipakai sesi yang tak menentukan sendiri (null = default SDK)
+  private defaultEffort: EffortSetting | null = null // tingkat mikir GLOBAL (null = default model)
   // Akun yang usage-nya terbukti TAK bisa dibaca (403 scope). Dipakai UI untuk jujur bilang
   // "ambang non-aktif" alih-alih memberi kesan proteksi proaktif menyala padahal tidak.
   private readonly usageReadable = new Map<string, boolean>()
@@ -265,6 +279,8 @@ export class SessionManager implements GroveHost {
     this.defaultSwitchPct = Number.isFinite(savedPct) && savedPct > 0 ? clampPct(savedPct) : DEFAULT_SWITCH_PCT
     this.defaultAccountId = this.db.getSetting('defaultAccountId') || null
     this.defaultModel = this.db.getSetting('defaultModel') || null
+    const savedEffort = this.db.getSetting('defaultEffort')
+    this.defaultEffort = isEffort(savedEffort) ? savedEffort : null
     // Pin akun pilihan user TAHAN RESTART: tanpa ini restorePinnedAccounts() kehilangan target dan
     // sesi yang tadi sempat di-auto-switch (mis. ke akun login utama) nyangkut di sana selamanya.
     for (const p of this.db.getAllSessionPins()) this.pinnedAccount.set(p.sessionId, p.accountId)
@@ -294,7 +310,8 @@ export class SessionManager implements GroveHost {
       autoResume: this.autoResume,
       defaultSwitchPct: this.defaultSwitchPct,
       defaultAccountId: this.accountExists(this.defaultAccountId) ? this.defaultAccountId : null,
-      defaultModel: this.defaultModel
+      defaultModel: this.defaultModel,
+      defaultEffort: this.defaultEffort
     }
   }
 
@@ -312,12 +329,23 @@ export class SessionManager implements GroveHost {
     const clean = label.trim() || 'Akun'
     const pct = switchPct == null ? undefined : clampPct(switchPct)
     const prov: AccountProvider =
-      provider === 'openrouter' ? 'openrouter' : provider === 'custom' ? 'custom' : 'claude'
-    // openrouter & custom sama-sama "Anthropic Skin" → keduanya memaksa model akun sendiri.
-    const skin = prov === 'openrouter' || prov === 'custom'
-    const orModel = skin ? model?.trim() || undefined : undefined
-    // base URL hanya untuk 'custom' (proxy sendiri). openrouter pakai konstanta tetap.
-    const url = prov === 'custom' ? baseUrl?.trim() || undefined : undefined
+      provider === 'openrouter'
+        ? 'openrouter'
+        : provider === 'custom'
+          ? 'custom'
+          : provider === 'cursor'
+            ? 'cursor'
+            : provider === 'deepseek'
+              ? 'deepseek'
+              : 'claude'
+    // openrouter/custom/cursor/deepseek sama-sama "Anthropic Skin" → semuanya memaksa model akun sendiri.
+    // DeepSeek punya daftar model tertutup (pro/flash) → kosong berarti pakai default, bukan "tanpa model"
+    // (tanpa model, SDK akan meminta alias claude yang tak dikenal DeepSeek → 400).
+    const orModel = isSkinProvider(prov)
+      ? model?.trim() || (prov === 'deepseek' ? DEEPSEEK_MODEL_DEFAULT : undefined)
+      : undefined
+    // base URL untuk provider proxy-sendiri ('custom'/'cursor'). openrouter pakai konstanta tetap.
+    const url = usesOwnBaseUrl(prov) ? baseUrl?.trim() || undefined : undefined
     this.db.addAccount(id, clean, token.trim(), now, plan, pct, prov, orModel, url)
     this.emitAccounts()
     return { id, label: clean, plan, switchPct: pct, provider: prov, model: orModel, baseUrl: url, createdAt: now }
@@ -419,19 +447,34 @@ export class SessionManager implements GroveHost {
    * (Claude vs OpenRouter) + model efektif. null = tak ada akun → sesi tak boleh jalan.
    * Env provider dibangun DI SINI supaya Session tak perlu tahu detail tiap provider.
    */
-  getSessionLaunch(sessionId: string): { env: Record<string, string>; model?: string } | null {
+  getSessionLaunch(
+    sessionId: string
+  ): { env: Record<string, string>; model?: string; effort?: EffortSetting } | null {
     const acc = this.effectiveAccount(sessionId)
     if (!acc) return null
     const token = this.db.getAccountToken(acc.id)
     if (!token) return null
     const env: Record<string, string> = { ...process.env } as Record<string, string>
-    if (acc.provider === 'openrouter' || acc.provider === 'custom') {
+    if (isSkinProvider(acc.provider)) {
       // "Anthropic Skin": Claude Code kirim format Anthropic, endpoint yang menerjemahkan.
-      // openrouter → base URL tetap; custom → base URL milik akun (proxy sendiri, mis. Gemini).
-      env.ANTHROPIC_BASE_URL = acc.provider === 'custom' ? acc.baseUrl || OPENROUTER_BASE_URL : OPENROUTER_BASE_URL
+      // openrouter/deepseek → base URL tetap milik providernya; custom/cursor → base URL akun (proxy).
+      env.ANTHROPIC_BASE_URL = skinBaseUrl(acc.provider, acc.baseUrl)
       env.ANTHROPIC_AUTH_TOKEN = token
       delete env.ANTHROPIC_API_KEY // AUTH_TOKEN yang jadi bearer; API_KEY bisa bentrok
       delete env.CLAUDE_CODE_OAUTH_TOKEN // jangan sampai malah dipakai token Claude
+      if (acc.provider === 'deepseek') {
+        // Claude Code punya jalur INTERNAL yang memanggil model per-KELAS (haiku untuk ringkasan
+        // judul/topik, sonnet/opus untuk sub-agent) — nama alias itu tak ada di DeepSeek → 400/404
+        // di tengah sesi. Petakan ketiganya ke model DeepSeek yang dipakai akun ini supaya seluruh
+        // jalur CLI tetap hidup. (Kelas "cepat" sengaja ke -flash bila ada, biar tak boros.)
+        const main = acc.model || DEEPSEEK_MODEL_DEFAULT
+        const fast = main.replace(/-pro$/, '-flash')
+        env.ANTHROPIC_MODEL = main
+        env.ANTHROPIC_DEFAULT_OPUS_MODEL = main
+        env.ANTHROPIC_DEFAULT_SONNET_MODEL = main
+        env.ANTHROPIC_DEFAULT_HAIKU_MODEL = fast
+        env.ANTHROPIC_SMALL_FAST_MODEL = fast // nama lama (CLI versi sebelumnya)
+      }
     } else {
       // Claude: token OAuth langganan. ANTHROPIC_* dibuang supaya tak mengalahkan token ini.
       env.CLAUDE_CODE_OAUTH_TOKEN = token
@@ -439,7 +482,55 @@ export class SessionManager implements GroveHost {
       delete env.ANTHROPIC_AUTH_TOKEN
       delete env.ANTHROPIC_BASE_URL
     }
-    return { env, model: this.resolveModel(sessionId) }
+    return { env, model: this.resolveModel(sessionId), effort: this.resolveEffort(sessionId) }
+  }
+
+  /** GroveHost — akun efektif sesi ini bisa melihat gambar? (DeepSeek: tidak, lihat providerSeesImages) */
+  sessionSeesImages(sessionId: string): boolean {
+    return providerSeesImages(this.effectiveAccount(sessionId)?.provider)
+  }
+
+  /**
+   * GroveHost.getVisionLaunches — SEMUA akun yang bisa melihat gambar, TERURUT sebagai daftar
+   * cadangan untuk jembatan gambar. Session mencobanya satu per satu: kalau yang pertama kena limit
+   * atau gangguan koneksi, ia turun ke berikutnya (dulu langsung menyerah — satu akun limit =
+   * gambar tak terbaca sama sekali).
+   *
+   * Urutan: akun GLOBAL dulu (yang biasa dipakai user) → akun dengan kuota TERBACA & masih di bawah
+   * ambangnya → sisanya. Akun tanpa token dilewati.
+   */
+  getVisionLaunches(): Array<{ env: Record<string, string>; model?: string; label: string }> {
+    const accts = this.db.getAccounts().filter((a) => providerSeesImages(a.provider))
+    const score = (a: Account): number => {
+      if (a.id === this.defaultAccountId) return 0
+      return a.usageReadable === false ? 2 : 1 // kuota tak terbaca (token bermasalah) → paling belakang
+    }
+    return this.accountsWithStatus()
+      .filter((a) => accts.some((x) => x.id === a.id))
+      .sort((a, b) => score(a) - score(b))
+      .map((acc): { env: Record<string, string>; model?: string; label: string } | null => {
+        const token = this.db.getAccountToken(acc.id)
+        if (!token) return null
+        const env: Record<string, string> = { ...process.env } as Record<string, string>
+        if (isSkinProvider(acc.provider)) {
+          env.ANTHROPIC_BASE_URL = skinBaseUrl(acc.provider, acc.baseUrl)
+          env.ANTHROPIC_AUTH_TOKEN = token
+          delete env.ANTHROPIC_API_KEY
+          delete env.CLAUDE_CODE_OAUTH_TOKEN
+        } else {
+          env.CLAUDE_CODE_OAUTH_TOKEN = token
+          delete env.ANTHROPIC_API_KEY
+          delete env.ANTHROPIC_AUTH_TOKEN
+          delete env.ANTHROPIC_BASE_URL
+        }
+        return { env, model: isSkinProvider(acc.provider) ? acc.model : undefined, label: acc.label }
+      })
+      .filter((x): x is { env: Record<string, string>; model?: string; label: string } => x !== null)
+  }
+
+  /** Kandidat jembatan gambar TERBAIK (null = tak ada akun yang bisa melihat gambar). */
+  getVisionLaunch(): { env: Record<string, string>; model?: string; label: string } | null {
+    return this.getVisionLaunches()[0] ?? null
   }
 
   /**
@@ -453,9 +544,19 @@ export class SessionManager implements GroveHost {
     // jadi model akun (id OpenRouter) menang mutlak. Kecuali sesi/rootnya sengaja diisi id ber-"/"
     // (juga id OpenRouter) → hormati sebagai override sadar.
     const acc = this.effectiveAccount(sessionId)
-    // Akun 'custom' (proxy): nama model ditentukan proxy, tak ada daftar/alias di Grove → pakai
+    // Akun 'custom'/'cursor' (proxy): nama model ditentukan proxy, tak ada daftar/alias di Grove → pakai
     // model akun apa adanya untuk seluruh pohon (buat varian model = buat akun lain ke proxy sama).
-    if (acc?.provider === 'custom') return acc.model || undefined
+    if (usesOwnBaseUrl(acc?.provider)) return acc?.model || undefined
+    // Akun DeepSeek: daftar modelnya tertutup (pro/flash) → sesi boleh memilih di antara keduanya,
+    // tapi alias Claude (opus/sonnet/haiku) yang terwarisi dari global JANGAN dipakai — DeepSeek
+    // menolaknya. Warisan non-DeepSeek → jatuh ke model akun.
+    if (acc?.provider === 'deepseek') {
+      const s = this.sessions.get(sessionId)
+      if (isDeepSeekModel(s?.meta.model)) return s!.meta.model
+      const root = s ? this.sessions.get(s.meta.treeId) : undefined
+      if (root && root.meta.id !== s?.meta.id && isDeepSeekModel(root.meta.model)) return root.meta.model
+      return acc.model || DEEPSEEK_MODEL_DEFAULT
+    }
     if (acc?.provider === 'openrouter') {
       const s = this.sessions.get(sessionId)
       const own = s?.meta.model
@@ -512,6 +613,51 @@ export class SessionManager implements GroveHost {
           channel: 'session:update',
           payload: { id, model: sess.meta.model, ctxPercent: contextPercent(sess.meta.ctxInput, sess.meta.ctxWindow) }
         })
+        sess.restartQuery()
+      }
+    }
+  }
+
+  /**
+   * TINGKAT MIKIR EFEKTIF sebuah sesi — pola yang SAMA dengan resolveModel: sesi → sesi UTAMA →
+   * global → undefined (pakai default model). Dihitung saat dipakai, jadi mengubahnya di sesi utama
+   * langsung menular ke sub-sesi yang tak menentukan sendiri.
+   */
+  resolveEffort(sessionId: string): EffortSetting | undefined {
+    const s = this.sessions.get(sessionId)
+    if (!s) return this.defaultEffort ?? undefined
+    if (s.meta.effort) return s.meta.effort
+    const root = this.sessions.get(s.meta.treeId)
+    if (root && root.meta.id !== s.meta.id && root.meta.effort) return root.meta.effort
+    return this.defaultEffort ?? undefined
+  }
+
+  /** Tingkat mikir global: dipakai semua sesi yang tak menentukan sendiri. null = default model. */
+  setDefaultEffort(effort: EffortSetting | null): void {
+    const before = new Map([...this.sessions.keys()].map((id) => [id, this.resolveEffort(id)]))
+    this.defaultEffort = effort
+    this.db.setSetting('defaultEffort', effort ?? '')
+    // Hanya restart sesi yang tingkat mikir EFEKTIF-nya benar-benar berubah (param ini dikirim saat
+    // query dibuat, jadi perubahan baru berlaku setelah query di-restart).
+    for (const [id, prev] of before) {
+      const s = this.sessions.get(id)
+      if (s && this.resolveEffort(id) !== prev) s.restartQuery()
+    }
+    this.emitAccounts()
+  }
+
+  /** Set tingkat mikir sebuah sesi (null = kembali mewarisi). Sub-sesi yang menumpang ikut berubah. */
+  setSessionEffort(sessionId: string, effort: EffortSetting | null): void {
+    const s = this.sessions.get(sessionId)
+    if (!s) throw new Error(`Session ${sessionId} tidak ditemukan`)
+    const before = new Map([...this.sessions.keys()].map((id) => [id, this.resolveEffort(id)]))
+    s.meta.effort = effort ?? undefined
+    s.meta.updatedAt = Date.now()
+    this.db.upsertSession(s.meta)
+    for (const [id, prev] of before) {
+      const sess = this.sessions.get(id)
+      if (sess && this.resolveEffort(id) !== prev) {
+        this.emit({ channel: 'session:update', payload: { id, effort: sess.meta.effort } })
         sess.restartQuery()
       }
     }
@@ -796,11 +942,15 @@ export class SessionManager implements GroveHost {
     // tak ada hubungannya dgn kuota akun Claude. JANGAN rotasi ke akun Claude (billing nyasar + tak
     // menolong). Beri pesan jujur: tunggu/coba lagi.
     const prov = this.effectiveAccount(sessionId)?.provider
-    if (prov === 'openrouter' || prov === 'custom') {
+    if (isSkinProvider(prov)) {
       s.systemNote(
-        prov === 'custom'
-          ? '⚠️ Endpoint proxy-mu membalas limit/penuh (mis. Gemini free-tier 429 RESOURCE_EXHAUSTED — batas per-menit/per-hari). Ini rate-limit provider, BUKAN kuota Claude. Tunggu sebentar lalu kirim lagi; kalau sering, kurangi jumlah worker atau pakai model yang limitnya lebih longgar.'
-          : '⚠️ Model OpenRouter gratis sedang penuh di sisi provider (mis. NVIDIA "ResourceExhausted") — ini sementara, BUKAN kuota akunmu. Kirim lagi untuk coba ulang, atau klik-kanan kartu sesi → pilih model OpenRouter lain (mis. Ultra vs Super).'
+        prov === 'cursor'
+          ? '⚠️ Endpoint Cursor-mu membalas limit/penuh (free-tier Cursor punya batas request harian). Ini rate-limit provider, BUKAN kuota Claude. Tunggu sebentar lalu kirim lagi; kalau sering, kurangi jumlah worker atau pakai model Cursor yang limitnya lebih longgar.'
+          : prov === 'deepseek'
+            ? '⚠️ DeepSeek membalas limit/penuh (rate-limit atau saldo API habis). Ini batas provider DeepSeek, BUKAN kuota Claude. Tunggu sebentar lalu kirim lagi; kalau menetap, cek saldo di platform.deepseek.com atau kurangi jumlah worker paralel.'
+          : prov === 'custom'
+            ? '⚠️ Endpoint proxy-mu membalas limit/penuh (mis. Gemini free-tier 429 RESOURCE_EXHAUSTED — batas per-menit/per-hari). Ini rate-limit provider, BUKAN kuota Claude. Tunggu sebentar lalu kirim lagi; kalau sering, kurangi jumlah worker atau pakai model yang limitnya lebih longgar.'
+            : '⚠️ Model OpenRouter gratis sedang penuh di sisi provider (mis. NVIDIA "ResourceExhausted") — ini sementara, BUKAN kuota akunmu. Kirim lagi untuk coba ulang, atau klik-kanan kartu sesi → pilih model OpenRouter lain (mis. Ultra vs Super).'
       )
       s.markLimited()
       return
@@ -921,6 +1071,173 @@ export class SessionManager implements GroveHost {
     // Tugas baru ke root → (re)nyalakan thread auto-check "udah sampe mana?". Root LITE tak punya
     // worker (tool spawn tak dimuat) → loop mustahil berguna, jangan pasang timernya sama sekali.
     if (s.meta.role === 'root' && !s.meta.lite) this.enableLoop(id)
+  }
+
+  /**
+   * PERKIRAAN BIAYA akun DeepSeek per jendela waktu, dari token yang TERCATAT DI PC INI × harga
+   * publik model akun. Ini perkiraan: yang otoritatif tetap saldo di platform (lihat fetchDeepseekBalance),
+   * karena promo/harga jam sibuk tak terlihat dari sisi kita.
+   */
+  deepseekCosts(): Array<{
+    accountId: string
+    label: string
+    model: string
+    cost: { hour: number; day: number; week: number; allTime: number }
+  }> {
+    const accounts = this.db.getAccounts().filter((a) => a.provider === 'deepseek')
+    if (!accounts.length) return []
+    const now = Date.now()
+    const DAY = 86_400_000
+    const hourStartOfNow = Math.floor(now / 3_600_000) * 3_600_000
+    const rows = this.db.getUsageRows(now - 8 * DAY)
+    const allTime = new Map(this.db.getUsageAllTimeByAccount().map((r) => [r.accountId, r]))
+    const blank = (): { input: number; cacheRead: number; cacheCreation: number; output: number } => ({
+      input: 0, cacheRead: 0, cacheCreation: 0, output: 0
+    })
+    return accounts.map((a) => {
+      const w = { hour: blank(), day: blank(), week: blank() }
+      for (const r of rows) {
+        if (r.accountId !== a.id) continue
+        for (const [key, from] of [
+          ['hour', hourStartOfNow],
+          ['day', now - DAY],
+          ['week', now - 7 * DAY]
+        ] as const) {
+          if (r.hourStart < from) continue
+          const t = w[key]
+          t.input += r.input
+          t.cacheRead += r.cacheRead
+          t.cacheCreation += r.cacheCreation
+          t.output += r.output
+        }
+      }
+      const at = allTime.get(a.id) ?? blank()
+      const usd = (t: { input: number; cacheRead: number; cacheCreation: number; output: number }): number =>
+        deepseekCostUsd(t, a.model) ?? 0
+      return {
+        accountId: a.id,
+        label: a.label,
+        model: a.model ?? DEEPSEEK_MODEL_DEFAULT,
+        cost: { hour: usd(w.hour), day: usd(w.day), week: usd(w.week), allTime: usd(at) }
+      }
+    })
+  }
+
+  // ---- antrian pesan user (ditahan selama turn berjalan; bisa diedit/dibatalkan) --------------
+
+  listQueued(id: string): Array<{ qid: number; text: string }> {
+    return this.sessions.get(id)?.listQueued() ?? []
+  }
+  editQueued(id: string, qid: number, text: string): boolean {
+    const clean = text.trim()
+    if (!clean) return false
+    return this.sessions.get(id)?.editQueued(qid, clean) ?? false
+  }
+  cancelQueued(id: string, qid: number): boolean {
+    return this.sessions.get(id)?.cancelQueued(qid) ?? false
+  }
+
+  // ---- REFERENSI ANTAR-SESI (satu arah: helper → target) ---------------------
+  // Dipakai untuk "chat B membantu chat A tanpa sepengetahuan A". Yang DIBAGI hanya papan + ekor
+  // chat target (ringkas) dan kanal kirim-pesan; KONTEKS SDK TIDAK PERNAH dibagi — tiap sesi punya
+  // percakapan & cache prefix sendiri, termasuk dua sesi yang folder kerjanya sama.
+
+  /** Tautkan: `helperId` boleh membantu `targetId`. Arah balik ditolak agar tak jadi pair-to-pair. */
+  linkReference(helperId: string, targetId: string): void {
+    if (helperId === targetId) throw new Error('Tidak bisa menautkan sesi ke dirinya sendiri')
+    if (!this.sessions.has(helperId)) throw new Error(`Session ${helperId} tidak ditemukan`)
+    if (!this.sessions.has(targetId)) throw new Error(`Sesi referensi ${targetId} tidak ditemukan`)
+    const refs = this.db.getAllRefs()
+    if (refs.some((r) => r.helperId === targetId && r.targetId === helperId)) {
+      throw new Error('Ditolak: sesi itu sudah menjadikan sesi ini referensi. Tautan dikunci SATU ARAH.')
+    }
+    const had = this.db.getRefTargets(helperId).length > 0
+    this.db.addRef(helperId, targetId, Date.now())
+    const helper = this.sessions.get(helperId)!
+    const target = this.sessions.get(targetId)!
+    helper.systemNote(
+      `🔗 Referensi ditambahkan: "${target.meta.title}" (${targetId.slice(0, 6)}). Kamu bisa membaca papan & ekor chat-nya, ` +
+        'dan mengirim bantuan ke sana lewat tool ref_*. Sesi itu TIDAK tahu bantuan datang darimu, dan tak punya akses balik.'
+    )
+    // Tool ref_* hanya dipasang saat sesi PUNYA tautan → giliran berikutnya harus memakai server baru.
+    if (!had) helper.restartQuery()
+  }
+
+  unlinkReference(helperId: string, targetId: string): void {
+    this.db.removeRef(helperId, targetId)
+    const helper = this.sessions.get(helperId)
+    if (helper) {
+      helper.systemNote(`🔗 Referensi dilepas: ${targetId.slice(0, 6)}`)
+      if (!this.db.getRefTargets(helperId).length) helper.restartQuery() // tool ref_* dilepas lagi
+    }
+  }
+
+  /** Sesi ini punya referensi? Menentukan apakah tool ref_* ikut dipasang (hemat skema token). */
+  hasReferences(sessionId: string): boolean {
+    return this.db.getRefTargets(sessionId).length > 0
+  }
+
+  /** Daftar referensi sebuah sesi (untuk UI & tool ref_list). */
+  listReferences(helperId: string): Array<{ id: string; title: string; status: string; cwd: string }> {
+    return this.db
+      .getRefTargets(helperId)
+      .map((id) => this.sessions.get(id))
+      .filter((s): s is Session => !!s)
+      .map((s) => ({ id: s.meta.id, title: s.meta.title, status: s.meta.status, cwd: s.meta.cwd }))
+  }
+
+  private assertLinked(helperId: string, targetId: string): Session {
+    if (!this.db.getRefTargets(helperId).includes(targetId)) {
+      throw new Error(`Sesi ${targetId} bukan referensimu (tautan satu arah belum dibuat)`)
+    }
+    const t = this.sessions.get(targetId)
+    if (!t) throw new Error(`Sesi referensi ${targetId} sudah tidak ada`)
+    return t
+  }
+
+  /**
+   * Baca kondisi target: papan tulis + ekor chat (ringkas). SENGAJA cuma cuplikan — menyalin seluruh
+   * percakapan target ke konteks helper akan mahal & menghapus keuntungan cache masing-masing sesi.
+   */
+  readReference(helperId: string, targetId: string, lines = 12): string {
+    const t = this.assertLinked(helperId, targetId)
+    const b = this.db.getBoardEntry(targetId)
+    const tail = this.db
+      .getChatMessages(targetId)
+      .filter((m) => m.role === 'user' || m.role === 'assistant')
+      .slice(-Math.max(1, Math.min(40, lines)))
+      .map((m) => `${m.role === 'user' ? 'USER' : 'ASISTEN'}: ${m.text.slice(0, 400)}`)
+      .join('\n')
+    return (
+      `REFERENSI "${t.meta.title}" (${targetId.slice(0, 6)}) · status ${t.meta.status} · cwd ${t.meta.cwd}\n` +
+      (b
+        ? `RINGKASAN: ${b.summary || '(kosong)'}\nPROGRES: ${b.progress || '(kosong)'}${
+            b.percent != null ? ` (${b.percent}%)` : ''
+          }\nTODO:\n${b.todo.map((i) => `- [${i.done ? 'x' : ' '}] ${i.text}`).join('\n') || '(kosong)'}\n`
+        : 'PAPAN: (kosong)\n') +
+      `\nEKOR PERCAKAPAN:\n${tail || '(belum ada)'}`
+    )
+  }
+
+  /**
+   * Kirim bantuan ke target. Masuk sebagai PESAN USER biasa di sesi target — jadi target
+   * mengerjakannya tanpa tahu asalnya dari sesi lain (persis yang diminta: satu arah, tak
+   * pair-to-pair). Tercatat jelas di chat KEDUA sesi supaya manusianya tetap bisa mengaudit.
+   */
+  sendToReference(helperId: string, targetId: string, text: string): void {
+    const t = this.assertLinked(helperId, targetId)
+    const body = text.trim()
+    if (!body) throw new Error('Pesan kosong')
+    const helper = this.sessions.get(helperId)
+    helper?.systemNote(`📤 Dikirim ke referensi "${t.meta.title}": ${body.slice(0, 160)}${body.length > 160 ? '…' : ''}`)
+    this.sendChat(targetId, body)
+  }
+
+  /** /btw — pertanyaan sampingan untuk sesi ini (query terpisah; sesi utama tak tersentuh). */
+  async askSide(id: string, question: string): Promise<void> {
+    const s = this.sessions.get(id)
+    if (!s) throw new Error(`Session ${id} tidak ditemukan`)
+    await s.askSide(question)
   }
 
   /** Ubah mode ringan (lite) sebuah root. Berlaku di giliran berikutnya: bila query sedang jalan,
@@ -1058,7 +1375,7 @@ export class SessionManager implements GroveHost {
 
   private scheduleLoop(rootId: string, intervalMs?: number): void {
     this.clearLoopTimer(rootId)
-    this.loopTimers.set(rootId, setTimeout(() => this.runLoopCheck(rootId), intervalMs ?? LOOP_INTERVAL_MS))
+    this.loopTimers.set(rootId, setTimeout(() => this.runLoopCheck(rootId), intervalMs ?? WAKE.loopIntervalMs))
   }
 
   /**
@@ -1069,8 +1386,8 @@ export class SessionManager implements GroveHost {
    * Tick DILEWATI (tanpa giliran) bila: root sedang running, belum ada worker, semua worker masih
    * running, ATAU sudah tak ada info baru (lihat aturan streak di bawah).
    *
-   * Setelah IDLE_CHECK_LIMIT tercapai: TIDAK berhenti total — beralih ke MODE CACHE-WARM: ping
-   * ringan (cacheWarm) dengan interval CACHE_WARM_INTERVAL_MS agar prefix prompt tetap ter-cache
+   * Setelah WAKE.idleCheckLimit tercapai: TIDAK berhenti total — beralih ke MODE CACHE-WARM: ping
+   * ringan (cacheWarm) dengan interval WAKE.cacheWarmIntervalMs agar prefix prompt tetap ter-cache
    * di API (Pro plan TTL 1 jam). Cache-warm dihentikan hanya oleh task_done atau tugas baru.
    */
   private runLoopCheck(rootId: string): void {
@@ -1085,10 +1402,10 @@ export class SessionManager implements GroveHost {
     // ---- MODE CACHE-WARM: ping ringan, interval panjang, tujuannya hanya refresh cache prefix ----
     if (this.loopCacheWarmMode.has(rootId)) {
       if (root.meta.status !== 'running') {
-        const stale = Date.now() - root.lastApiActivity > CACHE_WARM_STALE_MS
+        const stale = Date.now() - root.lastApiActivity > WAKE.cacheWarmStaleMs
         if (stale) root.cacheWarm()
       }
-      this.scheduleLoop(rootId, CACHE_WARM_INTERVAL_MS)
+      this.scheduleLoop(rootId, WAKE.cacheWarmIntervalMs)
       return
     }
 
@@ -1104,12 +1421,12 @@ export class SessionManager implements GroveHost {
       const streak = unchanged ? (this.loopIdleStreak.get(rootId) ?? 0) + 1 : 0
       this.loopIdleStreak.set(rootId, streak)
       this.lastLoopSummary.set(rootId, sig)
-      if (streak >= IDLE_CHECK_LIMIT) {
+      if (streak >= WAKE.idleCheckLimit) {
         root.systemNote(
-          `⏹ Auto-check dihentikan: ${IDLE_CHECK_LIMIT}× berturut tak ada perubahan. Cache prefix tetap dijaga. Nyala lagi otomatis saat kamu kirim tugas baru.`
+          `⏹ Auto-check dihentikan: ${WAKE.idleCheckLimit}× berturut tak ada perubahan. Cache prefix tetap dijaga. Nyala lagi otomatis saat kamu kirim tugas baru.`
         )
         this.loopCacheWarmMode.add(rootId)
-        this.scheduleLoop(rootId, CACHE_WARM_INTERVAL_MS)
+        this.scheduleLoop(rootId, WAKE.cacheWarmIntervalMs)
         return
       }
       if (allDone) {
@@ -1122,7 +1439,7 @@ export class SessionManager implements GroveHost {
       }
     } else if (root.meta.status !== 'running' && !worthAsking) {
       // Tak ada worker / semua worker baik-baik saja → tak perlu auto-check, tapi jaga cache.
-      const stale = Date.now() - root.lastApiActivity > CACHE_WARM_STALE_MS
+      const stale = Date.now() - root.lastApiActivity > WAKE.cacheWarmStaleMs
       if (stale) root.cacheWarm()
     }
     this.scheduleLoop(rootId)
@@ -1183,6 +1500,7 @@ export class SessionManager implements GroveHost {
       this.loopCacheWarmMode.delete(sid)
       this.loopIdleStreak.delete(sid) // state auto-check milik sesi ini → jangan tinggalkan sisa
       this.lastLoopSummary.delete(sid)
+      this.lastPingSummary.delete(sid) // dedupe ping board (keyed treeId = id root) → ikut dibuang
       this.loopDonePinged.delete(sid)
       this.pinnedAccount.delete(sid) // baris DB-nya dibersihkan db.deleteSession (session_pins)
       const rt = this.reportTimers.get(sid) // buffer coalesce milik sesi ini (sbg parent) → bersihkan
@@ -1228,7 +1546,17 @@ export class SessionManager implements GroveHost {
     this.emitBoard(sessionId)
   }
 
-  /** Worker → root: update board (+persen), nota ke parent, lalu bangunkan root (debounce). */
+  /**
+   * Worker → parent: update board (+persen), nota ke panel pesan, lalu titipkan laporan ke BUFFER
+   * COALESCE parent — SATU jalur wake saja.
+   *
+   * FIX 1 (dobel-wake). Dulu jalur ini memanggil `scheduleRootStatus` SENDIRI, terpisah dari buffer
+   * laporan milik `autoReportFinal`. Akibatnya satu penutupan worker anak-langsung root memicu DUA
+   * giliran root: (1) flush laporan gabungan, dan (2) ping board 60 detik kemudian yang isinya
+   * tumpang-tindih. Sekarang laporan progres masuk buffer yang SAMA, jadi progres + hasil akhir
+   * worker yang sama menyatu menjadi satu giliran. Ping board hanya dipakai untuk worker yang BUKAN
+   * anak langsung root (kalau tidak, root baru tahu setelah laporan merambat level-per-level).
+   */
   reportToParent(fromId: string, opts: { status: string; percent?: number }): void {
     const from = this.sessions.get(fromId)
     if (!from) return
@@ -1240,17 +1568,29 @@ export class SessionManager implements GroveHost {
     // guard ini defensif agar laporan tak pernah bisa nyasar ke pohon (UTAMA) lain.
     const parent = this.sessions.get(parentId)
     if (!parent || parent.meta.treeId !== from.meta.treeId) return
-    const pct = opts.percent == null ? '' : `${Math.max(0, Math.min(100, Math.round(opts.percent)))}% · `
+    const pctNum = opts.percent == null ? undefined : Math.max(0, Math.min(100, Math.round(opts.percent)))
+    const pct = pctNum == null ? '' : `${pctNum}% · `
     this.sendMessage(fromId, parentId, `[progress] ${pct}${opts.status}`)
+    const done = pctNum != null && pctNum >= 100
     // Worker sudah melapor TUNTAS sendiri → tandai, agar auto-report di akhir turn tidak dobel.
-    if (opts.percent != null && opts.percent >= 100) {
+    if (done) {
       from.markFinalReported()
       from.markDone() // sub 100% → status 'done' (diterapkan saat turn-nya berakhir)
-      // INVARIAN: laporan "worker SELESAI" tak boleh tertahan sampai akhir jendela coalesce —
-      // alur "semua worker selesai → root menyintesis" harus tetap jalan tepat waktu.
-      this.flushParentReportsSoon(parentId)
     }
-    this.scheduleRootStatus(from.meta.treeId) // treeId = id root pohon INI → hanya membangunkan root sendiri
+    this.queueParentReport(parentId, {
+      workerId: fromId,
+      title: from.meta.title,
+      line: cap(opts.status.replace(/\s+/g, ' ').trim(), CAP_PROGRESS),
+      filePath: '',
+      percent: pctNum,
+      done,
+      // Lapor 100% DI TENGAH turn: hasil penuh menyusul lewat notifyTurnEnd beberapa detik lagi →
+      // tahan dulu supaya keduanya menyatu jadi SATU giliran root (tetap dijaga timer jendela).
+      awaitTurnEnd: done && from.meta.status === 'running',
+      ts: Date.now()
+    })
+    // Cucu/cicit: parent-nya bukan root, jadi root tak ikut terbangun oleh flush di atas.
+    if (from.meta.parentId !== from.meta.treeId) this.scheduleRootStatus(from.meta.treeId)
   }
 
   /**
@@ -1261,6 +1601,7 @@ export class SessionManager implements GroveHost {
   notifyTurnEnd(sessionId: string, outcome?: { finalText: string }): void {
     const s = this.sessions.get(sessionId)
     if (!s || s.meta.role !== 'sub') return // hanya sub-worker; root menyelesaikan turn ≠ pemicu
+    const parentId = s.meta.parentId
     if (outcome) {
       this.autoReportFinal(s, outcome.finalText)
       // ANTI DOBEL-GILIRAN ROOT: autoReportFinal→queueParentReport SUDAH membangunkan parent. Kalau
@@ -1268,7 +1609,12 @@ export class SessionManager implements GroveHost {
       // isinya tumpang-tindih dgn laporan gabungan → dua giliran ~74K utk SATU penutupan worker (biang
       // "banyak langkah kerja"). Lewati utk anak-langsung root; worker lebih dalam tetap pakai ping
       // board supaya root dapat ringkasan cepat tanpa menunggu kaskade laporan naik level-per-level.
-      if (s.meta.parentId === s.meta.treeId) return
+      if (parentId === s.meta.treeId) return
+    } else if (parentId && this.pendingReports.get(parentId)?.size) {
+      // Turn berakhir TIDAK wajar (interupsi/limit/error) padahal ada laporan TUNTAS yang sengaja
+      // ditahan menunggu turn-end (awaitTurnEnd) → lepaskan sekarang, jangan biarkan nyangkut.
+      this.flushParentReportsSoon(parentId)
+      if (parentId === s.meta.treeId) return
     }
     this.scheduleRootStatus(s.meta.treeId)
   }
@@ -1333,6 +1679,7 @@ export class SessionManager implements GroveHost {
       filePath,
       percent: this.db.getBoardEntry(from.meta.id)?.percent,
       done: from.meta.status === 'done',
+      awaitTurnEnd: false, // ini SUDAH akhir turn — tak ada yang perlu ditunggu lagi
       ts: Date.now()
     })
   }
@@ -1350,14 +1697,22 @@ export class SessionManager implements GroveHost {
       this.pendingReports.set(parentId, buf)
     }
     buf.set(entry.workerId, entry) // DEDUPE: simpan hanya laporan TERBARU per worker
-    if (entry.done) {
+    if (entry.done && !entry.awaitTurnEnd) {
       this.flushParentReportsSoon(parentId) // worker tuntas → jangan ditahan sampai akhir jendela
       return
     }
+    // FIX 3 — laporan NON-FINAL tidak pernah membangunkan parent sendirian: ia hanya memperbarui
+    // board (sudah dilakukan pemanggil) lalu MENUMPANG wake berikutnya. Alasannya bukan sekadar
+    // hemat, tapi REDUNDAN: setiap ping/auto-check ke root SUDAH memuat ringkasan board lengkap
+    // berisi progres yang sama. Dulu tiap laporan 25%/50%/75% = satu giliran root penuh — persis
+    // pengali biaya terbesar pada sesi multi-worker.
+    if (!entry.done) return
     if (this.reportTimers.has(parentId)) return // jendela sudah berjalan → cukup menumpuk
+    // JARING PENGAMAN untuk entry `awaitTurnEnd` (lapor 100% di tengah turn): kalau turn worker
+    // ternyata tak pernah berakhir wajar, laporan TUNTAS tetap sampai ≤ 1 jendela.
     this.reportTimers.set(
       parentId,
-      setTimeout(() => this.flushParentReports(parentId), WORKER_REPORT_COALESCE_MS)
+      setTimeout(() => this.flushParentReports(parentId), WAKE.coalesceMs)
     )
   }
 
@@ -1367,7 +1722,7 @@ export class SessionManager implements GroveHost {
     if (!buf || !buf.size) return
     const prev = this.reportTimers.get(parentId)
     if (prev) clearTimeout(prev)
-    this.reportTimers.set(parentId, setTimeout(() => this.flushParentReports(parentId), REPORT_PRIORITY_MS))
+    this.reportTimers.set(parentId, setTimeout(() => this.flushParentReports(parentId), WAKE.priorityMs))
   }
 
   /**
@@ -1389,15 +1744,18 @@ export class SessionManager implements GroveHost {
       // Tunggu giliran parent selesai; coba lagi nanti (pola sama dgn scheduleRootStatus).
       this.reportTimers.set(
         parentId,
-        setTimeout(() => this.flushParentReports(parentId), WORKER_REPORT_COALESCE_MS)
+        setTimeout(() => this.flushParentReports(parentId), WAKE.coalesceMs)
       )
       return
     }
     const items = [...buf.values()].sort((a, b) => a.ts - b.ts)
-    const anyDone = items.some((i) => i.done)
-    const sig = items.map((i) => `${i.workerId}|${i.percent ?? ''}|${i.line}`).join('\n')
+    const sig = reportSignature(items)
     buf.clear()
-    if (!anyDone && this.lastReportSig.get(parentId) === sig) return // tak ada info baru → hemat 1 giliran
+    // FIX 6 — isi flush ini SAMA PERSIS dengan yang sudah dikirim → parent tak dapat info baru,
+    // jadi giliran ini murni pemborosan. Dulu `anyDone` mem-BYPASS pengecekan ini, sehingga satu
+    // worker tuntas bisa membangunkan root berkali-kali dengan isi identik. Signature ikut memuat
+    // flag `done`, jadi transisi "belum selesai → SELESAI" tetap dianggap info baru dan terkirim.
+    if (shouldSkipWake(this.lastReportSig.get(parentId), sig)) return
     this.lastReportSig.set(parentId, sig)
     parent.injectAutoTask(this.buildCombinedReport(items))
   }
@@ -1418,28 +1776,35 @@ export class SessionManager implements GroveHost {
     return `${head}\n${body}\n\nBeri user SATU baris update singkat. Kalau SEMUA worker sudah selesai, baca file hasil yang relevan (pakai Read) lalu beri sintesis akhir.`
   }
 
-  /** Ringkasan board 1-baris/sesi untuk pohon ini — disuntik ke ping (ganti read_board = hemat konteks). */
-  private treeBoardSummary(treeId: string): string {
+  /**
+   * Ringkasan board 1-baris/sesi untuk pohon ini — disuntik ke ping (ganti read_board = hemat konteks).
+   * `subsOnly` (dipakai semua ping ke ROOT): buang baris ROOT SENDIRI — root sudah tahu keadaannya
+   * sendiri, jadi baris itu murni token terbuang di SETIAP ping.
+   */
+  private treeBoardSummary(treeId: string, subsOnly = false): string {
     const boardMap = new Map(this.db.getAllBoard().map((b) => [b.sessionId, b]))
     const lines: string[] = []
     for (const m of this.metaSnapshot()) {
       if (m.treeId !== treeId) continue
+      if (subsOnly && m.role === 'root') continue
       const b = boardMap.get(m.id)
       const pct = b?.percent != null ? `, ${b.percent}%` : ''
       const prog = b?.progress ? ` — ${b.progress}` : b?.summary ? ` — ${b.summary}` : ''
-      lines.push(`- [${m.role}] ${m.title} (${m.status}${pct})${prog}`.slice(0, 220)) // 1 baris/sesi
+      lines.push(`- ${m.title} (${m.status}${pct})${prog}`.slice(0, WAKE.boardLineMaxChars)) // 1 baris/sesi
     }
     const out = lines.join('\n') || '(belum ada laporan)'
     // Batas total: ringkasan ini disuntik ke SETIAP ping → jangan biarkan tumbuh tak terbatas.
-    return out.length > 2000 ? out.slice(0, 2000) + '\n… (dipotong)' : out
+    return out.length > WAKE.boardMaxChars ? out.slice(0, WAKE.boardMaxChars) + '\n… (dipotong)' : out
   }
 
+  // FIX 4 — teks ping diringkas & larangan read_board dibuat eksplisit. Board di bawah SUDAH final:
+  // memanggil read_board dari ping hanya menambah 1 tool-call + isi board yang sama ke konteks root.
   private rootStatusPrompt(treeId: string): string {
-    return `[GROVE AUTO] Worker melapor progres. Ringkasan board pohonmu (JANGAN panggil read_board — ini sudah lengkap):\n${this.treeBoardSummary(treeId)}\n\nBeri user SATU baris update singkat dari ringkasan ini. Kalau semua worker sudah selesai, beri sintesis akhir.`
+    return `[GROVE AUTO] Worker melapor. Board (final, JANGAN read_board):\n${this.treeBoardSummary(treeId, true)}\n\nBalas SATU baris ke user. Semua selesai → sintesis akhir.`
   }
 
   private loopCheckPrompt(treeId: string): string {
-    return `[GROVE AUTO-CHECK] Udah sampai mana? Ringkasan board pohonmu (JANGAN panggil read_board — sudah lengkap):\n${this.treeBoardSummary(treeId)}\n\nDari ringkasan itu: kalau ADA worker idle yang tugasnya BELUM selesai, dorong lanjut (mcp__grove__list_workers untuk id → mcp__grove__assign_worker). Beri user update singkat. Kalau SEMUA selesai, panggil mcp__grove__task_done.`
+    return `[GROVE AUTO-CHECK] Udah sampai mana? Board (final, JANGAN read_board):\n${this.treeBoardSummary(treeId, true)}\n\nWorker idle tapi belum selesai → list_workers lalu assign_worker. Balas SATU baris ke user. SEMUA selesai → panggil task_done.`
   }
 
   /** Debounce: banyak laporan worker berdekatan → satu kali bangunkan root. */
@@ -1461,11 +1826,14 @@ export class SessionManager implements GroveHost {
           this.scheduleRootStatus(treeId) // coba lagi nanti, jangan hilang
           return
         }
-        const summary = this.treeBoardSummary(treeId)
-        if (this.lastPingSummary.get(treeId) === summary) return
-        this.lastPingSummary.set(treeId, summary)
+        // FIX 6 — dedupe pakai SIGNATURE SUB (status/percent/progress), bukan treeBoardSummary.
+        // treeBoardSummary memuat baris root + judul: balasan root atas ping SEBELUMNYA sudah
+        // mengubahnya, jadi dedupe lama praktis tak pernah kena → tiap laporan = satu giliran root.
+        const sig = this.subBoardSignature(treeId)
+        if (shouldSkipWake(this.lastPingSummary.get(treeId), sig)) return
+        this.lastPingSummary.set(treeId, sig)
         root.injectAutoTask(this.rootStatusPrompt(treeId))
-      }, ROOT_STATUS_DEBOUNCE_MS)
+      }, WAKE.rootStatusDebounceMs)
     )
   }
 

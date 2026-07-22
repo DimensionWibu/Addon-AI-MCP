@@ -16,7 +16,8 @@ import { join } from 'node:path'
 import type { Board } from './db'
 import { buildGroveServer, type GroveHost } from './mcpTools'
 import { contextPercent, contextWindowFor } from './contextWindows'
-import { groveAppend } from './prompts'
+import { groveAppend, GROVE_REFERENCE } from './prompts'
+import { compactThresholds } from './wakePolicy'
 
 /**
  * Path claude.exe untuk app TERPAKET. Di dalam paket, SDK menunjuk binary yang berada
@@ -113,6 +114,41 @@ function formatToolInput(input?: Record<string, unknown>): string {
     .join('\n')
 }
 
+/**
+ * Detail baris tool untuk tool yang MENGUBAH FILE (Edit/Write/MultiEdit) → format DIFF baris-per-baris
+ * ("- " dibuang, "+ " ditambah) dengan penanda hunk "@@". Renderer memakai penanda ini untuk mewarnai
+ * dan untuk menampilkan pratinjau ringkas saat baris belum diklik. Tool lain memakai format lama.
+ */
+function formatToolDetail(name = '', input?: Record<string, unknown>): string {
+  const i = input ?? {}
+  const path = typeof i.file_path === 'string' ? i.file_path : typeof i.path === 'string' ? i.path : ''
+  const mark = (s: string, m: string): string =>
+    clip(s, 6000)
+      .replace(/\n+$/, '')
+      .split('\n')
+      .map((l) => m + l)
+      .join('\n')
+  if (name === 'Edit' && typeof i.old_string === 'string' && typeof i.new_string === 'string') {
+    const head = `file: ${path}${i.replace_all ? ' · semua kemunculan' : ''}`
+    return `${head}\n@@ edit @@\n${mark(i.old_string, '- ')}\n${mark(i.new_string, '+ ')}`
+  }
+  if (name === 'Write' && typeof i.content === 'string') {
+    const n = i.content.replace(/\n+$/, '').split('\n').length
+    return `file: ${path}\n@@ tulis ${n} baris @@\n${mark(i.content, '+ ')}`
+  }
+  if (name === 'MultiEdit' && Array.isArray(i.edits)) {
+    const blocks = (i.edits as Array<Record<string, unknown>>)
+      .map((e, n) => {
+        const o = typeof e.old_string === 'string' ? e.old_string : ''
+        const w = typeof e.new_string === 'string' ? e.new_string : ''
+        return `@@ edit ${n + 1} @@\n${mark(o, '- ')}\n${mark(w, '+ ')}`
+      })
+      .join('\n')
+    return `file: ${path}\n${blocks}`
+  }
+  return formatToolInput(input)
+}
+
 /** Ambil teks dari content tool_result (string, array blok teks/gambar, atau objek). */
 function extractResultText(content: unknown): string {
   if (typeof content === 'string') return content
@@ -130,9 +166,15 @@ function extractResultText(content: unknown): string {
   return content == null ? '' : JSON.stringify(content)
 }
 
-const MAX_TRANSIENT_RETRIES = 3 // auto-retry beruntun error koneksi transient sebelum menyerah
-const AUTO_COMPACT_HIGH = 88 // ctx% ambang ATAS: picu auto-compact (cegah freeze saat konteks nyaris penuh)
-const AUTO_COMPACT_LOW = 70 // ctx% ambang BAWAH: baru boleh mempersenjatai ulang auto-compact (hysteresis anti-thrash)
+// Auto-retry beruntun error koneksi transient sebelum menyerah. 5× dengan backoff eksponensial
+// (2s→4s→8s→16s→30s, total ~1 menit) karena gangguan provider (DeepSeek/OpenRouter penuh, 5xx,
+// koneksi drop di tengah stream) sering butuh lebih dari 4 detik untuk pulih — 3× backoff linear
+// dulu terlalu cepat menyerah dan memaksa user mengetik ulang.
+const MAX_TRANSIENT_RETRIES = 5
+const RETRY_BACKOFF_MS = [2000, 4000, 8000, 16000, 30000]
+// Ambang auto-compact (ctx%) ada di ./wakePolicy dan BEDA PER ROLE — root dipadatkan jauh lebih
+// awal (70/50 vs 88/70) karena root-lah yang paling sering dibangunkan, jadi tiap persen konteksnya
+// ditagih berkali-kali; compact root pun tak memakai giliran model. Lihat COMPACT di wakePolicy.ts.
 const DELTA_FLUSH_MS = 40 // B2: coalesce token stream → satu emit chat:delta per interval ini (bukan per token)
 const CTX_PERSIST_MS = 2000 // B3: throttle tulis ctx/usage ke DB; angka ephemeral, nilai final disimpan saat turn selesai
 
@@ -367,6 +409,10 @@ export class Session {
   private deltaBuf = ''
   private deltaTimer: NodeJS.Timeout | null = null
   private lastCtxPersist = 0 // B3: kapan terakhir ctx/usage ditulis ke DB (throttle persist)
+  private lastUsageMsgId: string | null = null // id respons API terakhir yang usage-nya sudah dicatat (anti hitung-ganda)
+  // Pesan user yang DITAHAN karena turn masih berjalan → masih bisa diedit/dibatalkan user.
+  private queued: Array<{ qid: number; text: string; images?: ImageAttachment[] }> = []
+  private qidSeq = 1
   /** Waktu terakhir API merespons (dari applyUsage). Dipakai SessionManager untuk tahu kapan cache perlu di-warm. */
   lastApiActivity = 0
 
@@ -427,6 +473,15 @@ export class Session {
         // Model EFEKTIF: untuk akun Claude = model sesi → sesi utama → global → default SDK; untuk
         // akun OpenRouter = id model akun itu (dihitung di getSessionLaunch).
         model: launch.model,
+        // TINGKAT MIKIR (reasoning). low..max → CLI mengirim output_config.effort (jalan di Claude
+        // MAUPUN DeepSeek — dibuktikan lewat proxy pencatat). 'off' → CLI hanya MENGHILANGKAN field
+        // `thinking` (tak pernah mengirim type:"disabled"): efektif mematikan extended thinking di
+        // Claude, tapi DeepSeek yang default-nya nyala TETAP mikir. undefined = default model.
+        ...(launch.effort === 'off'
+          ? { thinking: { type: 'disabled' as const } }
+          : launch.effort
+            ? { effort: launch.effort }
+            : {}),
         cwd: this.meta.cwd,
         includePartialMessages: true,
         permissionMode: 'bypassPermissions',
@@ -434,7 +489,10 @@ export class Session {
         systemPrompt: {
           type: 'preset',
           preset: 'claude_code',
-          append: lite ? '' : groveAppend(this.meta.role),
+          // Instruksi referensi hanya ikut bila sesi ini memang punya tautan → sesi biasa tak membayarnya.
+          append: lite
+            ? ''
+            : groveAppend(this.meta.role) + (this.host.hasReferences(this.meta.id) ? `\n\n${GROVE_REFERENCE}` : ''),
           // CATATAN (diverifikasi di sdk.d.ts:1943-1947): opsi ini TIDAK membuang apa pun. Ia hanya
           // MEMINDAHKAN seksi dinamis (working-dir, auto-memory, git-status) keluar dari system
           // prompt lalu menyuntikkannya kembali sebagai pesan user PERTAMA — tujuannya agar prefix
@@ -580,8 +638,79 @@ export class Session {
     this.finalReportSent = true
   }
 
+  /**
+   * Dorong konten ke query SEKALIGUS surface "raw request" ke panel LOG (renderer). rawText = teks
+   * yang Grove kontrol (prompt user + reseed + auto-task); byte-nya diukur UTF-8. JUJUR: ini BUKAN
+   * body HTTP byte-exact — system prompt/transcript/skema tools dirakit di subprocess SDK.
+   */
+  private pushRequest(content: string | unknown[], kind: 'user' | 'auto' | 'recycle', rawText: string, images = 0): void {
+    this.emit({
+      channel: 'log:request',
+      payload: { id: this.meta.id, kind, text: rawText, bytes: Buffer.byteLength(rawText, 'utf8'), images }
+    })
+    this.inbox.push(content)
+  }
+
   /** Kirim pesan user (opsional dengan gambar); start otomatis bila dormant. */
-  sendUserMessage(text: string, images?: ImageAttachment[]): void {
+  /** Pesan yang MASIH ANTRI di chat aktif (untuk UI: bisa diedit/dibatalkan sebelum terkirim). */
+  listQueued(): Array<{ qid: number; text: string }> {
+    return this.queued.map((q) => ({ qid: q.qid, text: q.text }))
+  }
+
+  /** Ubah isi pesan yang masih antri. false = sudah terlanjur terkirim (tak ada di antrian lagi). */
+  editQueued(qid: number, text: string): boolean {
+    const q = this.queued.find((x) => x.qid === qid)
+    if (!q) return false
+    q.text = text
+    this.emitQueue()
+    return true
+  }
+
+  /** Batalkan pesan yang masih antri. false = sudah terlanjur terkirim. */
+  cancelQueued(qid: number): boolean {
+    const i = this.queued.findIndex((x) => x.qid === qid)
+    if (i < 0) return false
+    this.queued.splice(i, 1)
+    this.emitQueue()
+    return true
+  }
+
+  private emitQueue(): void {
+    this.emit({ channel: 'queue:update', payload: { id: this.meta.id, items: this.listQueued() } })
+  }
+
+  /**
+   * Kirim satu pesan yang tertahan (dipanggil saat turn selesai). Sisa antrian tetap menunggu turn
+   * berikutnya — satu giliran satu pesan, supaya urutannya tetap terbaca oleh user.
+   */
+  private flushQueued(): void {
+    const next = this.queued.shift()
+    if (!next) return
+    this.emitQueue()
+    this.sendUserMessage(next.text, next.images, true)
+  }
+
+  /**
+   * @param fromQueue true = sudah pernah antri (jangan diantrikan lagi). Pesan user yang datang saat
+   * turn MASIH JALAN ditahan di Grove, BUKAN didorong ke SDK — dengan begitu ia masih bisa diedit
+   * atau dibatalkan (permintaan: "kalau prompt yang dituju masih antre harusnya dia ngedit antrian").
+   * Auto-task internal (injectAutoTask) memakai jalur lain & tak pernah lewat antrian ini.
+   */
+  sendUserMessage(text: string, images?: ImageAttachment[], fromQueue = false, displayImagesOnly = false): void {
+    if (!fromQueue && this.meta.status === 'running' && this.started) {
+      const qid = this.qidSeq++
+      this.queued.push({ qid, text, images })
+      this.emitQueue()
+      this.emitActivity(`antri ${this.queued.length} pesan`)
+      return
+    }
+    // JEMBATAN GAMBAR: model sesi ini buta gambar (DeepSeek menerima blok image lalu mengabaikannya
+    // TANPA error) → gambar dideskripsikan dulu oleh akun yang bisa melihat, hasilnya masuk sebagai
+    // teks. Tanpa ini, user mengira gambarnya terkirim padahal model tak pernah melihat apa pun.
+    if (images?.length && !displayImagesOnly && !this.host.sessionSeesImages(this.meta.id)) {
+      void this.describeImagesThenSend(text, images)
+      return
+    }
     this.beginTurn()
     this.lastUserPrompt = text // prompt user SEBELUM kena flag → diulang saat recycle
     this.apiRetries = 0 // prompt baru → reset hitungan recycle
@@ -601,15 +730,17 @@ export class Session {
     this.record({ role: 'user', text, ts: Date.now(), images: dataUrls.length ? dataUrls : undefined })
     this.setStatus('running')
     this.emitActivity('berpikir…')
-    if (images?.length) {
+    // displayImagesOnly = gambar sudah dideskripsikan lewat jembatan; di chat tetap ditampilkan
+    // (supaya user melihat apa yang ia kirim) tapi TIDAK dikirim ke model yang tak bisa melihatnya.
+    if (images?.length && !displayImagesOnly) {
       const content: unknown[] = []
       if (text) content.push({ type: 'text', text })
       for (const im of images) {
         content.push({ type: 'image', source: { type: 'base64', media_type: im.mediaType, data: im.data } })
       }
-      this.inbox.push(content)
+      this.pushRequest(content, 'user', text, images.length)
     } else {
-      this.inbox.push(text)
+      this.pushRequest(text, 'user', text)
     }
   }
 
@@ -628,7 +759,7 @@ export class Session {
     }
     this.setStatus('running')
     this.emitActivity('menyusun update progres…')
-    this.inbox.push(text)
+    this.pushRequest(text, 'auto', text)
   }
 
   /** Auto-check berkala: tampilkan nota "udah sampe mana?" (biar terlihat) lalu inject promptnya. */
@@ -868,7 +999,7 @@ export class Session {
       this.transientRetries = 0
       this.record({
         role: 'system',
-        text: `🚫 Koneksi ke API putus ${MAX_TRANSIENT_RETRIES}× berturut (retry otomatis menyerah). Ini biasanya kapasitas gratis OpenRouter yang sedang penuh — kirim pesan lagi untuk coba manual, atau klik-kanan kartu sesi → pilih model lain / OpenRouter berbayar yang lebih stabil.`,
+        text: `🚫 Koneksi ke API putus ${MAX_TRANSIENT_RETRIES}× berturut selama ~1 menit (retry otomatis menyerah). Penyebab lazim: kapasitas provider sedang penuh (OpenRouter gratis / DeepSeek sibuk) atau jaringan lokal. Konteks sesi TIDAK hilang — kirim pesan apa saja untuk melanjutkan, atau klik-kanan kartu sesi → ganti model/akun.`,
         ts: Date.now()
       })
       this.setStatus('error')
@@ -877,7 +1008,7 @@ export class Session {
     }
     this.transientRetries++
     const n = this.transientRetries
-    const delayMs = 1500 * n // backoff naik: 1.5s, 3s, 4.5s
+    const delayMs = RETRY_BACKOFF_MS[Math.min(n - 1, RETRY_BACKOFF_MS.length - 1)] // 2s→4s→8s→16s→30s
     this.record({
       role: 'system',
       text: `🔁 Koneksi terputus (transient) — mencoba lagi otomatis (${n}/${MAX_TRANSIENT_RETRIES}) dalam ${Math.round(delayMs / 1000)}s…`,
@@ -890,9 +1021,215 @@ export class Session {
       if (this.stopped) return
       // injectAutoTask meng-start() ulang (resume) lalu mendorong lanjut dari titik terakhir.
       this.injectAutoTask(
-        '[GROVE] Koneksi ke API sempat terputus lalu tersambung lagi. LANJUTKAN pekerjaan dari titik terakhir — jangan mengulang dari awal.'
+        '[GROVE] Koneksi ke API sempat terputus lalu tersambung lagi. LANJUTKAN pekerjaan dari titik terakhir — jangan mengulang dari awal. ' +
+          'PENTING: perintah terakhir mungkin SUDAH terlanjur jalan meski hasilnya tak sempat kembali. Sebelum menjalankan ulang apa pun yang berefek samping ' +
+          '(request jaringan, tulis/hapus file, deploy), CEK dulu jejaknya (file output, log, state) dan lanjutkan dari sana — jangan menduplikasi pekerjaan.'
       )
     }, delayMs)
+  }
+
+  /**
+   * JEMBATAN GAMBAR untuk sesi yang modelnya buta gambar (DeepSeek). Gambar dikirim ke akun LAIN yang
+   * bisa melihat (mis. Claude), diminta dideskripsikan seteliti mungkin, lalu deskripsinya disisipkan
+   * sebagai TEKS ke pesan user di sesi ini.
+   *
+   * Kejujuran yang dijaga: user diberi tahu jembatan ini dipakai & akun mana yang menagihnya; kalau
+   * tak ada akun yang bisa melihat, sesi TIDAK pura-pura menerima gambar — pesannya tetap dikirim
+   * dengan catatan tegas bahwa gambarnya tak terbaca.
+   */
+  private async describeImagesThenSend(text: string, images: ImageAttachment[]): Promise<void> {
+    const candidates = this.host.getVisionLaunches()
+    if (!candidates.length) {
+      this.record({
+        role: 'system',
+        text:
+          '🖼️ Model sesi ini TIDAK bisa melihat gambar (DeepSeek mengabaikan gambar tanpa error), dan belum ada akun lain ' +
+          'yang bisa melihat. Gambar tidak dikirim. Tambahkan akun Claude di ⚙ Akun untuk mengaktifkan jembatan gambar, ' +
+          'atau jelaskan isi gambar lewat teks.',
+        ts: Date.now()
+      })
+      this.sendUserMessage(text, images, true, true)
+      return
+    }
+    // Jembatan makan waktu (satu panggilan model penuh) → tandai sesi BEKERJA, jangan biarkan tampak
+    // idle. Tanpa ini kartu sesi diam saja padahal ada giliran berbayar yang sedang jalan.
+    this.setStatus('running')
+    this.emitActivity('🖼️ membaca gambar')
+    let desc = ''
+    let usedLabel = ''
+    // CADANGAN BERANTAI: akun pertama kena limit/koneksi putus → turun ke akun berikutnya yang bisa
+    // melihat gambar. Kegagalan tiap akun dilaporkan apa adanya, bukan disembunyikan.
+    for (const vision of candidates) {
+      this.record({
+        role: 'system',
+        text: `🖼️ Model sesi ini tak bisa melihat gambar → dideskripsikan dulu lewat akun "${vision.label}" (giliran ini ditagih ke akun itu)…`,
+        ts: Date.now()
+      })
+      try {
+      const content: unknown[] = [
+        {
+          type: 'text',
+          text:
+            'Deskripsikan gambar berikut SETELITI mungkin untuk agen lain yang tidak bisa melihatnya. Wajib sebutkan: ' +
+            'semua teks yang terbaca (persis, termasuk angka/error/path), elemen UI & tata letaknya, status/warna penting, ' +
+            'dan apa pun yang tampak salah. Jangan menebak maksud pengguna, jangan memberi saran — hanya deskripsi faktual.' +
+            (text ? `\n\nKonteks pertanyaan pengguna (untuk fokus deskripsi): ${text.slice(0, 500)}` : '')
+        },
+        ...images.map((im) => ({
+          type: 'image',
+          source: { type: 'base64', media_type: im.mediaType, data: im.data }
+        }))
+      ]
+      const q = query({
+        prompt: (async function* () {
+          yield {
+            type: 'user' as const,
+            message: { role: 'user' as const, content: content as never },
+            parent_tool_use_id: null
+          }
+        })(),
+        options: {
+          ...(vision.model ? { model: vision.model } : {}),
+          cwd: this.meta.cwd,
+          permissionMode: 'bypassPermissions',
+          allowedTools: [],
+          systemPrompt: { type: 'preset', preset: 'claude_code', excludeDynamicSections: true },
+          settingSources: [],
+          env: vision.env,
+          ...(CLAUDE_EXE ? { pathToClaudeCodeExecutable: CLAUDE_EXE } : {})
+        }
+      })
+        let failure = ''
+        for await (const m of q as AsyncIterable<Record<string, unknown>>) {
+          if (String(m.type) === 'assistant') {
+            const blocks = (m.message as { content?: Array<{ type: string; text?: string }> })?.content ?? []
+            for (const b of blocks) {
+              if (b.type === 'text' && b.text) {
+                // Limit datang sebagai TEKS asisten ("You've hit your session limit · resets …"),
+                // bukan exception → tanpa cek ini, "limit" ikut jadi "deskripsi" gambar.
+                if (isLimitNotice(b.text) || isTransientError(b.text)) failure = b.text
+                else desc += b.text
+              }
+            }
+          }
+          if (String(m.type) === 'result') {
+            const r = m as { subtype?: string; errors?: unknown[] }
+            if (r.subtype && r.subtype !== 'success') {
+              failure ||= `${r.subtype}${Array.isArray(r.errors) && r.errors.length ? `: ${String(r.errors[0])}` : ''}`
+            }
+            break
+          }
+        }
+        if (failure) throw new Error(failure)
+        if (desc.trim()) {
+          usedLabel = vision.label
+          break // berhasil → tak perlu akun cadangan berikutnya
+        }
+        throw new Error('deskripsi kosong')
+      } catch (e) {
+        desc = ''
+        const why = String(e)
+        const limited = isLimitNotice(why) || isLimitError(why)
+        const more = candidates.indexOf(vision) < candidates.length - 1
+        this.record({
+          role: 'system',
+          text:
+            `⚠️ Akun "${vision.label}" gagal membaca gambar (${limited ? 'kuota/limit' : why.slice(0, 140)})` +
+            (more ? ' → mencoba akun berikutnya…' : ' — tak ada akun cadangan lagi.'),
+          ts: Date.now()
+        })
+      }
+    }
+    const bridged = desc.trim()
+      ? `${text}\n\n[DESKRIPSI GAMBAR — sesi ini tak bisa melihat gambar, deskripsi dibuat oleh akun "${usedLabel}"]\n${desc.trim()}`
+      : `${text}\n\n[CATATAN: ada ${images.length} gambar terlampir, tapi model sesi ini tak bisa melihatnya dan SEMUA akun jembatan gagal (limit/gangguan). Jawab dengan jujur bahwa gambarnya tak terbaca — jangan menebak isinya.]`
+    if (!desc.trim()) {
+      this.record({
+        role: 'system',
+        text: `🚫 Gambar tidak terbaca: ${candidates.length} akun jembatan dicoba, semuanya gagal. Coba lagi nanti, atau pindahkan sesi ini ke akun yang bisa melihat gambar (klik-kanan kartu sesi → Akun).`,
+        ts: Date.now()
+      })
+    }
+    this.sendUserMessage(bridged, images, true, true)
+  }
+
+  /**
+   * /btw — PERTANYAAN SAMPINGAN. Dijawab oleh query SEKALI-JALAN yang benar-benar terpisah:
+   * tak me-resume sdkSessionId sesi ini, tak masuk inbox/antrian, tak menambah apa pun ke konteks
+   * yang dikirim ulang tiap giliran. Jadi boleh ditanyakan SAAT sesi sedang bekerja — turn yang
+   * berjalan tidak terganggu sama sekali.
+   *
+   * Yang dibawa hanya potongan kecil percakapan terakhir supaya jawabannya nyambung, dan tool
+   * DIMATIKAN (allowedTools: []) — ini kanal tanya-jawab, bukan kanal kerja. Biayanya tetap nyata
+   * (satu prefix baru), karena itu jawabannya diminta ringkas.
+   */
+  async askSide(question: string): Promise<void> {
+    const q0 = question.trim()
+    if (!q0) return
+    const launch = this.host.getSessionLaunch(this.meta.id)
+    this.record({ role: 'side', text: `❯ ${q0}`, ts: Date.now() })
+    if (!launch) {
+      this.record({ role: 'side', text: '⛔ Belum ada akun/token untuk sesi ini.', ts: Date.now() })
+      this.host.onAccountMissing(this.meta.id)
+      return
+    }
+    const tail = this.history
+      .filter((m) => m.role === 'user' || m.role === 'assistant')
+      .slice(-4)
+      .map((m) => `${m.role === 'user' ? 'USER' : 'ASISTEN'}: ${m.text.slice(0, 400)}`)
+      .join('\n')
+    const prompt =
+      '[PERTANYAAN SAMPINGAN] Jawab RINGKAS (maksimal beberapa kalimat). Jangan memakai tool, jangan mengubah file apa pun, ' +
+      'jangan melanjutkan pekerjaan yang sedang berjalan — ini hanya pertanyaan sisipan dari user.\n' +
+      (tail ? `\nKonteks singkat percakapan yang sedang berjalan (untuk pemahaman saja):\n${tail}\n` : '') +
+      `\nPertanyaan: ${q0}`
+    this.emitActivity('💬 /btw')
+    try {
+      const sideQ = query({
+        prompt,
+        options: {
+          model: launch.model,
+          ...(launch.effort === 'off'
+            ? { thinking: { type: 'disabled' as const } }
+            : launch.effort
+              ? { effort: launch.effort }
+              : {}),
+          cwd: this.meta.cwd,
+          permissionMode: 'bypassPermissions',
+          allowedTools: [], // kanal tanya-jawab: tanpa tool → tak ada efek samping & prefix lebih kecil
+          systemPrompt: { type: 'preset', preset: 'claude_code', excludeDynamicSections: true },
+          settingSources: [],
+          env: launch.env,
+          ...(CLAUDE_EXE ? { pathToClaudeCodeExecutable: CLAUDE_EXE } : {})
+        }
+      })
+      let out = ''
+      for await (const m of sideQ as AsyncIterable<Record<string, unknown>>) {
+        const type = String(m.type)
+        if (type === 'assistant') {
+          const content = (m.message as { content?: Array<{ type: string; text?: string }> })?.content ?? []
+          for (const b of content) if (b.type === 'text' && b.text) out += b.text
+        }
+        if (type === 'result') {
+          // Biaya /btw NYATA → tetap dicatat ke riwayat pemakaian, jangan disembunyikan.
+          const u = m.usage as Record<string, number> | undefined
+          if (u) {
+            this.host.recordUsage(this.meta.id, {
+              input: u.input_tokens ?? 0,
+              cacheRead: u.cache_read_input_tokens ?? 0,
+              cacheCreation: u.cache_creation_input_tokens ?? 0,
+              output: u.output_tokens ?? 0
+            })
+          }
+          break
+        }
+      }
+      this.record({ role: 'side', text: out.trim() || '(tak ada jawaban)', ts: Date.now() })
+    } catch (e) {
+      this.record({ role: 'side', text: `⚠️ /btw gagal: ${String(e)}`, ts: Date.now() })
+    } finally {
+      this.emitActivity(this.meta.status === 'running' ? 'bekerja…' : 'idle')
+    }
   }
 
   /** Catat satu baris system ke chat (dipakai orkestrator: memberi tahu switch akun / limit). */
@@ -979,7 +1316,7 @@ export class Session {
     this.start() // fresh (started sudah false dari finally)
     this.setStatus('running')
     this.emitActivity(`recycle #${this.apiRetries}…`)
-    this.inbox.push(prompt)
+    this.pushRequest(prompt, 'recycle', prompt)
   }
 
   /** Interupsi turn yang sedang berjalan TANPA menutup session (masih bisa lanjut chat). */
@@ -1060,8 +1397,17 @@ export class Session {
         // BUKAN exception — deteksi di sini agar auto-switch akun ikut kepicu.
         const wrapErr = (msg as { error?: string }).error
         if (wrapErr && isLimitError(wrapErr)) this.flagLimitHit()
-        const message = (msg as { message?: { content?: unknown[]; usage?: Record<string, number> } }).message
-        this.applyUsage(message?.usage)
+        const message = (msg as { message?: { id?: string; content?: unknown[]; usage?: Record<string, number> } })
+          .message
+        // SDK memecah SATU respons API jadi BEBERAPA pesan 'assistant' — satu per blok konten
+        // (thinking / text / tool_use) — semuanya membawa message.id DAN usage yang SAMA
+        // (dibuktikan .tmp/probe-assistant-msgs.ts: 1 respons → 3 pesan, usage identik).
+        // Tanpa dedup ini, token satu respons tercatat 2-3× → riwayat pemakaian, tokensTotal, dan
+        // biaya (mis. panel DeepSeek) menggelembung, dan baris metrik di chat muncul dobel.
+        if (!message?.id || message.id !== this.lastUsageMsgId) {
+          this.lastUsageMsgId = message?.id ?? null
+          this.applyUsage(message?.usage)
+        }
         for (const block of (message?.content ?? []) as {
           type: string
           id?: string
@@ -1082,7 +1428,7 @@ export class Session {
             // sedang result-nya cuma subtype generik → catat di sini supaya finally bisa auto-retry.
             else if (isTransientError(block.text)) this.transientSeen = true
           } else if (block.type === 'tool_use') {
-            const input = formatToolInput(block.input)
+            const input = formatToolDetail(block.name, block.input)
             const rowId = this.record({
               role: 'tool',
               text: summarizeTool(block.name, block.input),
@@ -1198,15 +1544,21 @@ export class Session {
           cleanEnd ? { finalText: this.turnText || this.lastAssistantText } : undefined
         )
         this.turnText = '' // sudah dipakai → bersihkan agar turn berikutnya mulai bersih
+        // Pesan user yang tertahan selama turn berjalan → kirim SEKARANG (satu per turn). Ditunda bila
+        // turn ini akan di-retry/di-recycle/kena limit: pesan user tak boleh nyelip di tengah pemulihan.
+        if (!this.transientPending && !this.apiBlockPending && !this.limitHitPending && !this.pendingCompactSeed) {
+          this.flushQueued()
+        }
         // Bila ada permintaan compact tertunda, padatkan konteks sekarang (turn sudah selesai).
         if (this.pendingCompactSeed) this.doCompact()
         else {
           const pct = contextPercent(this.meta.ctxInput, this.meta.ctxWindow)
-          if (pct < AUTO_COMPACT_LOW) {
+          const { high, low } = compactThresholds(this.meta.role)
+          if (pct < low) {
             // Turn berakhir lega → reset guard futility (compact sebelumnya benar memberi headroom).
             this.compactStreak = 0
             this.compactWarned = false
-          } else if (this.compactArmed && pct >= AUTO_COMPACT_HIGH) {
+          } else if (this.compactArmed && pct >= high) {
             if (this.compactStreak >= 2) {
               // Compact berulang tak menurunkan konteks → jangan loop; peringatkan SEKALI (anti-freeze + anti-spam).
               if (!this.compactWarned) {
@@ -1266,10 +1618,16 @@ export class Session {
         ctxOutput,
         ctxPercent: contextPercent(ctxInput, this.meta.ctxWindow),
         tokensTotal: this.tokensTotal,
-        ctxPending: false // ada pengukuran nyata → badge keluar dari mode pending
+        ctxPending: false, // ada pengukuran nyata → badge keluar dari mode pending
+        callUsage: {
+          input: usage.input_tokens ?? 0,
+          cacheRead: usage.cache_read_input_tokens ?? 0,
+          cacheCreation: usage.cache_creation_input_tokens ?? 0,
+          output: ctxOutput
+        }
       }
     })
     // Hysteresis: begitu konteks NYATA turun < LOW, persenjatai ulang auto-compact (boleh memicu lagi nanti).
-    if (contextPercent(ctxInput, this.meta.ctxWindow) < AUTO_COMPACT_LOW) this.compactArmed = true
+    if (contextPercent(ctxInput, this.meta.ctxWindow) < compactThresholds(this.meta.role).low) this.compactArmed = true
   }
 }

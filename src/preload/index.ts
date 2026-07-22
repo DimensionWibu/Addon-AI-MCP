@@ -11,6 +11,16 @@ const api: GroveApi = {
   setSessionCwd: (id: string, path: string) => ipcRenderer.invoke('grove:setSessionCwd', { id, path }),
   sendChat: (id: string, text: string, images?: ImageAttachment[]) =>
     ipcRenderer.invoke('grove:sendChat', { id, text, images }),
+  askSide: (id: string, question: string) => ipcRenderer.invoke('grove:askSide', { id, question }),
+  getDeepseekCosts: () => ipcRenderer.invoke('grove:getDeepseekCosts'),
+  listQueued: (id: string) => ipcRenderer.invoke('grove:listQueued', { id }),
+  editQueued: (id: string, qid: number, text: string) => ipcRenderer.invoke('grove:editQueued', { id, qid, text }),
+  cancelQueued: (id: string, qid: number) => ipcRenderer.invoke('grove:cancelQueued', { id, qid }),
+  linkReference: (helperId: string, targetId: string) =>
+    ipcRenderer.invoke('grove:linkReference', { helperId, targetId }),
+  unlinkReference: (helperId: string, targetId: string) =>
+    ipcRenderer.invoke('grove:unlinkReference', { helperId, targetId }),
+  listReferences: (helperId: string) => ipcRenderer.invoke('grove:listReferences', { helperId }),
   stopSession: (id: string) => ipcRenderer.invoke('grove:stopSession', { id }),
   stopAll: () => ipcRenderer.invoke('grove:stopAll'),
   reorderSessions: (orderedIds: string[]) => ipcRenderer.invoke('grove:reorder', { ids: orderedIds }),
@@ -22,7 +32,7 @@ const api: GroveApi = {
     token: string,
     plan?: number,
     switchPct?: number,
-    provider?: 'claude' | 'openrouter' | 'custom',
+    provider?: 'claude' | 'openrouter' | 'custom' | 'cursor' | 'deepseek',
     model?: string,
     baseUrl?: string
   ) => ipcRenderer.invoke('grove:addAccount', { label, token, plan, switchPct, provider, model, baseUrl }),
@@ -34,6 +44,8 @@ const api: GroveApi = {
   setDefaultModel: (model: string | null) => ipcRenderer.invoke('grove:setDefaultModel', { model }),
   setSessionModel: (id: string, model: string | null) => ipcRenderer.invoke('grove:setSessionModel', { id, model }),
   setLite: (id: string, lite: boolean) => ipcRenderer.invoke('grove:setLite', { id, lite }),
+  setSessionEffort: (id: string, effort: string | null) => ipcRenderer.invoke('grove:setSessionEffort', { id, effort }),
+  setDefaultEffort: (effort: string | null) => ipcRenderer.invoke('grove:setDefaultEffort', { effort }),
   listOpenRouterModels: (freeOnly?: boolean) => ipcRenderer.invoke('grove:listOpenRouterModels', { freeOnly }),
   getUsageStats: () => ipcRenderer.invoke('grove:getUsageStats'),
   setSessionAccount: (id: string, accountId: string | null) =>

@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { Board } from '../src/main/orchestrator/db'
 import { SessionManager } from '../src/main/orchestrator/SessionManager'
 import { isTransientError, looksLikeAwaitingInput } from '../src/main/orchestrator/Session'
+import { contextWindowFor } from '../src/main/orchestrator/contextWindows'
 import type { GroveEvent } from '../src/shared/types'
 
 let failed = 0
@@ -239,6 +240,186 @@ async function main(): Promise<void> {
     await m6.stopAll()
     b6.flush()
     try { rmSync(xDir, { recursive: true, force: true }) } catch { /* windows lock */ }
+  }
+
+  // --- 15b. Provider CURSOR (token free via proxy Anthropic→Cursor): sama seperti custom, base-URL sendiri ---
+  {
+    const cDir = mkdtempSync(join(tmpdir(), 'grove-cursor-'))
+    const bC = new Board(join(cDir, 't.sqlite'))
+    await bC.init()
+    const mC = new SessionManager(bC, () => {})
+    const CR = mC.addAccount('CursorFree', 'workos-session-tok', undefined, undefined, 'cursor', 'claude-3.5-sonnet', 'http://localhost:3000')
+    check('provider tersimpan = cursor', CR.provider, 'cursor')
+    check('cursor: baseUrl tersimpan di objek akun', CR.baseUrl, 'http://localhost:3000')
+    mC.setDefaultAccount(CR.id)
+    const rC = await mC.createRoot(cDir, 'R') // baca via DB → uji round-trip kolom provider+base_url
+    const lC = mC.getSessionLaunch(rC.id)
+    check('cursor: ANTHROPIC_BASE_URL = baseUrl akun (BUKAN OpenRouter)', lC?.env.ANTHROPIC_BASE_URL, 'http://localhost:3000')
+    check('cursor: ANTHROPIC_AUTH_TOKEN = token', lC?.env.ANTHROPIC_AUTH_TOKEN, 'workos-session-tok')
+    check('cursor: CLAUDE_CODE_OAUTH_TOKEN dibuang', lC?.env.CLAUDE_CODE_OAUTH_TOKEN, undefined)
+    check('cursor: model = model akun', lC?.model, 'claude-3.5-sonnet')
+    mC.setSessionModel(rC.id, 'opus') // alias claude TAK boleh menang atas model akun cursor (dikunci proxy)
+    check('cursor: alias claude diabaikan (model akun terkunci)', mC.resolveModel(rC.id), 'claude-3.5-sonnet')
+    await mC.stopAll()
+    bC.flush()
+    try { rmSync(cDir, { recursive: true, force: true }) } catch { /* windows lock */ }
+  }
+
+  // --- 15c. Provider DEEPSEEK (token saja, base-URL Anthropic RESMI DeepSeek, model pro/flash) ---
+  {
+    const dDir = mkdtempSync(join(tmpdir(), 'grove-ds-'))
+    const bD = new Board(join(dDir, 't.sqlite'))
+    await bD.init()
+    const mD = new SessionManager(bD, () => {})
+    const DS = mD.addAccount('DeepSeek', 'sk-ds-test', undefined, undefined, 'deepseek') // model sengaja kosong
+    check('provider tersimpan = deepseek', DS.provider, 'deepseek')
+    check('deepseek: model kosong → default pro', DS.model, 'deepseek-v4-pro')
+    check('deepseek: TIDAK menyimpan baseUrl (konstanta, bukan proxy user)', DS.baseUrl, undefined)
+    mD.setDefaultAccount(DS.id)
+    const rD = await mD.createRoot(dDir, 'R') // baca via DB → uji round-trip kolom provider+or_model
+    const lD = mD.getSessionLaunch(rD.id)
+    check('deepseek: ANTHROPIC_BASE_URL = endpoint anthropic DeepSeek', lD?.env.ANTHROPIC_BASE_URL, 'https://api.deepseek.com/anthropic')
+    check('deepseek: ANTHROPIC_AUTH_TOKEN = key', lD?.env.ANTHROPIC_AUTH_TOKEN, 'sk-ds-test')
+    check('deepseek: CLAUDE_CODE_OAUTH_TOKEN dibuang', lD?.env.CLAUDE_CODE_OAUTH_TOKEN, undefined)
+    check('deepseek: ANTHROPIC_API_KEY dibuang', lD?.env.ANTHROPIC_API_KEY, undefined)
+    check('deepseek: kelas model internal CLI dipetakan (opus→pro)', lD?.env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'deepseek-v4-pro')
+    check('deepseek: kelas cepat → flash (hemat)', lD?.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'deepseek-v4-flash')
+    check('deepseek: model efektif = model akun', lD?.model, 'deepseek-v4-pro')
+    mD.setSessionModel(rD.id, 'opus') // alias claude TAK dikenal DeepSeek → harus diabaikan
+    check('deepseek: alias claude diabaikan', mD.resolveModel(rD.id), 'deepseek-v4-pro')
+    mD.setSessionModel(rD.id, 'deepseek-v4-flash') // pilih model DeepSeek lain = override sadar
+    check('deepseek: override model DeepSeek dihormati', mD.resolveModel(rD.id), 'deepseek-v4-flash')
+    const sD = await mD.spawnWorker(rD.id, { title: 'W', task: 'noop' })
+    check('deepseek: sub mewarisi model root', mD.resolveModel(sD), 'deepseek-v4-flash')
+    check('deepseek: ctxWindow 1jt (bukan 200k)', contextWindowFor(mD.resolveModel(rD.id)), 1_000_000)
+    await mD.stopAll()
+    bD.flush()
+    try { rmSync(dDir, { recursive: true, force: true }) } catch { /* windows lock */ }
+  }
+
+  // --- 15d. TINGKAT MIKIR (effort/thinking): warisan sesi→utama→global + persist + ikut launch ---
+  {
+    const eDir = mkdtempSync(join(tmpdir(), 'grove-effort-'))
+    const bE = new Board(join(eDir, 't.sqlite'))
+    await bE.init()
+    const mE = new SessionManager(bE, () => {})
+    const acc = mE.addAccount('Akun', 'tok', undefined, undefined, 'deepseek')
+    mE.setDefaultAccount(acc.id)
+    const rE = await mE.createRoot(eDir, 'R')
+    const sE = await mE.spawnWorker(rE.id, { title: 'W', task: 'noop' })
+    check('effort default: tak ada → undefined (ikut default model)', mE.resolveEffort(rE.id), undefined)
+    mE.setDefaultEffort('high')
+    check('effort global → root ikut', mE.resolveEffort(rE.id), 'high')
+    check('effort global → sub ikut lewat root', mE.resolveEffort(sE), 'high')
+    mE.setSessionEffort(rE.id, 'max')
+    check('root set max → root max', mE.resolveEffort(rE.id), 'max')
+    check('root set max → sub OTOMATIS ikut', mE.resolveEffort(sE), 'max')
+    mE.setSessionEffort(sE, 'off')
+    check('sub override → off (thinking mati)', mE.resolveEffort(sE), 'off')
+    check('root tetap max', mE.resolveEffort(rE.id), 'max')
+    check('effort ikut dibawa getSessionLaunch', mE.getSessionLaunch(sE)?.effort, 'off')
+    mE.setSessionEffort(sE, null)
+    check('sub kembali mewarisi → max', mE.resolveEffort(sE), 'max')
+    bE.flush()
+    check('effort persist di DB (round-trip kolom effort)', bE.getAllSessions().find((s) => s.id === rE.id)?.effort, 'max')
+    await mE.stopAll()
+    try { rmSync(eDir, { recursive: true, force: true }) } catch { /* windows lock */ }
+  }
+
+  // --- 15e. REFERENSI SATU ARAH antar-sesi: tautan, kunci arah-balik, baca, kirim ---
+  {
+    const fDir = mkdtempSync(join(tmpdir(), 'grove-ref-'))
+    const bF = new Board(join(fDir, 't.sqlite'))
+    await bF.init()
+    const mF = new SessionManager(bF, () => {})
+    const A = await mF.createRoot(fDir, 'Chat A', true) // lite → tak auto-start query
+    const B = await mF.createRoot(fDir, 'Chat B', true) // SENGAJA folder kerja SAMA
+    check('sebelum ditautkan: B tak punya referensi', mF.hasReferences(B.id), false)
+    mF.linkReference(B.id, A.id)
+    check('B punya referensi setelah ditautkan', mF.hasReferences(B.id), true)
+    check('daftar referensi B berisi A', mF.listReferences(B.id).map((r) => r.id), [A.id])
+    check('A TIDAK ikut punya referensi (satu arah)', mF.hasReferences(A.id), false)
+    check('folder kerja sama TIDAK membuat A jadi referensi B', mF.listReferences(A.id), [])
+    let reverseErr = ''
+    try { mF.linkReference(A.id, B.id) } catch (e) { reverseErr = String(e) }
+    check('tautan arah-balik DITOLAK', /SATU ARAH/.test(reverseErr), true)
+    let selfErr = ''
+    try { mF.linkReference(B.id, B.id) } catch (e) { selfErr = String(e) }
+    check('tautan ke diri sendiri DITOLAK', /dirinya sendiri/.test(selfErr), true)
+    check('B bisa membaca papan A', /Chat A/.test(mF.readReference(B.id, A.id)), true)
+    let noLinkErr = ''
+    try { mF.readReference(A.id, B.id) } catch (e) { noLinkErr = String(e) }
+    check('A TIDAK bisa membaca B (tak ada tautan)', /bukan referensimu/.test(noLinkErr), true)
+    mF.sendToReference(B.id, A.id, 'pakai guard rec.busy sebelum accept')
+    const aChat = mF.getChat(A.id)
+    check('pesan bantuan mendarat di A sebagai pesan user biasa',
+      aChat.some((m) => m.role === 'user' && m.text.includes('guard rec.busy')), true)
+    check('A tak diberi tahu asal pesannya',
+      aChat.some((m) => m.text.includes('Chat B') || m.text.includes(B.id)), false)
+    mF.unlinkReference(B.id, A.id)
+    check('setelah dilepas: B tak punya referensi lagi', mF.hasReferences(B.id), false)
+    await mF.stopAll()
+    bF.flush()
+    try { rmSync(fDir, { recursive: true, force: true }) } catch { /* windows lock */ }
+  }
+
+  // --- 15g. JEMBATAN GAMBAR: sesi DeepSeek buta gambar → butuh akun lain yang bisa melihat ---
+  {
+    const vDir = mkdtempSync(join(tmpdir(), 'grove-vision-'))
+    const bV = new Board(join(vDir, 't.sqlite'))
+    await bV.init()
+    const mV = new SessionManager(bV, () => {})
+    const ds = mV.addAccount('DS', 'sk-ds', undefined, undefined, 'deepseek')
+    mV.setDefaultAccount(ds.id)
+    const rV = await mV.createRoot(vDir, 'R', true)
+    check('sesi ber-akun DeepSeek dianggap BUTA gambar', mV.sessionSeesImages(rV.id), false)
+    check('tanpa akun lain → tak ada jembatan gambar', mV.getVisionLaunch(), null)
+    const cl = mV.addAccount('Claude', 'sk-ant-oat01-x')
+    const vl = mV.getVisionLaunch()
+    check('akun Claude menjadi jembatan gambar', vl?.label, 'Claude')
+    check('jembatan pakai token akun itu', vl?.env.CLAUDE_CODE_OAUTH_TOKEN, 'sk-ant-oat01-x')
+    check('jembatan tak membawa base URL DeepSeek', vl?.env.ANTHROPIC_BASE_URL, undefined)
+    mV.setSessionAccount(rV.id, cl.id)
+    check('sesi ber-akun Claude BISA melihat gambar', mV.sessionSeesImages(rV.id), true)
+    // CADANGAN: lebih dari satu akun yang bisa melihat → daftar berurutan (akun global paling depan),
+    // dipakai Session untuk turun ke akun berikutnya saat yang pertama kena limit.
+    const cl2 = mV.addAccount('Claude2', 'sk-ant-oat01-y')
+    check('dua kandidat jembatan terdaftar', mV.getVisionLaunches().map((v) => v.label), ['Claude', 'Claude2'])
+    mV.setDefaultAccount(cl2.id)
+    check('akun GLOBAL naik ke urutan pertama', mV.getVisionLaunches().map((v) => v.label), ['Claude2', 'Claude'])
+    check('akun DeepSeek tak pernah jadi kandidat', mV.getVisionLaunches().some((v) => v.label === 'DS'), false)
+    await mV.stopAll()
+    try { rmSync(vDir, { recursive: true, force: true }) } catch { /* windows lock */ }
+  }
+
+  // --- 15f. ANTRIAN pesan user saat turn jalan: bisa diedit & dibatalkan sebelum terkirim ---
+  {
+    const qDir = mkdtempSync(join(tmpdir(), 'grove-queue-'))
+    const bQ = new Board(join(qDir, 't.sqlite'))
+    await bQ.init()
+    const mQ = new SessionManager(bQ, () => {})
+    const acc = mQ.addAccount('Akun', 'tok', undefined, undefined, 'deepseek')
+    mQ.setDefaultAccount(acc.id)
+    const r = await mQ.createRoot(qDir, 'R', true)
+    const sess = mQ.getSnapshot().trees.find((t) => t.id === r.id)!
+    check('sesi baru: antrian kosong', mQ.listQueued(r.id), [])
+    // Paksa kondisi "turn sedang jalan" seperti saat model bekerja.
+    const live = (mQ as unknown as { sessions: Map<string, { meta: { status: string }; started: boolean }> }).sessions.get(r.id)!
+    live.meta.status = 'running'
+    live.started = true
+    mQ.sendChat(r.id, 'pesan pertama')
+    mQ.sendChat(r.id, 'pesan kedua')
+    check('dua pesan MASUK ANTRIAN (bukan dikirim)', mQ.listQueued(r.id).map((q) => q.text), ['pesan pertama', 'pesan kedua'])
+    check('antrian TIDAK muncul di chat sebelum terkirim', mQ.getChat(r.id).some((m) => m.role === 'user'), false)
+    const qid = mQ.listQueued(r.id)[0].qid
+    check('edit antrian berhasil', mQ.editQueued(r.id, qid, 'pesan pertama (diedit)'), true)
+    check('isi antrian ikut berubah', mQ.listQueued(r.id)[0].text, 'pesan pertama (diedit)')
+    check('batalkan antrian berhasil', mQ.cancelQueued(r.id, qid), true)
+    check('sisa antrian tinggal satu', mQ.listQueued(r.id).map((q) => q.text), ['pesan kedua'])
+    check('edit qid yang sudah tak ada → false', mQ.editQueued(r.id, qid, 'x'), false)
+    check('sesi lain tak terpengaruh', sess.id === r.id, true)
+    await mQ.stopAll()
+    try { rmSync(qDir, { recursive: true, force: true }) } catch { /* windows lock */ }
   }
 
   // --- 16. Mode LITE (fix boros): default per entry-point + toggle + persist DB ---
