@@ -28,6 +28,7 @@ import {
   DEEPSEEK_MODEL_DEFAULT,
   DZAX_BASE_URL_DEFAULT,
   DZAX_MODEL_SUGGESTIONS,
+  modelCandidates,
   deepseekCostUsd,
   isDeepSeekModel,
   providerSeesImages,
@@ -380,16 +381,12 @@ export class SessionManager implements GroveHost {
     const now = Date.now()
     const clean = label.trim() || 'Akun'
     const pct = switchPct == null ? undefined : clampPct(switchPct)
-    const prov: AccountProvider =
-      provider === 'openrouter'
-        ? 'openrouter'
-        : provider === 'custom'
-          ? 'custom'
-          : provider === 'cursor'
-            ? 'cursor'
-            : provider === 'deepseek'
-              ? 'deepseek'
-              : 'claude'
+    // DAFTAR PUTIH provider. WAJIB memuat setiap provider baru — kalau tidak, pilihan user diam-diam
+    // jatuh ke 'claude'. Itu bukan teori: akun gateway yang ditambahkan lewat GUI sempat tersimpan
+    // sebagai akun Claude (token gateway dikirim ke api.anthropic.com, usage mustahil terbaca) persis
+    // karena 'dzax' belum ada di sini, padahal db.ts sudah bisa membacanya.
+    const KNOWN: AccountProvider[] = ['openrouter', 'custom', 'cursor', 'deepseek', 'dzax']
+    const prov: AccountProvider = provider && KNOWN.includes(provider) ? provider : 'claude'
     // openrouter/custom/cursor/deepseek sama-sama "Anthropic Skin" → semuanya memaksa model akun sendiri.
     // DeepSeek punya daftar model tertutup (pro/flash) → kosong berarti pakai default, bukan "tanpa model"
     // (tanpa model, SDK akan meminta alias claude yang tak dikenal DeepSeek → 400).
@@ -397,7 +394,7 @@ export class SessionManager implements GroveHost {
       ? model?.trim() || (prov === 'deepseek' ? DEEPSEEK_MODEL_DEFAULT : undefined)
       : undefined
     // base URL untuk provider proxy-sendiri ('custom'/'cursor'). openrouter pakai konstanta tetap.
-    const url = usesOwnBaseUrl(prov) ? baseUrl?.trim() || undefined : undefined
+    const url = usesOwnBaseUrl(prov) || prov === 'dzax' ? baseUrl?.trim() || undefined : undefined
     this.db.addAccount(id, clean, token.trim(), now, plan, pct, prov, orModel, url)
     this.emitAccounts()
     return { id, label: clean, plan, switchPct: pct, provider: prov, model: orModel, baseUrl: url, createdAt: now }
@@ -511,7 +508,10 @@ export class SessionManager implements GroveHost {
       // GATEWAY BER-FORMAT OPENAI: CLI tak bisa bicara langsung ke sana. Arahkan ke jembatan lokal
       // (openaiBridge) yang menerjemahkan Anthropic ⇄ OpenAI; tujuan upstream & model default
       // dikodekan di path jembatan, token diteruskan apa adanya lewat header.
-      const model = acc.model || DZAX_MODEL_SUGGESTIONS[0].id
+      // Field model boleh berisi beberapa id dipisah koma (daftar cadangan) → pakai yang pertama,
+      // kecuali sesi ini sudah punya override sendiri (mis. hasil pindah otomatis saat model ditolak).
+      const sessionModel = this.resolveModel(sessionId)
+      const model = (sessionModel && modelCandidates(acc.model).includes(sessionModel) ? sessionModel : modelCandidates(acc.model)[0]) || DZAX_MODEL_SUGGESTIONS[0].id
       const bridge = bridgeBaseUrl(acc.baseUrl || DZAX_BASE_URL_DEFAULT, model, sessionId)
       if (!bridge) return null // jembatan belum menyala → lebih baik sesi berhenti daripada salah kirim
       env.ANTHROPIC_BASE_URL = bridge
@@ -553,6 +553,26 @@ export class SessionManager implements GroveHost {
       delete env.ANTHROPIC_BASE_URL
     }
     return { env, model: this.resolveModel(sessionId), effort: this.resolveEffort(sessionId) }
+  }
+
+  /**
+   * GroveHost.nextModelCandidate — pindah ke model cadangan akun (daftar dipisah koma di field model).
+   * Model yang barusan dipakai ditandai sebagai "sudah gagal" lewat pin per-sesi, jadi kandidat
+   * berikutnya benar-benar berbeda dan tak berputar-putar di model yang sama.
+   */
+  nextModelCandidate(sessionId: string): string | null {
+    const acc = this.effectiveAccount(sessionId)
+    const list = modelCandidates(acc?.model)
+    if (list.length < 2) return null
+    // Model yang SEDANG dipakai: override sesi bila ada, kalau tidak kandidat pertama akun (itulah
+    // yang dipakai getSessionLaunch). Tanpa fallback ini, penolakan pertama akan "pindah" ke model
+    // yang sama dan berputar di situ.
+    const current = this.resolveModel(sessionId) ?? list[0]
+    const idx = list.indexOf(current)
+    const next = list[idx + 1]
+    if (!next) return null
+    this.setSessionModel(sessionId, next) // berlaku di start berikutnya
+    return next
   }
 
   /** GroveHost.providerCachesPrompt — gateway OpenAI-compatible tak melaporkan cache sama sekali. */
@@ -653,9 +673,18 @@ export class SessionManager implements GroveHost {
     return this.defaultModel ?? undefined
   }
 
+  /** Model EFEKTIF yang benar-benar dikirim untuk sesi ini (akun gateway: kandidat pertama bila
+   *  sesi belum menentukan sendiri). Dipakai UI & jalur pindah-model. */
+  effectiveModel(sessionId: string): string | undefined {
+    const own = this.resolveModel(sessionId)
+    if (own) return own
+    const acc = this.effectiveAccount(sessionId)
+    return acc?.provider === 'dzax' ? modelCandidates(acc.model)[0] : undefined
+  }
+
   /** GroveHost.getSessionModel — model EFEKTIF sesi ini untuk di-inject ke query. */
   getSessionModel(sessionId: string): string | undefined {
-    return this.resolveModel(sessionId)
+    return this.effectiveModel(sessionId)
   }
 
   /** Model global: dipakai semua sesi yang tak menentukan model sendiri. null = default SDK. */

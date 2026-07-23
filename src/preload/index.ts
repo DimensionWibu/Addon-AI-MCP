@@ -47,6 +47,7 @@ const api: GroveApi = {
   setLite: (id: string, lite: boolean) => ipcRenderer.invoke('grove:setLite', { id, lite }),
   setSessionEffort: (id: string, effort: string | null) => ipcRenderer.invoke('grove:setSessionEffort', { id, effort }),
   setDefaultEffort: (effort: string | null) => ipcRenderer.invoke('grove:setDefaultEffort', { effort }),
+  listGatewayModels: (accountId: string) => ipcRenderer.invoke('grove:listGatewayModels', { accountId }),
   listOpenRouterModels: (freeOnly?: boolean) => ipcRenderer.invoke('grove:listOpenRouterModels', { freeOnly }),
   getUsageStats: () => ipcRenderer.invoke('grove:getUsageStats'),
   setSessionAccount: (id: string, accountId: string | null) =>

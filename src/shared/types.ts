@@ -254,6 +254,20 @@ export function deepseekPriceLabel(model?: string): string {
   return p ? `$${p.miss}/M input · $${p.hit}/M input ter-cache · $${p.out}/M output` : ''
 }
 
+/**
+ * DAFTAR MODEL sebuah akun gateway: field `model` boleh berisi BEBERAPA id dipisah koma, mis.
+ * "claude-opus-4.8, claude-sonnet-5, glm-5.2". Yang pertama dipakai default; sisanya jadi CADANGAN
+ * saat gateway menolak model (kuota model itu habis / tak diizinkan) — Grove pindah sendiri ke
+ * kandidat berikutnya alih-alih membuat sesi mati. Sengaja lewat satu field: tak perlu migrasi DB,
+ * dan user bisa mengatur urutannya persis sesuai keinginannya.
+ */
+export function modelCandidates(model?: string | null): string[] {
+  return (model ?? '')
+    .split(',')
+    .map((m) => m.trim())
+    .filter(Boolean)
+}
+
 /** Model itu milik DeepSeek? Dipakai memutuskan override model per-sesi pada akun DeepSeek. */
 export function isDeepSeekModel(model?: string | null): boolean {
   return !!model && /^deepseek[-/]/i.test(model)
@@ -604,6 +618,8 @@ export interface GroveApi {
   /** Mode ringan (CLI-parity, tanpa protokol/tool orkestrasi) untuk sebuah root. Berlaku pada
    *  giliran berikutnya (query di-restart bila sedang jalan). */
   setLite: (id: string, lite: boolean) => Promise<void>
+  /** Model yang bisa dipakai akun gateway: gabungan daftar milik akun + hasil GET <base>/models. */
+  listGatewayModels: (accountId: string) => Promise<string[]>
   /** Daftar model OpenRouter (mendukung tools) untuk dropdown; freeOnly default true. */
   listOpenRouterModels: (freeOnly?: boolean) => Promise<OpenRouterModel[]>
   /** Riwayat pemakaian token tercatat di PC ini (jam/hari/minggu + tren) untuk cek boros/normal. */

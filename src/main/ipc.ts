@@ -157,6 +157,28 @@ export function registerIpc(manager: SessionManager): void {
   ipcMain.handle('grove:setDefaultEffort', (_e, { effort }: { effort: string | null }) =>
     manager.setDefaultEffort(isEffort(effort) ? effort : null)
   )
+  // Daftar model milik akun GATEWAY: diambil live dari <base>/models, lalu DIGABUNG dengan daftar
+  // yang user tulis sendiri di akun. Penggabungan itu penting — gateway bisa melaporkan daftar yang
+  // tak lengkap (Shiteru hanya mengembalikan 1 model padahal 4 lainnya sah dipakai key yang sama).
+  ipcMain.handle('grove:listGatewayModels', async (_e, { accountId }: { accountId: string }) => {
+    const acc = manager.listAccounts().accounts.find((a) => a.id === accountId)
+    const token = manager.getAccountToken(accountId)
+    if (!acc || !token) return []
+    const own = (acc.model ?? '').split(',').map((m) => m.trim()).filter(Boolean)
+    const base = (acc.baseUrl || '').replace(/\/+$/, '')
+    let live: string[] = []
+    try {
+      const res = await fetch(`${base}/models`, { headers: { Authorization: `Bearer ${token}` } })
+      if (res.ok) {
+        const j = (await res.json()) as { data?: Array<{ id?: string }> }
+        live = (j.data ?? []).map((m) => String(m.id ?? '')).filter(Boolean)
+      }
+    } catch {
+      /* jaringan mati → cukup pakai daftar milik akun */
+    }
+    return [...new Set([...own, ...live])]
+  })
+
   // Daftar model OpenRouter (live). Gagal jaringan → balikan [] supaya renderer fallback ke saran statis.
   ipcMain.handle('grove:listOpenRouterModels', async (_e, { freeOnly }: { freeOnly?: boolean }) => {
     try {

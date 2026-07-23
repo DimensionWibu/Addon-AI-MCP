@@ -213,6 +213,16 @@ function isLimitNotice(text: string): boolean {
  * (lihat db.upsertSession). Deteksi ini tetap dipertahankan sebagai jaring pengaman — id sesi juga
  * bisa hilang karena transkripnya dihapus/dibersihkan di luar Grove.
  */
+/**
+ * Gateway MENOLAK model yang dipakai — bukan gangguan sesaat, melainkan keputusan tetap:
+ * kuota model itu habis ("subscription_not_eligible"), tak diizinkan untuk key ini
+ * ("model_not_allowed"), atau namanya tak dikenal. Retry model yang sama percuma; yang benar adalah
+ * pindah ke model cadangan.
+ */
+export function isModelRejected(raw: string): boolean {
+  return /subscription_not_eligible|model_not_allowed|model_not_found|is not available|not allowed to use model|tidak diizinkan untuk key/i.test(raw)
+}
+
 export function isStaleSdkSession(raw: string): boolean {
   return /no conversation found with session id/i.test(raw)
 }
@@ -407,6 +417,7 @@ export class Session {
   private limitStreak = 0 // pindah akun beruntun akibat limit tanpa turn sukses (guard anti-loop)
   private transientPending = false // error koneksi transient (ECONNRESET/5xx) → auto-retry di akhir turn
   private staleSessionPending = false // id sesi SDK tak dikenali di folder ini → mulai sesi bersih & ulangi
+  private modelRejectedPending = false // gateway menolak model ini → pindah ke model cadangan akun
   private transientSeen = false // teks asisten menyebut error koneksi transient pada turn ini
   private transientRetries = 0 // retry transient beruntun tanpa turn sukses (guard anti-loop; reset saat sukses)
   private retryTimer: NodeJS.Timeout | null = null // timer backoff auto-retry (di-clear saat stop)
@@ -1031,7 +1042,8 @@ export class Session {
       // jadi jalur itu tetap jalan lewat cabang di bawah.
       if (this.interrupting || this.stopped) {
         /* disengaja — abaikan, jangan tandai error/transient/limit */
-      } else if (isStaleSdkSession(raw)) this.staleSessionPending = true // transkrip lama tak ketemu → sesi bersih
+      } else if (isModelRejected(raw)) this.modelRejectedPending = true // model ditolak → pindah cadangan
+      else if (isStaleSdkSession(raw)) this.staleSessionPending = true // transkrip lama tak ketemu → sesi bersih
       else if (isApiBlock(raw)) this.apiBlockPending = true
       else if (isLimitError(raw)) this.limitHitPending = true // limit via exception → auto-switch (didahulukan)
       else if (isTransientError(raw) || this.transientSeen) this.transientPending = true // koneksi putus → auto-retry
@@ -1106,6 +1118,38 @@ export class Session {
     this.disposeQuery(q) // interrupt SAJA meninggalkan proses CLI hidup (lihat disposeQuery)
     this.setStatus('idle')
     this.emitActivity('idle')
+  }
+
+  /**
+   * Gateway menolak model yang sedang dipakai → PINDAH ke kandidat berikutnya milik akun, lalu ulangi
+   * permintaan terakhir. Tanpa ini sesi mati total begitu satu model kehabisan kuota, padahal akun
+   * yang sama masih punya model lain yang sah.
+   */
+  private recoverRejectedModel(): void {
+    const next = this.host.nextModelCandidate(this.meta.id)
+    if (!next) {
+      this.record({
+        role: 'system',
+        text:
+          '⛔ Gateway menolak model sesi ini (kuota model itu habis / tak diizinkan untuk key ini) dan TIDAK ada model cadangan. ' +
+          'Isi daftar model akun dengan beberapa id dipisah koma (mis. "claude-opus-4.8, claude-sonnet-5, glm-5.2") lewat ⚙ Akun, atau ganti model sesi ini lewat klik-kanan kartu.',
+        ts: Date.now()
+      })
+      this.setStatus('error')
+      this.emitActivity('model ditolak')
+      return
+    }
+    this.record({
+      role: 'system',
+      text: `🔀 Model sebelumnya ditolak gateway (kuota habis / tak diizinkan) → pindah ke "${next}" dan mengulang permintaan terakhir.`,
+      ts: Date.now()
+    })
+    this.restartQuery() // model efektif dibaca lagi saat start berikutnya
+    if (this.lastUserPrompt) this.injectAutoTask(this.lastUserPrompt, { noNudge: true })
+    else {
+      this.setStatus('idle')
+      this.emitActivity('idle')
+    }
   }
 
   /**
@@ -1639,7 +1683,9 @@ export class Session {
         this.reconcileTurnUsage(msg as { usage?: Record<string, number> })
         const r = msg as { subtype?: string; errors?: unknown[]; stop_reason?: string }
         const subtype = r.subtype
-        if (isStaleSdkSession(JSON.stringify(msg))) this.staleSessionPending = true
+        const rawResult = JSON.stringify(msg)
+        if (isModelRejected(rawResult)) this.modelRejectedPending = true
+        if (isStaleSdkSession(rawResult)) this.staleSessionPending = true
         if (isApiBlock(JSON.stringify(msg))) this.flagApiBlock() // blokir API terselip di result
         // Limit bisa muncul sbg result error (errors[]/stop_reason). JANGAN stringify seluruh msg
         // untuk isLimitError — field "usage"/"modelUsage" akan false-positive; cek yang spesifik saja.
@@ -1722,6 +1768,12 @@ export class Session {
         // turn ini akan di-retry/di-recycle/kena limit: pesan user tak boleh nyelip di tengah pemulihan.
         if (!this.transientPending && !this.apiBlockPending && !this.limitHitPending && !this.pendingCompactSeed) {
           this.flushQueued()
+        }
+        // Model ditolak gateway → pindah ke model cadangan akun lalu ulangi permintaan terakhir.
+        if (this.modelRejectedPending && !this.stopped) {
+          this.modelRejectedPending = false
+          this.recoverRejectedModel()
+          break
         }
         // Id sesi SDK basi → mulai sesi bersih di folder SEKARANG lalu ulangi permintaan terakhir.
         if (this.staleSessionPending && !this.stopped) {

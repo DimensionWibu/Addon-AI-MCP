@@ -68,6 +68,11 @@ export interface GroveHost {
    * false = tiap token input ditagih penuh tiap panggilan → konteks harus dipadatkan jauh lebih awal.
    */
   providerCachesPrompt(sessionId: string): boolean
+  /**
+   * Model CADANGAN berikutnya untuk sesi ini setelah gateway menolak model yang sekarang.
+   * Sekaligus MENYETEL model sesi ke kandidat itu. null = sudah tak ada cadangan.
+   */
+  nextModelCandidate(sessionId: string): string | null
   /** Dipanggil Session saat turn gagal karena limit — untuk auto-switch akun bila aktif. */
   onLimitHit(sessionId: string): void
   /** Dipanggil Session saat ctx% ≥ ambang → auto-compact (padatkan konteks, cegah freeze). */

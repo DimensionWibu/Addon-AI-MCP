@@ -1505,6 +1505,44 @@ function fillSessionModelSelect(sel: HTMLSelectElement, node: Node): void {
     sel.disabled = true
     return
   }
+  if (eff?.provider === 'dzax') {
+    // Akun GATEWAY: daftar model diisi dari daftar milik akun (boleh beberapa, dipisah koma) DIGABUNG
+    // dengan hasil GET <base>/models. Gabungan itu perlu karena gateway kadang melaporkan daftar yang
+    // tak lengkap — Shiteru hanya mengembalikan 1 model padahal 4 lainnya sah dipakai key yang sama.
+    const own = (eff.model ?? '').split(',').map((m) => m.trim()).filter(Boolean)
+    const inherit = document.createElement('option')
+    inherit.value = ''
+    inherit.textContent = `— default akun: ${own[0] ?? '?'}${own.length > 1 ? ` (+${own.length - 1} cadangan)` : ''} —`
+    sel.append(inherit)
+    const fill = (ids: string[]): void => {
+      for (const id of ids) {
+        const o = document.createElement('option')
+        o.value = id
+        o.textContent = own.indexOf(id) === 0 ? `${id} · utama` : own.includes(id) ? `${id} · cadangan` : id
+        sel.append(o)
+      }
+      const extra = document.createElement('option')
+      extra.value = CUSTOM_MODEL
+      extra.textContent = '✎ ketik model lain…'
+      sel.append(extra)
+      sel.value = node.model && ids.includes(node.model) ? node.model : ''
+    }
+    fill(own)
+    // Segarkan dengan daftar live (async) tanpa menahan render.
+    void window.grove
+      .listGatewayModels(eff.id)
+      .then((ids) => {
+        if (!ids?.length || sel.dataset.acct !== eff.id) return
+        const keep = sel.value
+        sel.textContent = ''
+        sel.append(inherit.cloneNode(true))
+        fill(ids)
+        if (keep) sel.value = keep
+      })
+      .catch(() => {})
+    sel.dataset.acct = eff.id
+    return
+  }
   if (eff?.provider === 'deepseek') {
     // Akun DeepSeek: daftar model tertutup (pro/flash). Opsi kosong = pakai model default akun.
     const inherit = document.createElement('option')
@@ -2748,7 +2786,7 @@ function renderAccountsPanel(): void {
     orModel.style.display = skin && p !== 'deepseek' ? 'block' : 'none'
     orModel.placeholder =
       p === 'dzax'
-        ? 'Nama model persis dari GET <base>/v1/models, mis. claude-sonnet-5 atau gl/glm-5.2'
+        ? 'Model (boleh BEBERAPA dipisah koma = cadangan otomatis), mis. claude-sonnet-5, glm-5.2, kimi-k3'
         : p === 'cursor'
         ? 'Nama model Cursor, mis. claude-3.5-sonnet'
         : p === 'custom'
@@ -2766,7 +2804,7 @@ function renderAccountsPanel(): void {
     plan.style.display = skin ? 'none' : 'block'
     hint.textContent =
       p === 'dzax'
-        ? '🌉 Untuk endpoint APA PUN yang berformat OpenAI (chat/completions) — DZAX/Belo Store, gateway pribadi, endpoint raw. Grove menjalankan JEMBATAN penerjemah lokal sendiri, jadi tak perlu proxy tambahan. Base URL = alamat sampai /v1 SAJA (tanpa /chat/completions). Model = nama PERSIS dari GET <base>/models; kalau salah, gateway biasanya membalas daftar model yang diizinkan. Diuji jalan di Grove: chat, streaming, dan tool-call. Kuota gaya Claude tak berlaku di sini.'
+        ? '🌉 Untuk endpoint APA PUN yang berformat OpenAI (chat/completions) — DZAX/Belo Store, gateway pribadi, endpoint raw. Grove menjalankan JEMBATAN penerjemah lokal sendiri, jadi tak perlu proxy tambahan. Base URL = alamat sampai /v1 SAJA (tanpa /chat/completions). Model boleh diisi BEBERAPA id dipisah koma — yang pertama jadi utama, sisanya CADANGAN yang dipakai otomatis kalau gateway menolak (kuota model itu habis / tak diizinkan). Nama model harus PERSIS; kalau salah, gateway biasanya membalas daftar model yang diizinkan. Diuji jalan di Grove: chat, streaming, dan tool-call. Kuota gaya Claude tak berlaku di sini.'
         : p === 'deepseek'
         ? '🚀 Langsung ke endpoint Anthropic RESMI DeepSeek (https://api.deepseek.com/anthropic) — TANPA proxy lokal: cukup API key. Streaming, tool, & reasoning sudah diuji jalan di Grove. Pilih modelnya di dropdown: deepseek-v4-pro (paling pintar, ~1jt konteks) atau deepseek-v4-flash (lebih cepat & hemat) — bisa diganti per-sesi lewat klik-kanan kartu sesi. Kuota gaya Claude tak berlaku — yang berlaku saldo & rate-limit DeepSeek.'
         : p === 'openrouter'
