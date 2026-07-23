@@ -235,9 +235,26 @@ export function isTransientError(raw: string): boolean {
 }
 
 /** Apakah pesan menandakan blokir keamanan API Claude (pemicu recycle sesi). */
+/**
+ * Permintaan DIBLOKIR oleh penyaring provider — bukan error teknis, jadi mengulang prompt yang sama
+ * pada konteks yang sama pasti diblokir lagi. Jalan keluarnya: recycle (konteks direset, tugas
+ * di-seed ulang dari papan) — lihat handleApiBlock.
+ *
+ * Selain penyaring Anthropic, di sini juga ditangkap penyaring model TIONGKOK (GLM/Kimi lewat
+ * gateway). Balasannya datang sebagai TEKS BIASA berbahasa Mandarin dengan status 200 — bukan error
+ * — sehingga tanpa deteksi ini Grove mengira turn berhasil, padahal tak ada pekerjaan yang jalan dan
+ * konteks yang memicu penyaring itu tetap menempel di sesi (giliran berikutnya kena lagi).
+ */
+/** Penyaring KONTEN milik model (GLM/Kimi dkk) — sifatnya melekat pada modelnya, bukan pada konteks. */
+export function isContentFilter(raw: string): boolean {
+  return /系统检测到|敏感内容|无法响应您的请求|contains sensitive content|detected that the information you entered/i.test(raw)
+}
+
 function isApiBlock(raw: string): boolean {
-  return /safety measures that flagged|flagged this message for a|Cyber Verification Program|cybersecurity topic/i.test(
-    raw
+  return (
+    /safety measures that flagged|flagged this message for a|Cyber Verification Program|cybersecurity topic/i.test(raw) ||
+    // 系统检测到…敏感内容 = "sistem mendeteksi konten sensitif"; versi Inggrisnya dipakai gateway lain.
+    isContentFilter(raw)
   )
 }
 
@@ -418,6 +435,7 @@ export class Session {
   private transientPending = false // error koneksi transient (ECONNRESET/5xx) → auto-retry di akhir turn
   private staleSessionPending = false // id sesi SDK tak dikenali di folder ini → mulai sesi bersih & ulangi
   private modelRejectedPending = false // gateway menolak model ini → pindah ke model cadangan akun
+  private contentFilterPending = false // penyaring konten MODEL yang menolak → ganti model, bukan cuma reset konteks
   private transientSeen = false // teks asisten menyebut error koneksi transient pada turn ini
   private transientRetries = 0 // retry transient beruntun tanpa turn sukses (guard anti-loop; reset saat sukses)
   private retryTimer: NodeJS.Timeout | null = null // timer backoff auto-retry (di-clear saat stop)
@@ -1044,7 +1062,10 @@ export class Session {
         /* disengaja — abaikan, jangan tandai error/transient/limit */
       } else if (isModelRejected(raw)) this.modelRejectedPending = true // model ditolak → pindah cadangan
       else if (isStaleSdkSession(raw)) this.staleSessionPending = true // transkrip lama tak ketemu → sesi bersih
-      else if (isApiBlock(raw)) this.apiBlockPending = true
+      else if (isApiBlock(raw)) {
+        if (isContentFilter(raw)) this.contentFilterPending = true
+        this.apiBlockPending = true
+      }
       else if (isLimitError(raw)) this.limitHitPending = true // limit via exception → auto-switch (didahulukan)
       else if (isTransientError(raw) || this.transientSeen) this.transientPending = true // koneksi putus → auto-retry
       else {
@@ -1507,6 +1528,20 @@ export class Session {
       return
     }
     this.apiRetries++
+    // PENYARING KONTEN MODEL: mengulang di model yang SAMA hampir pasti diblokir lagi — penolakan itu
+    // melekat pada modelnya (mis. GLM menolak topik tertentu), bukan pada konteksnya. Jadi selain
+    // konteks di-reset, modelnya juga dipindah ke kandidat berikutnya bila akun punya cadangan.
+    if (this.contentFilterPending) {
+      this.contentFilterPending = false
+      const next = this.host.nextModelCandidate(this.meta.id)
+      this.record({
+        role: 'system',
+        text: next
+          ? `🚫 Model menolak permintaan lewat penyaring kontennya sendiri → pindah ke "${next}" DAN mulai sesi bersih, lalu ulangi.`
+          : '🚫 Model menolak permintaan lewat penyaring kontennya sendiri. Tak ada model cadangan di akun ini — konteks direset dan dicoba sekali lagi; kalau tetap ditolak, ganti model atau ubah kalimat permintaannya.',
+        ts: Date.now()
+      })
+    }
     // Ringkasan tugas dari board sesi ini → agar sesi fresh tetap tahu konteksnya.
     const board = this.db.getBoardEntry(this.meta.id)
     const ctx: string[] = []
@@ -1635,7 +1670,10 @@ export class Session {
             this.lastAssistantText = block.text // hasil kerja worker → isi auto-report saat turn selesai
             // Akumulasi SELURUH teks turn ini (bukan cuma blok terakhir) → hasil penuh utk handoff ke parent.
             this.turnText = this.turnText ? this.turnText + '\n' + block.text : block.text
-            if (isApiBlock(block.text)) this.flagApiBlock() // API blokir pesan → recycle di akhir turn
+            if (isApiBlock(block.text)) {
+              if (isContentFilter(block.text)) this.contentFilterPending = true
+              this.flagApiBlock() // diblokir → recycle di akhir turn (konteks direset)
+            }
             // Limit langganan sering datang sebagai TEKS ("You've hit your session limit · resets …"),
             // bukan exception/field error → deteksi di sini agar auto-switch akun ikut kepicu.
             else if (isLimitNotice(block.text)) this.flagLimitHit()

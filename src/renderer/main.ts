@@ -2416,6 +2416,31 @@ function showSessionMenu(node: Node, x: number, y: number): void {
     for (const m of DEEPSEEK_MODEL_SUGGESTIONS) {
       menu.append(item(m.label, selfDs === m.id, () => setSessionModel(node.id, m.id)))
     }
+  } else if (eff?.provider === 'dzax') {
+    // Akun GATEWAY: pilihan model = daftar milik akun (kandidat, dipisah koma) + hasil GET
+    // <base>/models. Opsi AUTO = tak mengunci apa pun: Grove memakai kandidat pertama dan PINDAH
+    // SENDIRI ke kandidat berikutnya kalau gateway menolak (kuota model habis / tak diizinkan).
+    const own = (eff.model ?? '').split(',').map((m) => m.trim()).filter(Boolean)
+    const auto = node.model == null
+    menu.append(
+      item(
+        `🔀 Auto — pakai ${own[0] ?? '?'}${own.length > 1 ? `, pindah sendiri kalau ditolak (+${own.length - 1} cadangan)` : ''}`,
+        auto,
+        () => setSessionModel(node.id, null)
+      )
+    )
+    const addModelItem = (id: string): void => {
+      const tag = own.indexOf(id) === 0 ? ' · utama' : own.includes(id) ? ' · cadangan' : ''
+      menu.append(item(`kunci ke ${id}${tag}`, node.model === id, () => setSessionModel(node.id, id)))
+    }
+    for (const id of own) addModelItem(id)
+    if (node.model && !own.includes(node.model)) addModelItem(node.model)
+    menu.append(
+      item('✎ Model lain…', false, () => {
+        const m = promptCustomModel(node.model)
+        if (m != null) setSessionModel(node.id, m || null)
+      })
+    )
   } else if (eff?.provider === 'openrouter') {
     // Akun OpenRouter: model BEBAS dipilih dari daftar OR (tak dikunci). Kosong = default akun.
     const selfOr = node.model && node.model.includes('/') ? node.model : null
@@ -2622,11 +2647,21 @@ function renderAccountsPanel(): void {
                     `DS: ${a.model ?? DEEPSEEK_MODEL_DEFAULT}`
                   )
                 : a.provider === 'dzax'
-                  ? el(
-                      'span',
-                      { class: 'ap-prov', title: `${a.baseUrl ?? DZAX_BASE_URL_DEFAULT} · ${a.model ?? '?'}` },
-                      `OAI: ${a.model ?? '?'}`
-                    )
+                  ? (() => {
+                      // Daftar model bisa panjang (beberapa kandidat) — tampilkan yang UTAMA saja + jumlah
+                      // cadangannya, selengkapnya di tooltip. Badge panjang dulu mendorong tombol ✎/×
+                      // keluar dari panel sehingga akun tak bisa diedit sama sekali.
+                      const ms = (a.model ?? '').split(',').map((m) => m.trim()).filter(Boolean)
+                      const short = ms[0] ?? '?'
+                      return el(
+                        'span',
+                        {
+                          class: 'ap-prov',
+                          title: [a.baseUrl ?? DZAX_BASE_URL_DEFAULT, ...(ms.length ? ms : ['?'])].join('\n')
+                        },
+                        `OAI: ${short}${ms.length > 1 ? ` +${ms.length - 1}` : ''}`
+                      )
+                    })()
                   : el('span', {})
       // Tombol ✎ — buka form ubah akun di tempat. Ini jalan satu-satunya untuk MELIHAT & mengoreksi
       // endpoint/model akun gateway tanpa harus menghapus lalu membuat ulang (yang menghilangkan

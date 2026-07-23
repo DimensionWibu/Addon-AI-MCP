@@ -69,7 +69,11 @@ button, input { font-family: var(--mono); }
 .ap-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text); cursor: pointer; margin-bottom: 6px; }
 .ap-head { color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: .5px; margin: 12px 0 5px; }
 .ap-empty { color: var(--text-dim); font-size: 11px; }
-.ap-item { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+.ap-item { display: flex; align-items: center; gap: 8px; padding: 4px 0; min-width: 0; }
+/* Label & badge boleh menyusut/ellipsis; tombol aksi TIDAK pernah terdorong keluar panel. */
+.ap-item .ap-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ap-item .ap-prov { min-width: 0; overflow: hidden; text-overflow: ellipsis; max-width: 46%; }
+.ap-item .ap-edit, .ap-item .ap-del { flex: none; }
 .ap-label { flex: 1; color: var(--text); font-size: 12px; }
 .ap-del { background: transparent; color: var(--err); border: 1px solid var(--err); border-radius: 3px; cursor: pointer; font-size: 11px; padding: 0 7px; }
 .ap-del:hover { background: rgba(224, 108, 108, .15); }
@@ -84,6 +88,7 @@ button, input { font-family: var(--mono); }
 .ap-pct { width: 56px; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 3px; padding: 2px 5px; font-size: 11px; font-family: var(--mono); }
 .ap-dead { color: var(--err); cursor: help; }
 .ap-prov { font-size: 9px; color: var(--accent); border: 1px solid var(--accent); border-radius: 8px; padding: 0 6px; white-space: nowrap; }
+.acct-panel { width: 380px; max-width: calc(100vw - 24px); max-height: calc(100vh - 64px); overflow-y: auto; }
 
 /* ---- Panel Tools: diff checker berwarna + formatter JSON/YAML (renderer-only) ---- */
 .tools-panel {
