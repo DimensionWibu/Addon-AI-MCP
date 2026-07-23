@@ -56,10 +56,23 @@ export interface GroveHost {
   onAccountMissing(sessionId: string): void
   /** Dipanggil Session tiap respons API → catat token ke riwayat pemakaian lokal (per jam/akun). */
   recordUsage(sessionId: string, u: { input: number; cacheRead: number; cacheCreation: number; output: number }): void
+  /**
+   * Usage PER-PESAN sesi ini bisa dipercaya untuk pencatatan biaya?
+   * false untuk akun gateway (jembatan Anthropic→OpenAI): di sana angka per-pesan hanyalah TAKSIRAN
+   * jembatan (gateway baru melaporkan token sebenarnya di akhir), jadi biaya HARUS diambil dari
+   * rekonsiliasi akhir-turn saja — kalau tidak, input tercatat berlipat.
+   */
+  perMessageUsageReliable(sessionId: string): boolean
   /** Dipanggil Session saat turn gagal karena limit — untuk auto-switch akun bila aktif. */
   onLimitHit(sessionId: string): void
   /** Dipanggil Session saat ctx% ≥ ambang → auto-compact (padatkan konteks, cegah freeze). */
   notifyHighContext(sessionId: string): void
+  /**
+   * Dipanggil Session TEPAT SEBELUM konteks dilepas: pastikan ada file handover di working directory
+   * (checkpoint tulisan model bila masih segar, kalau tidak Grove menulis versi deterministiknya).
+   * Balikan = path RELATIF file itu untuk disebut di reseed, atau null bila gagal menulis.
+   */
+  beforeCompact(sessionId: string, summary: string): string | null
 }
 
 const ok = (text: string) => ({ content: [{ type: 'text' as const, text }] })

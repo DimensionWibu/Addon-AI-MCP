@@ -32,6 +32,12 @@ export function registerIpc(manager: SessionManager): void {
     return manager.createRoot(scratch, title || 'Chat baru', true)
   })
 
+  // Worker baru buatan USER (klik 3× kartu sesi): sub-sesi idle di bawah kartu itu, TANPA tugas &
+  // tanpa giliran model — user yang mengisi tugasnya setelah kartunya muncul.
+  ipcMain.handle('grove:newWorker', (_e, { parentId, title }: { parentId: string; title?: string }) =>
+    manager.newWorker(parentId, title)
+  )
+
   // Pilih folder proyek lewat dialog (alternatif drag-drop).
   ipcMain.handle('grove:pickFolder', async () => {
     const r = await dialog.showOpenDialog({ properties: ['openDirectory'] })
@@ -123,7 +129,7 @@ export function registerIpc(manager: SessionManager): void {
         token: string
         plan?: number
         switchPct?: number
-        provider?: 'claude' | 'openrouter' | 'custom' | 'cursor' | 'deepseek'
+        provider?: 'claude' | 'openrouter' | 'custom' | 'cursor' | 'deepseek' | 'dzax'
         model?: string
         baseUrl?: string
       }

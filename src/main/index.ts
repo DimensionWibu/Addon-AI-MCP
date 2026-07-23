@@ -1,22 +1,33 @@
 // Bootstrap Electron main process.
-import { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, Tray, nativeImage } from 'electron'
 import { join } from 'node:path'
 import { Board } from './orchestrator/db'
 import { SessionManager } from './orchestrator/SessionManager'
 import { registerIpc } from './ipc'
 import { fetchAccountEmail, fetchUsage, peekAccountEmail, peekUsage } from './usage'
 import { loadWindowState, trackWindowState } from './windowState'
-import type { GroveEvent, UsageSnapshot } from '../shared/types'
+import { startOpenAiBridge } from './openaiBridge'
+import { currentHolder, holdLock } from './dbLock'
+import type { AccountProvider, GroveEvent, UsageSnapshot } from '../shared/types'
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let managerRef: SessionManager | null = null
+let quitting = false // app benar-benar diminta keluar (tray "Keluar", Cmd+Q, kill) → jangan tanya lagi
+let closeConfirmed = false // user sudah menjawab dialog "masih ada sesi bekerja" untuk penutupan ini
 
-// Keep-alive (tutup jendela ≠ keluar, sesi lanjut di background) HANYA di app terpaket.
-// Di `electron-vite dev`, tiap edit file main memicu restart main-process; kalau proses lama
-// dibiarkan hidup, dua Electron berebut grove.sqlite → DB bisa ke-clobber jadi kosong.
-// Maka di dev kita restart bersih (quit saat window-all-closed), di produksi baru keep-alive.
-const KEEP_ALIVE = app.isPackaged
+/**
+ * Keep-alive: tutup jendela ≠ keluar — sesi lanjut bekerja di background, jendela dibuka lagi lewat
+ * tray. Berlaku DI DEV JUGA (dulu hanya di app terpaket).
+ *
+ * Kekhawatiran lama yang membuat dev dikecualikan: proses lama yang dibiarkan hidup bisa berebut
+ * grove.sqlite dengan proses baru → DB ke-clobber. Yang menjaganya sekarang:
+ *  - single-instance lock di bawah: instance kedua LANGSUNG keluar, jadi tak pernah ada dua penulis;
+ *  - restart dari `electron-vite dev` MEMBUNUH proses lama (bukan menambah proses baru), jadi
+ *    hot-reload tetap seperti biasa.
+ * Butuh perilaku lama (tutup jendela = keluar)? Jalankan dengan GROVE_QUIT_ON_CLOSE=1.
+ */
+const KEEP_ALIVE = process.env.GROVE_QUIT_ON_CLOSE !== '1'
 
 /** Tampilkan jendela (buat ulang bila sudah ditutup — proses tetap hidup di background). */
 function showWindow(): void {
@@ -32,11 +43,45 @@ function showWindow(): void {
 // Cegah >1 instance menulis grove.sqlite yang sama (penyebab data ke-clobber).
 // Bonus: saat GUI ditutup tapi proses masih jalan, menjalankan .exe lagi hanya
 // membuka kembali jendelanya (bukan proses baru) → nyambung ke sesi yang masih hidup.
-if (!app.requestSingleInstanceLock()) {
+/**
+ * SATU INSTANCE SAJA — tapi di DEV, yang menang harus yang BARU.
+ *
+ * Sejak keep-alive berlaku di dev, menutup jendela tidak mematikan prosesnya. Akibatnya
+ * `run-dev.bat` berikutnya kalah lock lalu keluar, dan yang muncul justru jendela proses LAMA
+ * dengan KODE LAMA — persis gejala "kok gak jalan versi baru". Karena itu instance dev yang baru
+ * meminta ALIH TUGAS: yang lama (kalau ia juga dev) mundur, yang baru mengambil lock.
+ *
+ * App TERPAKET tidak pernah dipaksa mundur: di sana sesi user sedang bekerja sungguhan, dan
+ * mematikannya karena seseorang menjalankan dev-build adalah kehilangan kerja yang nyata.
+ */
+const DEV = !app.isPackaged
+function acquireLock(attempt = 0): void {
+  if (app.requestSingleInstanceLock({ takeover: DEV })) {
+    app.on('second-instance', (_e, _argv, _cwd, data) => {
+      const wantsTakeover = DEV && !!(data as { takeover?: boolean } | undefined)?.takeover
+      if (wantsTakeover) {
+        console.log('[grove] Instance dev baru datang — instance ini mundur supaya kode terbaru yang jalan.')
+        app.quit()
+        return
+      }
+      showWindow()
+    })
+    return
+  }
+  if (DEV && attempt < 12) {
+    // Yang lama sedang mundur (atau belum sempat membaca pesan) → coba lagi sebentar.
+    if (attempt === 0) console.log('[grove] Instance lama terdeteksi — meminta ia mundur agar kode terbaru yang jalan…')
+    setTimeout(() => acquireLock(attempt + 1), 300)
+    return
+  }
+  console.log(
+    DEV
+      ? '[grove] Instance lama TIDAK mundur (kemungkinan app TERPAKET yang sedang bekerja). Keluar dari tray-nya dulu, lalu jalankan run-dev.bat lagi.'
+      : '[grove] Grove sudah berjalan — jendelanya dimunculkan kembali.'
+  )
   app.quit()
-} else {
-  app.on('second-instance', () => showWindow())
 }
+acquireLock()
 
 function createWindow(): void {
   const st = loadWindowState() // ukuran + posisi terakhir (atau default)
@@ -66,8 +111,43 @@ function createWindow(): void {
     void mainWindow.loadFile(join(import.meta.dirname, '../renderer/index.html'))
   }
 
+  // KONFIRMASI TUTUP JENDELA saat masih ada sesi bekerja. Tanpa ini, "tutup jendela" punya dua arti
+  // yang tak kelihatan bedanya (lanjut di background vs berhenti), dan turn yang sedang jalan bisa
+  // hilang tanpa user sadar — untuk akun berbayar, token turn itu tetap tertagih.
+  mainWindow.on('close', (e) => {
+    if (closeConfirmed || quitting || !managerRef) return // Keluar lewat tray/quit: sudah eksplisit
+    const running = managerRef.countRunning()
+    if (running === 0) return // tak ada yang bekerja → tutup diam-diam
+    e.preventDefault()
+    const win = mainWindow
+    if (!win) return
+    const choice = dialog.showMessageBoxSync(win, {
+      type: 'question',
+      buttons: ['Biarkan jalan di background', 'Stop semua lalu tutup', 'Batal'],
+      defaultId: 0,
+      cancelId: 2,
+      noLink: true,
+      title: 'Masih ada sesi yang bekerja',
+      message: `${running} sesi masih bekerja.`,
+      detail: KEEP_ALIVE
+        ? 'Grove tetap hidup di system tray kalau jendela ditutup — sesi lanjut bekerja, dan jendelanya bisa dibuka lagi dari ikon tray.\n\n"Stop semua lalu tutup" menghentikan turn yang sedang jalan (hasil turn itu hilang; token yang sudah terpakai tetap tertagih).'
+        : 'GROVE_QUIT_ON_CLOSE=1 sedang aktif → menutup jendela MENGHENTIKAN aplikasi beserta semua sesinya.'
+    })
+    if (choice === 2) return // Batal → jendela tetap terbuka
+    if (choice === 1) {
+      void managerRef.stopAll().then(() => {
+        closeConfirmed = true
+        mainWindow?.close()
+      })
+      return
+    }
+    closeConfirmed = true
+    win.close()
+  })
+
   mainWindow.on('closed', () => {
     mainWindow = null
+    closeConfirmed = false // jendela berikutnya dikonfirmasi lagi dari nol
   })
 }
 
@@ -101,6 +181,32 @@ function createTray(): void {
 }
 
 app.whenReady().then(async () => {
+  // SATU PENULIS SAJA untuk grove.sqlite. Lock bawaan Electron tak menjangkau lintas-binary (app
+  // terpaket vs dev bisa jalan bersamaan) — dan karena DB ditulis ulang utuh dari memori, penulis
+  // kedua akan MENIMPA pekerjaan yang pertama (akun/sesi bisa hilang). Jadi dicek eksplisit di sini.
+  const userData = app.getPath('userData')
+  const holder = currentHolder(userData)
+  if (holder) {
+    const mine = app.isPackaged ? 'terpaket' : 'dev'
+    dialog.showErrorBox(
+      'Grove sudah berjalan',
+      `Sudah ada Grove lain yang memakai database yang sama (PID ${holder.pid}, mode ${holder.kind}).
+
+` +
+        `Menjalankan dua Grove sekaligus membuat perubahan salah satunya HILANG tertimpa — jadi yang ini (mode ${mine}) ditutup.
+
+` +
+        'Tutup Grove yang sedang jalan dari ikon tray (Keluar), lalu buka lagi yang ini.'
+    )
+    app.quit()
+    return
+  }
+  const releaseLock = holdLock(userData, app.isPackaged ? 'terpaket' : 'dev')
+  app.on('will-quit', releaseLock)
+
+  // Jembatan Anthropic→OpenAI untuk akun gateway ber-format OpenAI (DZAX). Dinyalakan SEBELUM
+  // manager: getSessionLaunch butuh port-nya untuk merakit ANTHROPIC_BASE_URL sesi DZAX.
+  await startOpenAiBridge().catch((e) => console.error('[bridge] gagal menyala:', e))
   const board = new Board(join(app.getPath('userData'), 'grove.sqlite'))
   await board.init()
 
@@ -111,7 +217,9 @@ app.whenReady().then(async () => {
   managerRef = manager
   manager.loadFromDisk() // muat session lama (dormant) agar history & context tetap terlihat
   registerIpc(manager)
-  if (KEEP_ALIVE) createTray() // hanya di produksi: sesi lanjut jalan meski jendela ditutup
+  // Tray WAJIB ada begitu keep-alive menyala (termasuk di dev): tanpa ikon ini, jendela yang
+  // ditutup meninggalkan proses yang cuma bisa dimatikan lewat Task Manager.
+  if (KEEP_ALIVE) createTray()
 
   // Limit paket langganan → SATU timer 5-menit di main (BUKAN realtime) + refresh MANUAL ber-cooldown.
   // Endpoint oauth/usage membalas 429 bila di-hammer; maka TIDAK ada poll cepat/per-sesi. Nilai sukses
@@ -124,15 +232,16 @@ app.whenReady().then(async () => {
   let usageTimer: NodeJS.Timeout | null = null // interval 5-menit (di-clear saat quit)
   let lastManualAt = 0 // waktu fetch manual terakhir (untuk cooldown)
 
-  const usageTarget = (): { id: string | null; label: string; token: string | null } =>
+  const usageTarget = (): { id: string | null; label: string; token: string | null; provider?: AccountProvider } =>
     manager.getSessionAccountInfo(usageSessionId)
 
   /** Snapshot lengkap untuk akun yang sedang dipilih: identitas + angka (atau alasan kosongnya). */
   const snapshotFor = async (
-    t: { id: string | null; label: string; token: string | null },
+    t: { id: string | null; label: string; token: string | null; provider?: AccountProvider },
     live: boolean
   ): Promise<UsageSnapshot> => {
-    const acct = { id: t.id, token: t.token }
+    // provider ikut → akun API-key ditanyakan ke API-nya sendiri (kredit/saldo), bukan ke Anthropic.
+    const acct = { id: t.id, token: t.token, provider: t.provider }
     const r = live ? await fetchUsage(acct) : peekUsage(t.id)
     // Email diambil dari /oauth/profile (endpoint usage tak memuat identitas). Hasilnya di-cache
     // per akun; akun yang tokennya tak ber-scope user:profile permanen null → UI pakai label saja.
@@ -158,16 +267,23 @@ app.whenReady().then(async () => {
     if (gen === usageGen) emit({ channel: 'usage:update', payload: snap })
 
     for (const a of manager.listAccounts().accounts) {
-      // Akun non-Claude (OpenRouter / custom-proxy) tak punya kuota gaya Claude & endpoint /oauth/usage
-      // Anthropic tak berlaku → memfetch-nya hanya buang request + memunculkan "non-aktif" palsu. Lewati.
-      if (a.provider !== 'claude') continue
+      // SEMUA akun disapu — termasuk yang ber-API-key. Dulu akun non-Claude dilewati total, jadi
+      // kredit/saldo OpenRouter & DeepSeek tak pernah terpantau sama sekali. Sekarang fetchUsage
+      // yang provider-aware mengarahkan tiap akun ke API-nya sendiri (lihat usage.ts).
       // Akun terpilih baru saja di-fetch di atas → pakai cache, jangan tembak endpoint dua kali.
-      const r = a.id === t.id ? peekUsage(a.id) : await fetchUsage({ id: a.id, token: manager.getAccountToken(a.id) })
-      const pct = r.usage?.fiveHour?.utilization ?? null
-      // 'scope'/'unauthorized' = permanen tak terbaca. 'rate-limited'/'error' = gangguan sesaat →
-      // JANGAN divonis non-aktif, nanti UI bohong ke arah sebaliknya.
-      if (r.reason === 'scope' || r.reason === 'unauthorized') manager.noteUsageReadable(a.id, false)
+      const r =
+        a.id === t.id
+          ? peekUsage(a.id)
+          : await fetchUsage({ id: a.id, token: manager.getAccountToken(a.id), provider: a.provider })
+      // Akun Claude → utilisasi jendela 5-jam. Akun API-key → persen kredit terpakai (null bila key
+      // memang tak berbatas: ambangnya jujur TIDAK bisa ditegakkan, bukan diam-diam dianggap 0%).
+      const pct = r.usage?.credit ? r.usage.credit.utilization : (r.usage?.fiveHour?.utilization ?? null)
+      // 'scope'/'unauthorized'/'unsupported' = permanen tak terbaca. 'rate-limited'/'error' = gangguan
+      // sesaat → JANGAN divonis non-aktif, nanti UI bohong ke arah sebaliknya.
+      if (r.reason === 'scope' || r.reason === 'unauthorized' || r.reason === 'unsupported')
+        manager.noteUsageReadable(a.id, false)
       else if (pct != null) manager.noteUsageReadable(a.id, true)
+      else if (r.usage?.credit) manager.noteUsageReadable(a.id, false) // kredit terbaca tapi tanpa batas → ambang mati
       if (pct == null) continue
       // Ambang ditegakkan di dalam onUsageHigh (per akun) — di sini cukup laporkan angkanya.
       const moved = manager.onUsageHigh(a.id, pct)
@@ -203,6 +319,7 @@ app.whenReady().then(async () => {
   void runUsageFetch() // sekali di startup → header terisi (bukan blank); bukan poll cepat
 
   app.on('before-quit', () => {
+    quitting = true // keluar sungguhan (tray/Cmd+Q) → handler 'close' tak perlu bertanya lagi
     // JANGAN stopAll di sini: itu mengubah status running→idle & menghapus info "sesi ini tadi kerja"
     // yang dipakai auto-resume saat dibuka lagi. Proses yang mati sendiri sudah mematikan query-nya.
     if (usageTimer) clearInterval(usageTimer) // hentikan timer usage 5-menit
@@ -214,8 +331,8 @@ app.whenReady().then(async () => {
   app.on('activate', () => showWindow())
 })
 
-// Produksi: menutup jendela TIDAK mematikan app (sesi lanjut di background; keluar via tray).
-// Dev: quit bersih agar electron-vite bisa restart tanpa proses lama menyangkut & berebut DB.
+// Menutup jendela TIDAK mematikan app (sesi lanjut di background; keluar lewat tray) — kecuali
+// dijalankan dengan GROVE_QUIT_ON_CLOSE=1, yang mengembalikan perilaku "tutup = keluar".
 app.on('window-all-closed', () => {
   if (!KEEP_ALIVE) app.quit()
 })

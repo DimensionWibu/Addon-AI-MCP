@@ -36,14 +36,28 @@ Hasil `npm run dist` ada di folder **`release/`**:
 Catatan penting untuk exe:
 - Mesin target **harus punya Node.js** (SDK men-spawn Claude CLI via Node) dan **Claude Code sudah login** (auth dari `~/.claude`).
 - `@anthropic-ai/claude-agent-sdk` & `sql.js` sengaja **di-asarUnpack** agar subprocess & WASM bisa diakses dari paket.
-- Single-instance lock aktif di build terpaket: buka Grove lagi → fokus ke window yang sudah ada.
+- Single-instance lock aktif: buka Grove lagi → fokus ke window yang sudah ada, bukan proses kedua.
+
+## Menutup jendela ≠ berhenti
+Berlaku di build terpaket **maupun `npm run dev`**:
+- Tutup jendela → Grove tetap hidup di **system tray**; sesi lanjut bekerja. Klik ikon tray (atau
+  jalankan Grove lagi) untuk membuka jendelanya kembali; *Keluar (hentikan semua)* untuk benar-benar berhenti.
+- Kalau saat ditutup masih **ada sesi yang bekerja**, muncul konfirmasi: *biarkan jalan di background* /
+  *stop semua lalu tutup* / *batal*.
+- Keluar total tidak menghapus jejak: sesi yang tadi bekerja tercatat, dan saat dibuka lagi
+  **Auto-resume** (tab Akun) melanjutkannya dari titik terakhir.
+- Butuh perilaku lama (tutup jendela = keluar)? Jalankan dengan `GROVE_QUIT_ON_CLOSE=1`.
 
 ## Cara pakai
 1. Jalankan app → **drag-drop folder proyek** ke jendela → muncul session **UTAMA**.
 2. Ketik tugas di kolom chat → Claude mulai bekerja; ia melapor ke Papan Tulis dan
    bisa `spawn_worker` untuk sub-tugas paralel (muncul sebagai anak di sidebar).
-3. **Double-click** node di sidebar untuk berpindah session (kolom chat ikut berganti).
-4. Badge `%` di tiap node = context terpakai (hijau <60, kuning <85, merah ≥85).
+3. **Klik** node di sidebar untuk berpindah session (kolom chat ikut berganti).
+4. **Klik 3×** sebuah kartu session → langsung lahir **sub-worker** di bawahnya (idle, nol token
+   sampai kamu mengetik tugasnya). Sama dengan klik-kanan → "➕ Sub-worker baru".
+5. Badge `%` di tiap node = context terpakai (hijau <60, kuning <85, merah ≥85).
+6. Saat konteks dipadatkan (compact), Grove menulis **handover** `.grove/checkpoint-<id>.md` di
+   folder kerja — file itu yang membuat sesi paham konteksnya setelah riwayat dipotong.
 
 ## Aturan isolasi
 - **Dalam 1 pohon** (UTAMA ↔ sub): berbagi konteks penuh.

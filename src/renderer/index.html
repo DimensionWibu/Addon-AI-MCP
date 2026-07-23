@@ -70,7 +70,14 @@
           <button id="btn-compact" class="compact-btn" title="Ringkas laporan sub/sub-sub → simpan ke Memori & padatkan konteks (hanya UTAMA)">🗜 Compact</button>
           <button id="btn-stop" class="stop-btn" title="Interupsi turn yang sedang berjalan">⏹ Stop</button>
         </div>
-        <div id="chat-log" class="chat-log"></div>
+        <div class="chat-log-wrap">
+          <div id="chat-log" class="chat-log"></div>
+          <!-- Muncul hanya saat kamu menggulir ke atas: auto-scroll berhenti supaya bisa membaca,
+               tombol ini yang membawamu kembali ke pesan terbaru (dan menyalakannya lagi). -->
+          <button id="chat-jump" class="chat-jump" hidden title="Ke pesan terbaru (auto-scroll menyala lagi)">
+            ↓ pesan terbaru
+          </button>
+        </div>
         <div class="composer">
           <!-- Pesan yang masih ANTRI (ditahan Grove selama turn jalan): bisa diedit / dibatalkan. -->
           <div id="chat-queue" class="chat-queue"></div>

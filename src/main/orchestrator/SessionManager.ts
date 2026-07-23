@@ -26,6 +26,8 @@ import type {
 } from '../../shared/types'
 import {
   DEEPSEEK_MODEL_DEFAULT,
+  DZAX_BASE_URL_DEFAULT,
+  DZAX_MODEL_SUGGESTIONS,
   deepseekCostUsd,
   isDeepSeekModel,
   providerSeesImages,
@@ -37,6 +39,8 @@ import {
 import type { EffortSetting } from '../../shared/types'
 import { Board } from './db'
 import { Session } from './Session'
+import { handoverIsFresh, handoverPath, handoverRel, writeHandover } from './handover'
+import { bridgeBaseUrl, setBridgeUsageSink } from '../openaiBridge'
 import { cap, CAP_MESSAGE, CAP_PROGRESS, type GroveHost } from './mcpTools'
 import { contextPercent, contextWindowFor } from './contextWindows'
 import { WAKE, reportSignature, shouldSkipWake } from './wakePolicy'
@@ -104,6 +108,9 @@ export class SessionManager implements GroveHost {
   private readonly loopTimers = new Map<string, NodeJS.Timeout>() // rootId → timer auto-check berkala
   private readonly loopEnabled = new Set<string>() // rootId dengan auto-check aktif
   private readonly loopCacheWarmMode = new Set<string>() // rootId yang sudah beralih ke mode cache-warm (setelah idle-strike habis)
+  // rootId → jumlah ping cache-warm BERUNTUN tanpa aktivitas nyata. Jatahnya pulih saat ada tugas
+  // baru (enableLoop) — tanpa ini, sesi yang ditinggalkan menghangatkan konteksnya selamanya.
+  private readonly cacheWarmPings = new Map<string, number>()
   // Buffer coalesce laporan worker → parentId → (workerId → laporan TERBARU worker itu).
   // Map per-worker = DEDUPE otomatis: progres lama ditimpa, hanya yang terakhir yang dikirim.
   private readonly pendingReports = new Map<string, Map<string, PendingWorkerReport>>()
@@ -122,11 +129,20 @@ export class SessionManager implements GroveHost {
   // Akun yang usage-nya terbukti TAK bisa dibaca (403 scope). Dipakai UI untuk jujur bilang
   // "ambang non-aktif" alih-alih memberi kesan proteksi proaktif menyala padahal tidak.
   private readonly usageReadable = new Map<string, boolean>()
+  // Akun API-key yang kreditnya sudah menembus ambang TAPI tak punya akun se-provider untuk
+  // dipindahi → diperingatkan SEKALI (poll 5 menit; tanpa ini nota yang sama muncul terus).
+  private readonly creditWarned = new Set<string>()
 
   constructor(
     private readonly db: Board,
     private readonly emit: (ev: GroveEvent) => void
-  ) {}
+  ) {
+    // Token NYATA akun gateway dilaporkan langsung oleh jembatan (lihat openaiBridge.setBridgeUsageSink):
+    // di jalur itu, angka per-pesan yang sampai lewat CLI adalah campuran taksiran, jadi tak bisa dipakai.
+    setBridgeUsageSink((sessionId, u) => {
+      if (this.sessions.has(sessionId)) this.recordUsage(sessionId, u)
+    })
+  }
 
   // ---- pembuatan session ---------------------------------------------------
 
@@ -224,6 +240,42 @@ export class SessionManager implements GroveHost {
     this.db.upsertSession(meta)
     this.registerSession(meta, { emit: true, start: true, task: opts.task })
     return id
+  }
+
+  /**
+   * Worker baru yang dibuat USER dari GUI (klik 3× kartu sesi) — bukan oleh model.
+   *
+   * Bedanya dengan spawnWorker: TIDAK diberi tugas & TIDAK di-start, jadi tak ada giliran model
+   * (nol token) sampai user benar-benar mengetik. Kartunya langsung muncul sebagai worker idle di
+   * bawah kartu yang diklik, siap diisi tugas — persis alur "buka slot dulu, isi kemudian".
+   *
+   * `lite` diwarisi dari induk supaya satu pohon tetap satu mode: pohon Lite tak diam-diam
+   * melahirkan worker berprotokol penuh (yang lebih mahal & tak ada yang mengoordinasi).
+   */
+  newWorker(parentId: string, title?: string): SessionMeta {
+    const parent = this.sessions.get(parentId)
+    if (!parent) throw new Error(`Session ${parentId} tidak ditemukan`)
+    const treeId = parent.meta.treeId
+    const inTree = [...this.sessions.values()].filter((s) => s.meta.treeId === treeId)
+    if (inTree.length >= MAX_WORKERS_PER_TREE) {
+      throw new Error(`Batas ${MAX_WORKERS_PER_TREE} sesi per pohon tercapai`)
+    }
+    const id = randomUUID()
+    const meta = this.newMeta({
+      id,
+      treeId,
+      parentId,
+      role: 'sub',
+      // Nomor urut dari jumlah SUB yang ada — cukup untuk membedakan; user bisa ganti judulnya
+      // lewat sesi itu sendiri (model memanggil set_title) atau membiarkannya.
+      title: title || `Worker ${inTree.filter((s) => s.meta.role === 'sub').length + 1}`,
+      cwd: parent.meta.cwd, // worker kerja di folder yang sama dengan induknya
+      lite: parent.meta.lite
+    })
+    // SENGAJA tanpa accountId/model: kosong = "ikut induk" (lihat catatan di spawnWorker).
+    this.db.upsertSession(meta)
+    this.registerSession(meta, { emit: true, start: false }) // dormant → 0 token sampai diberi tugas
+    return meta
   }
 
   /**
@@ -455,7 +507,25 @@ export class SessionManager implements GroveHost {
     const token = this.db.getAccountToken(acc.id)
     if (!token) return null
     const env: Record<string, string> = { ...process.env } as Record<string, string>
-    if (isSkinProvider(acc.provider)) {
+    if (acc.provider === 'dzax') {
+      // GATEWAY BER-FORMAT OPENAI: CLI tak bisa bicara langsung ke sana. Arahkan ke jembatan lokal
+      // (openaiBridge) yang menerjemahkan Anthropic ⇄ OpenAI; tujuan upstream & model default
+      // dikodekan di path jembatan, token diteruskan apa adanya lewat header.
+      const model = acc.model || DZAX_MODEL_SUGGESTIONS[0].id
+      const bridge = bridgeBaseUrl(acc.baseUrl || DZAX_BASE_URL_DEFAULT, model, sessionId)
+      if (!bridge) return null // jembatan belum menyala → lebih baik sesi berhenti daripada salah kirim
+      env.ANTHROPIC_BASE_URL = bridge
+      env.ANTHROPIC_AUTH_TOKEN = token
+      delete env.ANTHROPIC_API_KEY
+      delete env.CLAUDE_CODE_OAUTH_TOKEN
+      // Jalur internal CLI memanggil model per-KELAS (haiku untuk judul, sonnet/opus untuk sub-agent);
+      // nama alias itu tak ada di gateway → petakan semuanya ke model akun ini.
+      env.ANTHROPIC_MODEL = model
+      env.ANTHROPIC_DEFAULT_OPUS_MODEL = model
+      env.ANTHROPIC_DEFAULT_SONNET_MODEL = model
+      env.ANTHROPIC_DEFAULT_HAIKU_MODEL = model
+      env.ANTHROPIC_SMALL_FAST_MODEL = model
+    } else if (isSkinProvider(acc.provider)) {
       // "Anthropic Skin": Claude Code kirim format Anthropic, endpoint yang menerjemahkan.
       // openrouter/deepseek → base URL tetap milik providernya; custom/cursor → base URL akun (proxy).
       env.ANTHROPIC_BASE_URL = skinBaseUrl(acc.provider, acc.baseUrl)
@@ -483,6 +553,11 @@ export class SessionManager implements GroveHost {
       delete env.ANTHROPIC_BASE_URL
     }
     return { env, model: this.resolveModel(sessionId), effort: this.resolveEffort(sessionId) }
+  }
+
+  /** GroveHost.perMessageUsageReliable — lihat kontraknya di mcpTools.ts. */
+  perMessageUsageReliable(sessionId: string): boolean {
+    return this.effectiveAccount(sessionId)?.provider !== 'dzax'
   }
 
   /** GroveHost — akun efektif sesi ini bisa melihat gambar? (DeepSeek: tidak, lihat providerSeesImages) */
@@ -798,13 +873,25 @@ export class SessionManager implements GroveHost {
    * Akun yang sudah dihapus dari DB → token null (bukan jatuh ke login utama), supaya
    * UI menampilkan "tidak diketahui", bukan angka akun lain.
    */
-  getSessionAccountInfo(sessionId: string | null): { id: string | null; label: string; token: string | null } {
+  getSessionAccountInfo(sessionId: string | null): {
+    id: string | null
+    label: string
+    token: string | null
+    provider?: AccountProvider
+  } {
     // Akun EFEKTIF (bukan hanya yang tertulis di sesi) → header usage menampilkan akun yang BENAR-BENAR
     // dipakai, termasuk saat sesi menumpang akun sesi utama atau akun global.
     const accountId = sessionId ? this.resolveAccountId(sessionId) : null
     if (!accountId) return { id: null, label: 'Belum ada akun', token: null }
-    const label = this.db.getAccounts().find((a) => a.id === accountId)?.label
-    return { id: accountId, label: label ?? 'Akun terhapus', token: this.db.getAccountToken(accountId) }
+    // provider IKUT dibawa: penentu apakah kuota ditanyakan ke Anthropic (akun Claude) atau ke API
+    // provider sendiri (OpenRouter/DeepSeek). Tanpa ini header selalu menembak Anthropic → 401 palsu.
+    const acc = this.db.getAccounts().find((a) => a.id === accountId)
+    return {
+      id: accountId,
+      label: acc?.label ?? 'Akun terhapus',
+      token: this.db.getAccountToken(accountId),
+      provider: acc?.provider
+    }
   }
 
   /**
@@ -861,10 +948,11 @@ export class SessionManager implements GroveHost {
    * pilih yang paketnya TERBESAR = paling mungkin masih punya kuota — bukan sekadar yang paling
    * lama dibuat (urutan pembuatan gampang jatuh ke akun login utama).
    */
-  pickAvailableAccount(currentKey: string): Account | undefined {
+  pickAvailableAccount(currentKey: string, sameProvider?: AccountProvider): Account | undefined {
     return this.db
       .getAccounts()
       .filter((a) => a.id !== currentKey && !this.isAccountLimited(a.id))
+      .filter((a) => !sameProvider || (a.provider ?? 'claude') === sameProvider)
       .sort((x, y) => (y.plan ?? 1) - (x.plan ?? 1))[0]
   }
 
@@ -873,18 +961,27 @@ export class SessionManager implements GroveHost {
    * sebelum Max 5x) supaya kerja tetap jalan, bukan terkunci menunggu semua turun di bawah ambang.
    * Akun tanpa info paket dianggap 1.
    */
-  pickLargestPlanAccount(currentKey: string): Account | undefined {
+  pickLargestPlanAccount(currentKey: string, sameProvider?: AccountProvider): Account | undefined {
     return this.db
       .getAccounts()
       .filter((a) => a.id !== currentKey)
+      .filter((a) => !sameProvider || (a.provider ?? 'claude') === sameProvider)
       .sort((x, y) => (y.plan ?? 1) - (x.plan ?? 1))[0]
   }
 
-  /** Akun tujuan pindah: yang belum limit; kalau semua limit → yang paketnya terbesar. */
-  private pickSwitchTarget(currentKey: string): { acct: Account; fallback: boolean } | undefined {
-    const free = this.pickAvailableAccount(currentKey)
+  /**
+   * Akun tujuan pindah: yang belum limit; kalau semua limit → yang paketnya terbesar.
+   * `sameProvider` MENGUNCI tujuan ke provider yang sama — dipakai saat akun sumbernya ber-API-key:
+   * memindahkan sesi OpenRouter/DeepSeek ke langganan Claude berarti billing nyasar ke akun yang
+   * tak pernah user pilih untuk pekerjaan itu (prinsip yang sama sudah dipegang onLimitHit).
+   */
+  private pickSwitchTarget(
+    currentKey: string,
+    sameProvider?: AccountProvider
+  ): { acct: Account; fallback: boolean } | undefined {
+    const free = this.pickAvailableAccount(currentKey, sameProvider)
     if (free) return { acct: free, fallback: false }
-    const big = this.pickLargestPlanAccount(currentKey)
+    const big = this.pickLargestPlanAccount(currentKey, sameProvider)
     return big ? { acct: big, fallback: true } : undefined
   }
 
@@ -901,17 +998,36 @@ export class SessionManager implements GroveHost {
     // soal "berapa persen dianggap tinggi" adalah setelan akun — pemanggil boleh saja memanggil
     // dengan persentase apa pun tanpa risiko memindah sesi sebelum waktunya.
     const threshold = this.switchPctFor(accountId)
-    if (pct < threshold) return 0
     const key = accountId ?? DEFAULT_ACCT_KEY
+    if (pct < threshold) {
+      this.creditWarned.delete(key) // turun lagi (kredit diisi ulang) → boleh diperingatkan lagi nanti
+      return 0
+    }
     if (this.isAccountLimited(key)) return 0 // sudah ditandai → jangan pindah berulang
-    const target = this.pickSwitchTarget(key)
-    if (!target) return 0
-    const next = target.acct
+    // Akun API-key hanya boleh dipindahkan ke akun provider yang SAMA (lihat pickSwitchTarget).
+    const provider = this.db.getAccounts().find((a) => a.id === accountId)?.provider
+    const lockProvider = isSkinProvider(provider) ? provider : undefined
+    const target = this.pickSwitchTarget(key, lockProvider)
     // Bandingkan akun EFEKTIF: sub-sesi yang menumpang akun sesi utama / akun global juga ikut
     // dipindah. Sebelumnya perbandingan memakai meta.accountId mentah, jadi sub-sesi yang tak
     // menyimpan accountId sendiri LUPUT dari pemindahan dan tetap membakar akun yang hampir habis.
     const targets = [...this.sessions.values()].filter((s) => this.resolveAccountId(s.meta.id) === accountId)
     if (!targets.length) return 0
+    if (!target) {
+      // Tak ada tujuan yang sah. Untuk akun API-key ini kejadian normal (cuma punya 1 akun provider
+      // itu) → beri tahu SEKALI, jangan diam: user perlu tahu kreditnya mau habis.
+      if (lockProvider && !this.creditWarned.has(key)) {
+        this.creditWarned.add(key)
+        const label = this.db.getAccounts().find((a) => a.id === accountId)?.label ?? 'akun ini'
+        for (const s of targets) {
+          s.systemNote(
+            `⚠️ Kredit/saldo "${label}" sudah ${Math.round(pct)}% terpakai (ambang ${threshold}%) dan tak ada akun ${lockProvider} lain untuk dipindahi. Isi ulang kredit atau pindahkan sesi ini manual — Grove sengaja TIDAK memindahkanmu ke akun Claude agar billing tak nyasar.`
+          )
+        }
+      }
+      return 0
+    }
+    const next = target.acct
     this.markAccountLimited(key) // anggap tak tersedia selama cooldown
     for (const s of targets) {
       const wasRunning = s.meta.status === 'running'
@@ -1308,7 +1424,10 @@ export class SessionManager implements GroveHost {
       if (b?.progress) lines.push(`    progres: ${b.progress}`)
       if (b?.todo?.length) lines.push(`    todo: ${b.todo.map((t) => `${t.done ? '✓' : '○'} ${t.text}`).join('; ')}`)
     }
-    const summary = `Ringkasan tugas pohon ini (dari laporan worker, hasil compact):\n${lines.join('\n') || '(belum ada laporan board)'}\n\nJika ada file .grove/checkpoint.md di working directory, BACA file itu untuk konteks detail (file list, keputusan, next steps) yang tidak terekam di ringkasan ini.`
+    // Path file handover TIDAK ditulis di sini: Session.compactWith yang menempelkannya (ia tahu
+    // file mana yang benar-benar jadi — punya model atau tulisan Grove). Dulu kalimat "baca
+    // .grove/checkpoint.md" selalu ikut walau file itu tak pernah ada → model mengejar file hantu.
+    const summary = `Ringkasan tugas pohon ini (dari laporan worker, hasil compact):\n${lines.join('\n') || '(belum ada laporan board)'}`
     const mem = this.db.addMemory(treeId, rootId, summary, Date.now())
     this.emit({ channel: 'memory:new', payload: mem })
     root.compactWith(summary)
@@ -1328,11 +1447,50 @@ export class SessionManager implements GroveHost {
     if (b?.summary) parts.push(`Ringkasan: ${b.summary}`)
     if (b?.progress) parts.push(`Progres terakhir: ${b.progress}`)
     if (b?.todo?.length) parts.push(`Todo: ${b.todo.map((t) => `${t.done ? '✓' : '○'} ${t.text}`).join('; ')}`)
-    parts.push(`Jika ada file .grove/checkpoint.md di working directory, BACA file itu untuk konteks detail.`)
+    // (path handover ditempel Session.compactWith — lihat compactSession)
     const summary = `Ringkasan tugasmu (auto-compact karena konteks nyaris penuh):\n${parts.join('\n')}`
     const mem = this.db.addMemory(s.meta.treeId, sessionId, summary, Date.now())
     this.emit({ channel: 'memory:new', payload: mem })
     s.compactWith(summary)
+  }
+
+  /**
+   * GroveHost.beforeCompact — JAMINAN "selalu ada file untuk melanjutkan" (lihat handover.ts).
+   *
+   * Lapis 1 (kaya): checkpoint yang DITULIS MODEL — dihormati apa adanya bila ia segar (ditulis
+   * setelah compact terakhir & belum basi). Menimpanya dengan versi Grove justru membuang alasan &
+   * keputusan yang cuma ada di kepala model.
+   * Lapis 2 (jaring pengaman): Grove menulis sendiri dari papan tugas + jejak file + ekor percakapan.
+   *
+   * Balikan = path relatif untuk disebut di reseed; null = benar-benar tak ada file (gagal tulis) —
+   * Session akan mengatakannya terus terang alih-alih menyuruh model membaca file hantu.
+   */
+  beforeCompact(sessionId: string, summary: string): string | null {
+    const s = this.sessions.get(sessionId)
+    if (!s) return null
+    const rel = handoverRel(sessionId)
+    const abs = handoverPath(s.meta.cwd, sessionId)
+    if (handoverIsFresh(abs, s.getLastCompactAt())) return rel // model sudah menulis → jangan disentuh
+    const b = this.db.getBoardEntry(sessionId)
+    const ok = writeHandover(abs, {
+      sessionId,
+      title: s.meta.title,
+      role: s.meta.role,
+      status: s.meta.status,
+      cwd: s.meta.cwd,
+      reason: 'compact',
+      summary,
+      progress: b?.progress,
+      percent: b?.percent,
+      todo: b?.todo,
+      files: s.getFilesTouched(),
+      filesRead: s.getFilesRead(),
+      searches: s.getSearches(),
+      // Hanya giliran percakapan yang berisi maksud/hasil; baris tool sudah terwakili "Files Changed".
+      chatTail: s.getHistory().filter((m) => m.role === 'user' || m.role === 'assistant')
+    })
+    if (!ok) console.warn(`[handover] gagal menulis ${abs}`)
+    return ok || existsSync(abs) ? rel : null
   }
 
   /** GroveHost.saveCompaction — dipanggil tool save_compaction: simpan memori + padatkan konteks. */
@@ -1352,6 +1510,7 @@ export class SessionManager implements GroveHost {
     const wasOff = !this.loopEnabled.has(rootId)
     this.loopEnabled.add(rootId)
     this.loopCacheWarmMode.delete(rootId) // tugas baru → keluar mode cache-warm, kembali auto-check normal
+    this.cacheWarmPings.delete(rootId) // tugas baru → jatah ping cache-warm pulih
     this.loopIdleStreak.delete(rootId) // tugas baru → rantai "tanpa perubahan" direset
     this.lastLoopSummary.delete(rootId)
     this.loopDonePinged.delete(rootId) // tugas baru → ping penutup boleh dikirim lagi nanti
@@ -1399,12 +1558,9 @@ export class SessionManager implements GroveHost {
       return
     }
 
-    // ---- MODE CACHE-WARM: ping ringan, interval panjang, tujuannya hanya refresh cache prefix ----
+    // ---- MODE CACHE-WARM: ping ringan, tujuannya hanya menjaga prefix tetap ter-cache ----
     if (this.loopCacheWarmMode.has(rootId)) {
-      if (root.meta.status !== 'running') {
-        const stale = Date.now() - root.lastApiActivity > WAKE.cacheWarmStaleMs
-        if (stale) root.cacheWarm()
-      }
+      if (root.meta.status !== 'running') this.maybeCacheWarm(root)
       this.scheduleLoop(rootId, WAKE.cacheWarmIntervalMs)
       return
     }
@@ -1439,10 +1595,38 @@ export class SessionManager implements GroveHost {
       }
     } else if (root.meta.status !== 'running' && !worthAsking) {
       // Tak ada worker / semua worker baik-baik saja → tak perlu auto-check, tapi jaga cache.
-      const stale = Date.now() - root.lastApiActivity > WAKE.cacheWarmStaleMs
-      if (stale) root.cacheWarm()
+      this.maybeCacheWarm(root)
     }
     this.scheduleLoop(rootId)
+  }
+
+  /**
+   * Ping cache-warm — DENGAN REM. Yang dijaga di sini adalah biaya, bukan sekadar cache:
+   *
+   *  - Ping cache-warm memang balas satu kata (output ~nol), TAPI request-nya membawa SELURUH
+   *    konteks. Pada sesi 120k token, satu ping = 120k token input. Itu bukan "gratis".
+   *  - Karena itu ping hanya berguna bila jatuh SEBELUM TTL cache habis (dibayar sebagai cache-read
+   *    0,1×). Kalau telat, yang dibayar cache-creation 1,25× — lebih mahal daripada tidak
+   *    menghangatkan sama sekali. Angka jadwalnya sudah diperbaiki di wakePolicy.
+   *  - Konteks kecil tak sepadan dihangatkan, dan sesi yang benar-benar ditinggalkan harus BERHENTI
+   *    dihangatkan: 4 ping beruntun tanpa aktivitas nyata lalu stop, bukan selamanya.
+   */
+  private maybeCacheWarm(root: Session): void {
+    const id = root.meta.id
+    if (Date.now() - root.lastApiActivity <= WAKE.cacheWarmStaleMs) return // cache masih segar
+    if (root.meta.ctxInput < WAKE.cacheWarmMinCtx) return // tak ada konteks berarti untuk dijaga
+    const used = this.cacheWarmPings.get(id) ?? 0
+    if (used >= WAKE.cacheWarmMaxPings) {
+      if (used === WAKE.cacheWarmMaxPings) {
+        this.cacheWarmPings.set(id, used + 1) // tandai "nota sudah dikirim" (anti-spam)
+        root.systemNote(
+          `⏹ Cache-warm dihentikan setelah ${WAKE.cacheWarmMaxPings} ping tanpa aktivitas nyata. Menghangatkan konteks sebesar ini terus-menerus lebih mahal daripada sekali membangun ulang cache saat kamu kembali. Kirim tugas baru → jatahnya pulih.`
+        )
+      }
+      return
+    }
+    this.cacheWarmPings.set(id, used + 1)
+    root.cacheWarm()
   }
 
   /**
@@ -1478,6 +1662,11 @@ export class SessionManager implements GroveHost {
   }
 
   /** Stop All: interupsi turn SEMUA session (jadi idle) tanpa menutup — masih bisa dilanjut. */
+  /** Berapa sesi yang BENAR-BENAR sedang bekerja sekarang. Dipakai konfirmasi tutup jendela. */
+  countRunning(): number {
+    return [...this.sessions.values()].filter((s) => s.meta.status === 'running').length
+  }
+
   async stopAll(): Promise<number> {
     const running = [...this.sessions.values()].filter((s) => s.meta.status === 'running')
     await Promise.all(running.map((s) => s.interruptTurn().catch(() => {})))
@@ -1498,6 +1687,7 @@ export class SessionManager implements GroveHost {
       this.clearLoopTimer(sid)
       this.loopEnabled.delete(sid)
       this.loopCacheWarmMode.delete(sid)
+      this.cacheWarmPings.delete(sid)
       this.loopIdleStreak.delete(sid) // state auto-check milik sesi ini → jangan tinggalkan sisa
       this.lastLoopSummary.delete(sid)
       this.lastPingSummary.delete(sid) // dedupe ping board (keyed treeId = id root) → ikut dibuang

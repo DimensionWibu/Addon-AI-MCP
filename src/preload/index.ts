@@ -7,6 +7,7 @@ const api: GroveApi = {
   getPathForFile: (file: File) => webUtils.getPathForFile(file),
   dropFolder: (path: string, title?: string) => ipcRenderer.invoke('grove:dropFolder', { path, title }),
   newChat: (title?: string) => ipcRenderer.invoke('grove:newChat', { title }),
+  newWorker: (parentId: string, title?: string) => ipcRenderer.invoke('grove:newWorker', { parentId, title }),
   pickFolder: () => ipcRenderer.invoke('grove:pickFolder'),
   setSessionCwd: (id: string, path: string) => ipcRenderer.invoke('grove:setSessionCwd', { id, path }),
   sendChat: (id: string, text: string, images?: ImageAttachment[]) =>
@@ -32,7 +33,7 @@ const api: GroveApi = {
     token: string,
     plan?: number,
     switchPct?: number,
-    provider?: 'claude' | 'openrouter' | 'custom' | 'cursor' | 'deepseek',
+    provider?: 'claude' | 'openrouter' | 'custom' | 'cursor' | 'deepseek' | 'dzax',
     model?: string,
     baseUrl?: string
   ) => ipcRenderer.invoke('grove:addAccount', { label, token, plan, switchPct, provider, model, baseUrl }),

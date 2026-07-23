@@ -2,6 +2,7 @@ import type {
   Account,
   BoardEntry,
   ChatMessage,
+  CreditInfo,
   DeepseekAccountCost,
   EffortSetting,
   GroveEvent,
@@ -12,6 +13,7 @@ import type {
   SessionMeta,
   TreeNode,
   UsageSnapshot,
+  UsageStats,
   UsageUnavailable,
   UsageWindow
 } from '../shared/types'
@@ -23,6 +25,8 @@ import {
   CUSTOM_MODEL_SUGGESTIONS,
   DEEPSEEK_MODEL_DEFAULT,
   DEEPSEEK_MODEL_SUGGESTIONS,
+  DZAX_BASE_URL_DEFAULT,
+  DZAX_MODEL_SUGGESTIONS,
   deepseekCostUsd,
   deepseekPriceLabel,
   EFFORT_OPTIONS,
@@ -147,6 +151,19 @@ function fmtResetIn(iso: string | null): string {
   const m = mins % 60
   return h > 0 ? `reset ${h}j ${m}m` : `reset ${m}m`
 }
+/** Statistik pemakaian LOKAL (token tercatat di PC ini), di-cache 60 detik. */
+let statsCache: { at: number; s: UsageStats } | null = null
+async function localStats(): Promise<UsageStats | null> {
+  if (statsCache && Date.now() - statsCache.at < 60_000) return statsCache.s
+  try {
+    const s = await window.grove.getUsageStats()
+    statsCache = { at: Date.now(), s }
+    return s
+  } catch {
+    return null
+  }
+}
+
 /** Penjelasan jujur kenapa angka akun ini kosong (bukan diam-diam menampilkan akun lain). */
 function usageReasonText(r?: UsageUnavailable): string {
   switch (r) {
@@ -158,9 +175,51 @@ function usageReasonText(r?: UsageUnavailable): string {
       return 'Token akun ini ditolak (401) — kemungkinan sudah kedaluwarsa.'
     case 'rate-limited':
       return 'Server sedang membatasi permintaan (429). Dicoba lagi otomatis.'
+    case 'unsupported':
+      return 'Gateway/proxy akun ini tidak menyediakan API kuota yang bisa Grove tanyakan (sudah dicek: /usage, /credits, /key, /me semuanya tidak ada). Yang bisa ditampilkan adalah pemakaian yang TERCATAT DI PC INI — angkanya di bawah — sedangkan sisa saldo sebenarnya ada di dashboard provider.'
     default:
       return 'Gagal menghubungi server limit. Dicoba lagi otomatis.'
   }
+}
+
+/**
+ * Panel & header untuk akun ber-API-KEY (OpenRouter/DeepSeek): KREDIT/SALDO, bukan jendela waktu.
+ * Angkanya datang dari API provider itu sendiri. Bila provider tak memberi batas (key free-tier
+ * OpenRouter, saldo DeepSeek), persen sengaja ditulis "—" + alasannya — jangan mengarang 0%.
+ */
+function renderCreditUsage(
+  box: HTMLElement,
+  panel: HTMLElement,
+  acct: string,
+  label: string,
+  c: CreditInfo,
+  stale?: boolean
+): void {
+  const v = c.utilization
+  const val = v != null ? Math.round(v) : 0
+  const money = (n: number | null): string => (n == null ? '—' : c.currency === 'USD' ? fmtUsd(n) : `${n} ${c.currency}`)
+  box.innerHTML =
+    acct +
+    `<span class="ubar-mini"><span class="ulabel">kredit</span><span class="ubar"><span class="ufill ${ufillClass(v)}" style="width:${val}%"></span></span><span class="uval">${
+      v != null ? val + '%' : c.remaining != null ? money(c.remaining) : '—'
+    }</span></span>`
+  let html = `<div class="up-title">KREDIT API · ${label} (${c.provider})</div>`
+  if (v != null) {
+    html += `<div class="up-row"><div class="up-head"><span class="up-name">Kredit terpakai</span><span class="up-pct">${val}% terpakai</span></div><div class="up-bar"><span class="up-fill ${ufillClass(v)}" style="width:${val}%"></span></div></div>`
+  }
+  const rows: Array<[string, string]> = []
+  if (c.used != null) rows.push(['Terpakai', money(c.used)])
+  if (c.limit != null) rows.push(['Batas kredit', money(c.limit)])
+  if (c.remaining != null) rows.push([c.limit != null ? 'Sisa' : 'Saldo', money(c.remaining)])
+  if (c.freeTier) rows.push(['Tier', 'free'])
+  for (const [k, val2] of rows) {
+    html += `<div class="up-row"><div class="up-head"><span class="up-name">${escapeHtml(k)}</span><span class="up-pct">${escapeHtml(val2)}</span></div></div>`
+  }
+  if (c.note) html += `<div class="up-empty">${escapeHtml(c.note)}</div>`
+  if (v == null)
+    html += `<div class="up-empty">Ambang auto-switch tidak bisa ditegakkan untuk akun ini (tak ada angka batas), jadi proteksi yang berlaku hanya reaksi saat provider menolak.</div>`
+  html += `<div class="up-updated">Update: ${new Date(c.fetchedAt).toLocaleTimeString()}${stale ? ' · data terakhir (refresh gagal)' : ''}</div>`
+  panel.innerHTML = html
 }
 
 /**
@@ -184,11 +243,29 @@ function renderUsage(snap: UsageSnapshot): void {
   box.classList.toggle('stale', !!u?.stale)
 
   if (!u) {
-    box.title = `${whoTitle} — pemakaian tak bisa dibaca. Klik untuk detail.`
+    box.title = `${whoTitle} — pemakaian tak bisa dibaca dari provider. Klik untuk detail.`
     box.innerHTML = `${acct}<span class="ubar-mini"><span class="ulabel">usage</span><span class="uval">—</span></span>`
     panel.innerHTML =
       `<div class="up-title">BATAS PEMAKAIAN · ${who}</div>` +
       `<div class="up-empty">${escapeHtml(usageReasonText(snap.reason))}<br><br>Angka akun lain sengaja TIDAK ditampilkan di sini agar tidak menyesatkan.</div>`
+    // Provider tanpa API kuota (gateway OpenAI-compatible / proxy) → tampilkan yang Grove BENAR-BENAR
+    // tahu: token yang tercatat di PC ini untuk akun tersebut. Lebih berguna daripada "—" kosong.
+    if (snap.reason === 'unsupported' && snap.accountId) {
+      void localStats().then((st) => {
+        if (!st || $('usage') !== box) return
+        const row = st.byAccount.find((a) => a.accountId === snap.accountId)
+        if (!row) return
+        box.innerHTML = `${acct}<span class="ubar-mini"><span class="ulabel">lokal 7hr</span><span class="uval">${fmtTok(row.week.total)}</span></span>`
+        box.title = `${whoTitle} — provider tak punya API kuota; ini token yang TERCATAT DI PC INI selama 7 hari terakhir.`
+        panel.innerHTML +=
+          `<div class="up-row"><div class="up-head"><span class="up-name">Tercatat di PC ini (7 hari)</span>` +
+          `<span class="up-pct">${fmtTok(row.week.total)} token</span></div></div>` +
+          `<div class="up-row"><div class="up-head"><span class="up-name">— input / output</span>` +
+          `<span class="up-pct">${fmtTok(row.week.input + row.week.cacheRead + row.week.cacheCreation)} / ${fmtTok(row.week.output)}</span></div></div>` +
+          `<div class="up-row"><div class="up-head"><span class="up-name">— jumlah respons API</span>` +
+          `<span class="up-pct">${row.week.calls}</span></div></div>`
+      })
+    }
     return
   }
   box.title = u.stale
@@ -199,6 +276,12 @@ function renderUsage(snap: UsageSnapshot): void {
     const v = w?.utilization ?? null
     const val = v != null ? Math.round(v) : 0
     return `<span class="ubar-mini"><span class="ulabel">${label}</span><span class="ubar"><span class="ufill ${ufillClass(v)}" style="width:${val}%"></span></span><span class="uval">${v != null ? val + '%' : '—'}</span></span>`
+  }
+  // AKUN API-KEY: kuotanya berupa KREDIT/SALDO dari API providernya sendiri, bukan jendela
+  // 5-jam/7-hari. Menampilkan dua bar Claude yang selalu "—" untuk akun begini cuma menyesatkan.
+  if (u.credit) {
+    renderCreditUsage(box, panel, acct, label, u.credit, u.stale)
+    return
   }
   box.innerHTML = acct + mini('5-jam', u.fiveHour) + mini('minggu', u.sevenDay)
 
@@ -539,12 +622,69 @@ function scheduleBoard(): void {
   })
 }
 
-function scrollChatToBottom(): void {
+/**
+ * AUTO-SCROLL YANG TAHU DIRI. Dulu tiap pesan/token baru menyeret pandangan ke bawah, jadi mustahil
+ * membaca bagian atas selagi worker bekerja. Sekarang: begitu kamu menggulir menjauh dari dasar,
+ * auto-scroll BERHENTI (dan tombol "↓ pesan terbaru" muncul); begitu kamu kembali ke dasar — lewat
+ * tombol itu atau menggulir sendiri — auto-scroll menyala lagi.
+ */
+let autoScroll = true
+const SCROLL_BOTTOM_SLACK = 60 // px; masih dianggap "di dasar" (toleransi sub-pixel & baris tumbuh)
+
+function chatAtBottom(): boolean {
+  const log = $('chat-log')
+  return log.scrollHeight - log.scrollTop - log.clientHeight <= SCROLL_BOTTOM_SLACK
+}
+
+/** Sinkronkan tombol lompat + status auto-scroll dari posisi gulir sekarang. */
+function syncChatScrollState(): void {
+  const atBottom = chatAtBottom()
+  autoScroll = atBottom
+  const btn = document.getElementById('chat-jump')
+  if (btn) btn.hidden = atBottom
+}
+
+/**
+ * ENDAPKAN posisi di dasar selama beberapa frame.
+ *
+ * Pesan di luar layar dilewati layout-nya (content-visibility) sehingga tingginya masih TAKSIRAN;
+ * begitu browser merender item itu, tinggi aslinya menggeser scrollHeight dan posisi yang tadinya
+ * "paling bawah" jadi meleset ke atas — persis bug "pesan terbaru tidak sampai ke bawah, tiap prompt
+ * malah naik sendiri". Karena itu dasar ditegakkan ulang beberapa frame sampai benar-benar diam.
+ */
+function settleBottom(framesLeft: number): void {
+  if (framesLeft <= 0) return
+  requestAnimationFrame(() => {
+    if (!autoScroll) return // user menggulir ke atas di tengah pengendapan → hormati
+    const log = $('chat-log')
+    if (log.scrollHeight - log.scrollTop - log.clientHeight > 1) log.scrollTop = log.scrollHeight
+    settleBottom(framesLeft - 1)
+  })
+}
+
+/** `force` = permintaan eksplisit user (tombol/ganti sesi) → selalu turun & nyalakan lagi. */
+let scrollForce = false
+function scrollChatToBottom(force = false): void {
+  if (force) {
+    autoScroll = true
+    scrollForce = true
+    const btn = document.getElementById('chat-jump')
+    if (btn) btn.hidden = true
+  } else if (!autoScroll) {
+    return // user sedang membaca di atas — jangan diseret
+  }
   if (scrollRaf) return
   scrollRaf = requestAnimationFrame(() => {
     scrollRaf = 0
+    const wantForce = scrollForce
+    scrollForce = false
+    // PERIKSA ULANG DI DALAM FRAME. requestAnimationFrame bisa tertunda lama (jendela tersembunyi/
+    // minimize → rAF di-throttle), dan saat akhirnya jalan, user mungkin SUDAH menggulir ke atas.
+    // Tanpa cek kedua ini, keputusan basi dari beberapa detik lalu tetap menyeret pandangannya.
+    if (!wantForce && !autoScroll) return
     const log = $('chat-log')
     log.scrollTop = log.scrollHeight
+    settleBottom(4)
   })
 }
 
@@ -888,6 +1028,41 @@ function renderTree(): void {
   for (const r of roots) renderNode(r, 0, tree)
 }
 
+/**
+ * HITUNGAN KLIK BERUNTUN PER KARTU — sengaja TIDAK memakai `MouseEvent.detail`.
+ *
+ * `detail` dihitung browser terhadap ELEMEN/posisi yang sama, sementara kartu sesi bisa dibangun
+ * ulang (renderTree) tepat di tengah rentetan klik — mis. saat sesi lain melapor. Begitu elemennya
+ * diganti, hitungannya balik ke 1 dan klik ke-3 tak pernah terlihat sebagai klik ke-3. State di
+ * sini di-key oleh ID SESI, jadi ia kebal terhadap rebuild DOM.
+ */
+const TRIPLE_CLICK_MS = 700
+let clickRun = { id: '', n: 0, at: 0 }
+
+function countCardClick(id: string): number {
+  const now = performance.now()
+  if (clickRun.id !== id || now - clickRun.at > TRIPLE_CLICK_MS) clickRun = { id, n: 0, at: now }
+  clickRun.n++
+  clickRun.at = now
+  return clickRun.n
+}
+
+/**
+ * Sub-worker baru di bawah sebuah kartu (klik 3×). Worker lahir IDLE tanpa tugas — nol token
+ * sampai user mengetik — lalu langsung dipilih & kursor pindah ke kolom ketik supaya tinggal
+ * menuliskan tugasnya.
+ */
+async function createWorkerUnder(parentId: string): Promise<void> {
+  try {
+    const meta = await window.grove.newWorker(parentId)
+    ensureNode(meta) // daftarkan segera → tidak race dengan event session:new
+    await selectSession(meta.id)
+    document.getElementById('chat-input')?.focus()
+  } catch (err) {
+    alert(`Gagal membuat worker: ${String(err)}`)
+  }
+}
+
 function renderNode(node: Node, depth: number, container: HTMLElement): void {
   // Bug 1: sertakan status blink/stop/draft SAAT rebuild. Tanpa ini, renderTree() (mis. saat sesi
   // baru muncul / dihapus / reorder — sering terjadi tepat setelah satu sesi dijawab lalu pohonnya
@@ -904,7 +1079,15 @@ function renderNode(node: Node, depth: number, container: HTMLElement): void {
   wrap.dataset.id = node.id
   wrap.onclick = () => {
     if (performance.now() < suppressClickUntil) return // klik pasca-drag → jangan pilih
-    selectSession(node.id)
+    // KLIK 3× (dalam 700ms) = bikin sub-worker di bawah kartu ini. Klik ke-1 & ke-2 tetap memilih
+    // sesinya — itu memang diinginkan: worker lahir di pohon yang sedang dilihat.
+    if (countCardClick(node.id) >= 3) {
+      clickRun.n = 0 // klik ke-4/5 jangan memberondong worker baru
+      window.getSelection()?.removeAllRanges() // klik beruntun menyeleksi teks kartu — bersihkan
+      void createWorkerUnder(node.id)
+      return
+    }
+    void selectSession(node.id)
   }
   wrap.addEventListener('pointerdown', (e) => onNodePointerDown(e, node)) // tekan-tahan → geser
   wrap.addEventListener('contextmenu', (e) => {
@@ -1195,6 +1378,7 @@ async function selectSession(id: string): Promise<void> {
     logIngest(m, false) // bangun pohon LOG dari riwayat yang sama
   }
   log.scrollTop = log.scrollHeight
+  scrollChatToBottom(true) // pindah sesi = mulai dari pesan terbaru + auto-scroll menyala lagi
   const lt = document.getElementById('log-tree')
   if (lt) lt.scrollTop = lt.scrollHeight
   updateActiveHighlight()
@@ -1696,6 +1880,90 @@ let histIdx = -1 // -1 = tidak sedang menelusuri riwayat
 let histDraft = '' // teks yang sedang diketik sebelum menelusuri, dipulihkan saat kembali ke bawah
 let editingQid: number | null = null
 
+/**
+ * MUATAN pesan yang sudah dikirim dari UI — teks asli (tanpa blok referensi) + lampirannya.
+ * Chat & antrian hanya menyimpan TEKS, jadi tanpa catatan ini "batalkan pesan terakhir" mustahil
+ * mengembalikan gambar & referensinya. Disimpan per sesi, dibatasi beberapa terakhir saja.
+ */
+interface SentPayload {
+  text: string // yang diketik user
+  sent: string // yang benar-benar dikirim (refBlock + text) → untuk mencocokkan item antrian
+  images: ImageAttachment[]
+  refs: string[]
+}
+const sentPayloads = new Map<string, SentPayload[]>()
+const MAX_SENT_PAYLOADS = 8
+
+function rememberSent(sessionId: string, p: SentPayload): void {
+  const list = sentPayloads.get(sessionId) ?? []
+  list.push(p)
+  while (list.length > MAX_SENT_PAYLOADS) list.shift()
+  sentPayloads.set(sessionId, list)
+}
+
+/** Ambil (dan buang) muatan terakhir yang cocok teksnya; null bila tak ada catatannya. */
+function takeSentPayload(sessionId: string, sentText?: string): SentPayload | null {
+  const list = sentPayloads.get(sessionId)
+  if (!list?.length) return null
+  const idx = sentText ? list.map((p) => p.sent).lastIndexOf(sentText) : list.length - 1
+  if (idx < 0) return null
+  const [p] = list.splice(idx, 1)
+  return p ?? null
+}
+
+/** Kembalikan sebuah pesan ke kolom ketik: teks, gambar, dan referensinya sekaligus. */
+function restoreToComposer(p: { text: string; images?: ImageAttachment[]; refs?: string[] }): void {
+  const input = $<HTMLTextAreaElement>('chat-input')
+  input.value = p.text
+  pendingImages = p.images ? [...p.images] : []
+  pendingRefs = p.refs ? [...p.refs] : []
+  renderAttachStrip()
+  autoGrow(input)
+  resetHistoryNav()
+  input.focus()
+  input.setSelectionRange(input.value.length, input.value.length)
+}
+
+/**
+ * ESC — BATALKAN PESAN TERAKHIR, kembalikan utuh ke kolom ketik (meniru perilaku claude.ai).
+ *
+ * Dua keadaan, dua akibat yang berbeda — dan bedanya dikatakan apa adanya:
+ *  1. Pesan masih ANTRI di Grove (turn sedang jalan) → benar-benar dibatalkan sebelum sampai ke
+ *     model: tak ada token terpakai, tak ada jejak di konteks.
+ *  2. Pesan SUDAH terkirim (sedang dikerjakan) → turn dihentikan, teksnya dikembalikan ke kolom
+ *     ketik, TAPI pesan itu sudah masuk konteks model dan tokennya sudah tertagih. Itu batas yang
+ *     tak bisa dilewati siapa pun, jadi jangan berpura-pura "batal total".
+ */
+async function cancelLastMessage(sessionId: string): Promise<void> {
+  const last = queueItems[queueItems.length - 1]
+  if (last) {
+    const ok = await window.grove.cancelQueued(sessionId, last.qid).catch(() => false)
+    if (ok) {
+      const p = takeSentPayload(sessionId, last.text)
+      restoreToComposer(p ?? { text: last.text })
+      appendChatMessage({
+        role: 'system',
+        text: '↩︎ Pesan terakhir dibatalkan sebelum terkirim ke model — dikembalikan ke kolom ketik.',
+        ts: Date.now()
+      })
+      return
+    }
+    // Sudah terlanjur terkirim di sela-sela → jatuh ke jalur 2.
+  }
+  const node = nodes.get(sessionId)
+  if (node?.status !== 'running') return // tak ada yang bisa dibatalkan → Esc diam saja
+  await window.grove.interruptSession(sessionId).catch(() => {})
+  const p = takeSentPayload(sessionId)
+  if (p) restoreToComposer(p)
+  appendChatMessage({
+    role: 'system',
+    text: p
+      ? '⏹ Turn dihentikan; pesan terakhir dikembalikan ke kolom ketik (gambar & referensi ikut). Catatan: pesan itu sudah sempat masuk konteks model, jadi tokennya tetap tertagih.'
+      : '⏹ Turn dihentikan.',
+    ts: Date.now()
+  })
+}
+
 /** Daftar yang ditelusuri ↑: antrian dulu (paling dekat & masih bisa diubah), lalu prompt terkirim. */
 function historyEntries(): Array<{ text: string; qid: number | null }> {
   return [
@@ -1808,10 +2076,23 @@ function renderAttachStrip(): void {
   })
 }
 
+/**
+ * Tinggi textarea mengikuti isi. Sederhana dan — setelah pesan di luar layar tak lagi ikut di-layout
+ * (content-visibility di styles.css) — juga MURAH: terukur 0,06 ms per ketikan pada 400 pesan.
+ *
+ * Dua alternatif sudah diuji dan LEBIH BURUK, jangan diulang:
+ *  - `field-sizing: content` (CSS murni): tinggi jadi bergantung isi -> 44 ms/ketikan.
+ *  - elemen bayangan + getComputedStyle: 7,4 ms/ketikan (biaya baca gaya & tulis style).
+ */
+const NATIVE_GROW = typeof CSS !== 'undefined' && CSS.supports?.('field-sizing', 'content')
 function autoGrow(el: HTMLTextAreaElement): void {
+  if (NATIVE_GROW) return // tinggi diurus CSS field-sizing: nol layout paksa
   el.style.height = 'auto'
   el.style.height = `${Math.min(Math.max(el.scrollHeight, 84), 320)}px`
 }
+
+
+
 
 // ---- board & inbox ---------------------------------------------------------
 
@@ -2005,6 +2286,10 @@ function showSessionMenu(node: Node, x: number, y: number): void {
 
   menu.append(el('div', { class: 'ctx-head' }, `${node.role === 'root' ? 'UTAMA' : 'SUB'} · ${node.title}`))
 
+  // --- Sub-worker manual --- jalur yang bisa DITEMUKAN untuk aksi klik-3× pada kartu.
+  menu.append(el('div', { class: 'ctx-sep' }, 'Worker'))
+  menu.append(item('➕ Sub-worker baru (atau klik 3× kartu)', false, () => void createWorkerUnder(node.id)))
+
   // --- Akun ---
   menu.append(el('div', { class: 'ctx-sep' }, 'Akun'))
   const inheritAccLabel =
@@ -2024,7 +2309,9 @@ function showSessionMenu(node: Node, x: number, y: number): void {
             ? '  ⟨OR⟩'
             : a.provider === 'deepseek'
               ? '  ⟨DS⟩'
-              : ''
+              : a.provider === 'dzax'
+                ? '  ⟨OAI⟩'
+                : ''
     menu.append(item(a.label + tag, node.accountId === a.id, () => setSessionAccount(node.id, a.id)))
   }
 
@@ -2296,7 +2583,13 @@ function renderAccountsPanel(): void {
                     },
                     `DS: ${a.model ?? DEEPSEEK_MODEL_DEFAULT}`
                   )
-                : el('span', {})
+                : a.provider === 'dzax'
+                  ? el(
+                      'span',
+                      { class: 'ap-prov', title: `${a.baseUrl ?? DZAX_BASE_URL_DEFAULT} · ${a.model ?? '?'}` },
+                      `OAI: ${a.model ?? '?'}`
+                    )
+                  : el('span', {})
       panel.append(
         el('div', { class: 'ap-item' }, el('span', { class: 'ap-label' }, a.label), provTag, planTag, del)
       )
@@ -2348,6 +2641,7 @@ function renderAccountsPanel(): void {
   for (const [v, t] of [
     ['claude', 'Claude (langganan)'],
     ['deepseek', 'DeepSeek (token saja)'],
+    ['dzax', 'Gateway OpenAI-compatible (raw / DZAX)'],
     ['openrouter', 'OpenRouter (key + model)'],
     ['custom', 'Gemini / Proxy (base-URL)'],
     ['cursor', 'Cursor (token free + proxy)']
@@ -2402,6 +2696,7 @@ function renderAccountsPanel(): void {
   const orSuggest = OPENROUTER_MODEL_SUGGESTIONS.map((m) => ({ value: m.id, text: m.label }))
   const customSuggest = CUSTOM_MODEL_SUGGESTIONS.map((m) => ({ value: m.id, text: m.label }))
   const cursorSuggest = CURSOR_MODEL_SUGGESTIONS.map((m) => ({ value: m.id, text: m.label }))
+  const dzaxSuggest = DZAX_MODEL_SUGGESTIONS.map((m) => ({ value: m.id, text: m.label }))
   let orLive: ReadonlyArray<{ value: string; text: string }> | null = null
   fillDatalist(orSuggest)
   void window.grove
@@ -2423,11 +2718,15 @@ function renderAccountsPanel(): void {
 
   const hint = el('div', { class: 'ap-hint' }, '')
   const applyProvider = (): void => {
-    const p = prov.value // 'claude' | 'deepseek' | 'openrouter' | 'custom' | 'cursor'
-    const proxy = p === 'custom' || p === 'cursor' // pakai base URL sendiri (proxy lokal)
-    const skin = p === 'openrouter' || p === 'deepseek' || proxy
+    const p = prov.value // 'claude' | 'deepseek' | 'dzax' | 'openrouter' | 'custom' | 'cursor'
+    // dzax memakai base URL sendiri (gateway), tapi BUKAN proxy lokal buatan user.
+    const proxy = p === 'custom' || p === 'cursor'
+    const ownUrl = proxy || p === 'dzax'
+    const skin = p === 'openrouter' || p === 'deepseek' || p === 'dzax' || proxy
     token.placeholder =
-      p === 'deepseek'
+      p === 'dzax'
+        ? 'API key gateway (mis. ctg_… DZAX, sk_live_…, sk-…)'
+        : p === 'deepseek'
         ? 'DeepSeek API key (sk-…) — ambil di platform.deepseek.com'
         : p === 'openrouter'
         ? 'OpenRouter API key (sk-or-v1-…)'
@@ -2436,26 +2735,39 @@ function renderAccountsPanel(): void {
           : p === 'custom'
             ? 'Token proxy (ANTHROPIC_AUTH_TOKEN) — isi apa saja bila proxy tak memeriksa'
             : 'CLAUDE_CODE_OAUTH_TOKEN (sk-ant-oat01-…)'
-    baseUrl.style.display = proxy ? 'block' : 'none'
+    baseUrl.style.display = ownUrl ? 'block' : 'none'
     // Prefill base URL saat kosong ATAU masih salah satu default bawaan → ganti provider ganti default,
     // tapi URL yang sudah user-ketik tetap dipertahankan.
-    const knownDefaults: string[] = [CUSTOM_BASE_URL_DEFAULT, CURSOR_BASE_URL_DEFAULT]
-    if (proxy && (!baseUrl.value || knownDefaults.includes(baseUrl.value))) {
-      baseUrl.value = p === 'cursor' ? CURSOR_BASE_URL_DEFAULT : CUSTOM_BASE_URL_DEFAULT
+    const knownDefaults: string[] = [CUSTOM_BASE_URL_DEFAULT, CURSOR_BASE_URL_DEFAULT, DZAX_BASE_URL_DEFAULT]
+    if (ownUrl && (!baseUrl.value || knownDefaults.includes(baseUrl.value))) {
+      baseUrl.value =
+        p === 'dzax' ? DZAX_BASE_URL_DEFAULT : p === 'cursor' ? CURSOR_BASE_URL_DEFAULT : CUSTOM_BASE_URL_DEFAULT
     }
     // DeepSeek punya daftar model TERTUTUP → dropdown sendiri; provider skin lain tetap ketik-bebas.
     dsModel.style.display = p === 'deepseek' ? 'block' : 'none'
     orModel.style.display = skin && p !== 'deepseek' ? 'block' : 'none'
     orModel.placeholder =
-      p === 'cursor'
+      p === 'dzax'
+        ? 'Nama model persis dari GET <base>/v1/models, mis. claude-sonnet-5 atau gl/glm-5.2'
+        : p === 'cursor'
         ? 'Nama model Cursor, mis. claude-3.5-sonnet'
         : p === 'custom'
           ? 'Nama model yg dikenal proxy, mis. gemini-2.5-flash'
           : 'Model OpenRouter, mis. nvidia/nemotron-3-super-120b-a12b:free'
-    fillDatalist(p === 'cursor' ? cursorSuggest : p === 'custom' ? customSuggest : (orLive ?? orSuggest))
+    fillDatalist(
+      p === 'dzax'
+        ? dzaxSuggest
+        : p === 'cursor'
+          ? cursorSuggest
+          : p === 'custom'
+            ? customSuggest
+            : (orLive ?? orSuggest)
+    )
     plan.style.display = skin ? 'none' : 'block'
     hint.textContent =
-      p === 'deepseek'
+      p === 'dzax'
+        ? '🌉 Untuk endpoint APA PUN yang berformat OpenAI (chat/completions) — DZAX/Belo Store, gateway pribadi, endpoint raw. Grove menjalankan JEMBATAN penerjemah lokal sendiri, jadi tak perlu proxy tambahan. Base URL = alamat sampai /v1 SAJA (tanpa /chat/completions). Model = nama PERSIS dari GET <base>/models; kalau salah, gateway biasanya membalas daftar model yang diizinkan. Diuji jalan di Grove: chat, streaming, dan tool-call. Kuota gaya Claude tak berlaku di sini.'
+        : p === 'deepseek'
         ? '🚀 Langsung ke endpoint Anthropic RESMI DeepSeek (https://api.deepseek.com/anthropic) — TANPA proxy lokal: cukup API key. Streaming, tool, & reasoning sudah diuji jalan di Grove. Pilih modelnya di dropdown: deepseek-v4-pro (paling pintar, ~1jt konteks) atau deepseek-v4-flash (lebih cepat & hemat) — bisa diganti per-sesi lewat klik-kanan kartu sesi. Kuota gaya Claude tak berlaku — yang berlaku saldo & rate-limit DeepSeek.'
         : p === 'openrouter'
         ? '⚠️ OpenRouter hanya MENJAMIN Claude Code untuk model Anthropic. Model lain (mis. Nemotron) bisa saja tak patuh protokol tool Grove — uji dulu di satu sesi sebelum diandalkan. Kuota gaya Claude tak berlaku (auto-switch/ambang diabaikan).'
@@ -2471,17 +2783,19 @@ function renderAccountsPanel(): void {
   add.addEventListener('click', () => {
     const l = label.value.trim()
     const t = token.value.trim()
-    const provider = prov.value as 'claude' | 'openrouter' | 'custom' | 'cursor' | 'deepseek'
+    const provider = prov.value as 'claude' | 'openrouter' | 'custom' | 'cursor' | 'deepseek' | 'dzax'
     const proxy = provider === 'custom' || provider === 'cursor'
-    const skin = provider === 'openrouter' || provider === 'deepseek' || proxy
+    const ownUrl = proxy || provider === 'dzax'
+    const skin = provider === 'openrouter' || provider === 'deepseek' || provider === 'dzax' || proxy
     const p = !skin && Number(plan.value) > 0 ? Number(plan.value) : undefined
     // DeepSeek: dari dropdown (pro/flash), selalu terisi. Skin lain: ketik bebas.
     const m = provider === 'deepseek' ? dsModel.value || DEEPSEEK_MODEL_DEFAULT : skin ? orModel.value.trim() : undefined
-    const url = proxy ? baseUrl.value.trim() : undefined
+    const url = ownUrl ? baseUrl.value.trim() || (provider === 'dzax' ? DZAX_BASE_URL_DEFAULT : '') : undefined
     if (!l || !t) return alert('Isi label & token/key dulu.')
     if (provider === 'openrouter' && !m) return alert('Isi id model OpenRouter (mis. nvidia/nemotron-3-super-120b-a12b:free).')
     if (provider === 'cursor' && !m) return alert('Isi nama model Cursor yang dikenal proxy (mis. claude-3.5-sonnet).')
     if (provider === 'custom' && !m) return alert('Isi nama model yang dikenal proxy (mis. gemini-2.5-flash).')
+    if (provider === 'dzax' && !m) return alert('Isi model DZAX sesuai family key-mu (mis. gl/glm-5.2 atau kr/claude-sonnet-5).')
     if (proxy && !url) return alert('Isi base URL proxy (mis. http://localhost:3000).')
     void window.grove
       .addAccount(l, t, p, undefined, provider, m, url)
@@ -2783,7 +3097,49 @@ function buildFormatterSection(sec: HTMLElement): void {
 
 // ---- events ----------------------------------------------------------------
 
+/**
+ * PROBE PERFORMA — supaya "UI berat" bisa DIBUKTIKAN dari app yang benar-benar kamu pakai, bukan
+ * ditebak dari harness. Ia mencatat "long task" (blok >50ms di thread UI, itulah yang terasa sebagai
+ * macet) beserta pekerjaan terakhir yang sedang dilakukan, plus jumlah event per kanal.
+ *
+ * Cara pakai: View → Toggle Developer Tools → ketik `grovePerf()`. Nyaris nol biaya saat diam
+ * (PerformanceObserver hanya dipanggil ketika memang ada task panjang).
+ */
+const perfStats = {
+  longTasks: 0,
+  worstMs: 0,
+  recent: [] as Array<{ jam: string; ms: number; saat: string }>,
+  events: new Map<string, number>()
+}
+let perfNote = 'idle'
+if (typeof PerformanceObserver !== 'undefined') {
+  try {
+    new PerformanceObserver((list) => {
+      for (const e of list.getEntries()) {
+        if (e.duration < 50) continue
+        perfStats.longTasks++
+        perfStats.worstMs = Math.max(perfStats.worstMs, Math.round(e.duration))
+        perfStats.recent.push({ jam: new Date().toLocaleTimeString(), ms: Math.round(e.duration), saat: perfNote })
+        if (perfStats.recent.length > 25) perfStats.recent.shift()
+      }
+    }).observe({ entryTypes: ['longtask'] })
+  } catch {
+    /* browser tanpa longtask API → probe diam saja */
+  }
+}
+;(window as unknown as { grovePerf: () => unknown }).grovePerf = () => ({
+  taskPanjang: perfStats.longTasks,
+  terburukMs: perfStats.worstMs,
+  terakhir: perfStats.recent,
+  eventPerKanal: Object.fromEntries(perfStats.events),
+  pesanDiChat: document.getElementById('chat-log')?.childElementCount ?? 0,
+  barisLog: document.getElementById('log-tree')?.childElementCount ?? 0,
+  totalNodeDom: document.getElementsByTagName('*').length
+})
+
 function onEvent(ev: GroveEvent): void {
+  perfStats.events.set(ev.channel, (perfStats.events.get(ev.channel) ?? 0) + 1)
+  perfNote = ev.channel // dicatat probe: kanal apa yang sedang diproses saat UI membeku
   switch (ev.channel) {
     case 'session:new': {
       const { ctxPercent, ...meta } = ev.payload
@@ -3230,6 +3586,7 @@ async function init(): Promise<void> {
       }
       try {
         await window.grove.sendChat(targetId, refBlock + text, images)
+        rememberSent(targetId, { text, sent: refBlock + text, images, refs })
       } catch (err) {
         // Sesi target ternyata sudah tak ada (race dgn hapus) → buat chat baru & kirim ulang sekali.
         if (String(err).includes('tidak ditemukan')) {
@@ -3299,6 +3656,28 @@ async function init(): Promise<void> {
     }
     if (handled) e.preventDefault() // jangan tempel teks path
   })
+
+  // Auto-scroll berhenti saat kamu menggulir ke atas, nyala lagi saat kembali ke dasar.
+  $('chat-log').addEventListener('scroll', syncChatScrollState, { passive: true })
+  $('chat-jump').addEventListener('click', () => {
+    scrollChatToBottom(true)
+    $<HTMLInputElement>('chat-input').focus()
+  })
+
+  // ESC = BATALKAN PESAN TERAKHIR & kembalikan ke kolom ketik (teks + gambar + referensi).
+  // Ditangani di fase CAPTURE supaya tetap jalan saat fokus ada di kolom ketik, tapi mengalah pada
+  // dua pemakaian Esc yang sudah ada: navigasi riwayat prompt (↑) dan menu klik-kanan.
+  window.addEventListener(
+    'keydown',
+    (e) => {
+      if (e.key !== 'Escape' || e.defaultPrevented) return
+      if (histIdx >= 0) return // Esc sedang dipakai membatalkan navigasi riwayat
+      if (document.querySelector('.ctx-menu') || document.querySelector('.modal-back')) return
+      if (!activeId) return
+      void cancelLastMessage(activeId)
+    },
+    true
+  )
 
   // Ketik di mana saja → langsung masuk kolom chat.
   window.addEventListener('keydown', (e) => {

@@ -17,7 +17,8 @@ import type { Board } from './db'
 import { buildGroveServer, type GroveHost } from './mcpTools'
 import { contextPercent, contextWindowFor } from './contextWindows'
 import { groveAppend, GROVE_REFERENCE } from './prompts'
-import { compactThresholds } from './wakePolicy'
+import { compactDecision, compactThresholds } from './wakePolicy'
+import { handoverRel } from './handover'
 
 /**
  * Path claude.exe untuk app TERPAKET. Di dalam paket, SDK menunjuk binary yang berada
@@ -203,6 +204,19 @@ function isLimitNotice(text: string): boolean {
  *  - limit langganan (429/quota/"limit reached") → itu urusan isLimitError/onLimitHit.
  *  - error FATAL (401/403 auth, 404 model tak ada) → retry percuma, harus diberitahu ke user.
  */
+/**
+ * Sesi SDK yang dirujuk sudah tak ada di folder project ini.
+ *
+ * Claude Code menyimpan transkrip PER FOLDER PROJECT. Kalau id sesi milik folder A dipakai untuk
+ * resume di folder B, CLI membalas "No conversation found with session ID: …" dan sesi jadi buntu
+ * total. Penyebab yang sudah diperbaiki: kolom cwd tak ikut tersimpan saat folder sesi dipindah
+ * (lihat db.upsertSession). Deteksi ini tetap dipertahankan sebagai jaring pengaman — id sesi juga
+ * bisa hilang karena transkripnya dihapus/dibersihkan di luar Grove.
+ */
+export function isStaleSdkSession(raw: string): boolean {
+  return /no conversation found with session id/i.test(raw)
+}
+
 export function isTransientError(raw: string): boolean {
   if (/\b(401|403|404)\b|unauthorized|forbidden|not\s*found|invalid.?api.?key|no\s+access/i.test(raw)) return false
   return /ECONNRESET|ETIMEDOUT|ECONNREFUSED|EPIPE|ENOTFOUND|EAI_AGAIN|socket hang up|connection (was )?(lost|reset|closed|error)|network error|fetch failed|premature close|provider_unavailable|\b(502|503|504|529)\b|bad gateway|service unavailable|gateway time|overloaded/i.test(
@@ -392,12 +406,20 @@ export class Session {
   private limitHitPending = false // limit pemakaian terdeteksi → auto-switch akun di akhir turn
   private limitStreak = 0 // pindah akun beruntun akibat limit tanpa turn sukses (guard anti-loop)
   private transientPending = false // error koneksi transient (ECONNRESET/5xx) → auto-retry di akhir turn
+  private staleSessionPending = false // id sesi SDK tak dikenali di folder ini → mulai sesi bersih & ulangi
   private transientSeen = false // teks asisten menyebut error koneksi transient pada turn ini
   private transientRetries = 0 // retry transient beruntun tanpa turn sukses (guard anti-loop; reset saat sukses)
   private retryTimer: NodeJS.Timeout | null = null // timer backoff auto-retry (di-clear saat stop)
   private compactArmed = true // auto-compact hanya menyala bila konteks NYATA pernah turun < LOW (hysteresis anti-thrash)
   private compactStreak = 0 // compact beruntun tanpa turn yang berakhir < LOW (guard anti-freeze; lihat limitStreak)
   private compactWarned = false // peringatan "konteks tetap penuh" sudah dikirim untuk streak ini (anti-spam)
+  private lastCompactAt = 0 // kapan konteks terakhir dipadatkan (penentu "checkpoint model masih segar?")
+  private checkpointNudge = false // ctx lewat ambang pra-compact → giliran berikutnya minta model update handover
+  /** File yang sesi ini TULIS/EDIT (jejak tool_use, bukan tebakan) → bahan "Files Changed" handover. */
+  private readonly filesTouched = new Set<string>()
+  /** File yang sudah DIBACA & pencarian yang sudah DIJALANKAN → agar sesudah compact tak diulang. */
+  private readonly filesRead = new Set<string>()
+  private readonly searches = new Set<string>()
   // --- jaminan runtime "worker selesai → parent tahu" (lihat host.notifyTurnEnd) ---
   private lastAssistantText = '' // teks asisten TERAKHIR pada turn berjalan = hasil kerja worker
   private turnText = '' // AKUMULASI semua blok teks asisten pada turn ini = hasil PENUH utk handoff ke parent
@@ -409,6 +431,8 @@ export class Session {
   private deltaBuf = ''
   private deltaTimer: NodeJS.Timeout | null = null
   private lastCtxPersist = 0 // B3: kapan terakhir ctx/usage ditulis ke DB (throttle persist)
+  /** Token yang SUDAH tercatat pada turn berjalan — pembanding untuk rekonsiliasi di akhir turn. */
+  private turnUsage = { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 }
   private lastUsageMsgId: string | null = null // id respons API terakhir yang usage-nya sudah dicatat (anti hitung-ganda)
   // Pesan user yang DITAHAN karena turn masih berjalan → masih bisa diedit/dibatalkan user.
   private queued: Array<{ qid: number; text: string; images?: ImageAttachment[] }> = []
@@ -427,6 +451,26 @@ export class Session {
 
   getHistory(): ChatMessage[] {
     return this.history
+  }
+
+  /** Jejak file yang ditulis/diedit sesi ini (urut kemunculan) — dipakai menyusun handover. */
+  getFilesTouched(): string[] {
+    return [...this.filesTouched]
+  }
+
+  /** File yang sudah dibaca sesi ini — supaya sesi lanjutan tak membaca ulang setelah compact. */
+  getFilesRead(): string[] {
+    return [...this.filesRead]
+  }
+
+  /** Pencarian (Grep/Glob) yang sudah dijalankan — supaya tak diulang setelah compact. */
+  getSearches(): string[] {
+    return [...this.searches]
+  }
+
+  /** Kapan konteks sesi ini terakhir dipadatkan (0 = belum pernah). Penentu kesegaran handover. */
+  getLastCompactAt(): number {
+    return this.lastCompactAt
   }
 
   /** Mulai query berumur panjang (lazy). Bila meta.sdkSessionId ada → resume (lanjut konteks). */
@@ -490,9 +534,12 @@ export class Session {
           type: 'preset',
           preset: 'claude_code',
           // Instruksi referensi hanya ikut bila sesi ini memang punya tautan → sesi biasa tak membayarnya.
+          // Path checkpoint DIPERSONALISASI per sesi (.grove/checkpoint-<id>.md): root & semua
+          // sub-worker berbagi cwd, jadi satu nama file bersama pasti saling menimpa.
           append: lite
             ? ''
-            : groveAppend(this.meta.role) + (this.host.hasReferences(this.meta.id) ? `\n\n${GROVE_REFERENCE}` : ''),
+            : groveAppend(this.meta.role, handoverRel(this.meta.id)) +
+              (this.host.hasReferences(this.meta.id) ? `\n\n${GROVE_REFERENCE}` : ''),
           // CATATAN (diverifikasi di sdk.d.ts:1943-1947): opsi ini TIDAK membuang apa pun. Ia hanya
           // MEMINDAHKAN seksi dinamis (working-dir, auto-memory, git-status) keluar dari system
           // prompt lalu menyuntikkannya kembali sebagai pesan user PERTAMA — tujuannya agar prefix
@@ -543,8 +590,16 @@ export class Session {
   compactWith(summary: string): void {
     if (!summary) return
     this.flushDelta() // B2: keluarkan sisa token & batalkan timer sebelum konteks dipotong
+    // HANDOVER DULU, baru konteks dilepas: pastikan ada file .md di working directory yang memuat
+    // detail kerja (checkpoint tulisan model bila masih segar, kalau tidak versi Grove). Ringkasan
+    // board saja terlalu miskin untuk melanjutkan pekerjaan nyata.
+    const handover = this.host.beforeCompact(this.meta.id, summary)
+    this.lastCompactAt = Date.now()
+    this.checkpointNudge = false // konteks sudah dipotong → nudge lama tak relevan
     this.interrupting = true // turn dipotong paksa → jangan dianggap "worker selesai"
-    this.reseedText = summary
+    this.reseedText = handover
+      ? `${summary}\n\nHANDOVER: file \`${handover}\` di working directory berisi konteks detail (file yang sudah dibaca/diubah, pencarian yang sudah dijalankan, keputusan, langkah berikutnya). BACA file itu SEBELUM mulai bekerja. JANGAN mengulang pencarian atau pembacaan yang sudah tercatat di sana — lanjutkan dari temuannya; perbarui file yang sama saat ada kemajuan berarti.`
+      : summary
     this.meta.sdkSessionId = undefined // start berikutnya FRESH (tanpa resume) → konteks lama dilepas
     this.resetCtx() // ctx% turun ke 0 seketika
     this.compactArmed = false // jangan auto-compact lagi sampai konteks NYATA turun < LOW (anti-thrash)
@@ -553,14 +608,12 @@ export class Session {
     this.started = false
     const q = this.q
     this.q = null
-    try {
-      void q?.interrupt?.()
-    } catch {
-      /* abaikan */
-    }
+    this.disposeQuery(q) // interrupt SAJA meninggalkan proses CLI hidup (lihat disposeQuery)
     this.record({
       role: 'system',
-      text: '⟲ Konteks dipadatkan (compact). Ringkasan tugas disimpan ke Memori — pesan berikutnya melanjutkan dari ringkasan.',
+      text: handover
+        ? `⟲ Konteks dipadatkan (compact). Ringkasan disimpan ke Memori & handover ditulis ke \`${handover}\` — pesan berikutnya melanjutkan dari ringkasan + file itu.`
+        : '⚠️ Konteks dipadatkan (compact), TAPI file handover gagal ditulis (folder tak bisa ditulisi?) — sesi hanya melanjutkan dari ringkasan papan.',
       ts: Date.now()
     })
     this.setStatus('idle')
@@ -586,15 +639,19 @@ export class Session {
     this.compactArmed = true // konteks fresh → auto-compact boleh menyala lagi nanti
     this.compactStreak = 0
     this.compactWarned = false
+    this.checkpointNudge = false
+    this.filesTouched.clear() // topik baru → jejak file topik lama jangan ikut ke handover berikutnya
+    this.filesRead.clear()
+    this.searches.clear()
+    // Checkpoint yang ada di disk milik TOPIK LAMA. Ditandai basi (bukan dihapus: isinya masih
+    // diselamatkan sebagai kutipan) supaya compact berikutnya menulis ulang untuk topik baru ini.
+    this.lastCompactAt = Date.now()
     this.db.upsertSession(this.meta)
     this.started = false
     const q = this.q
     this.q = null
-    try {
-      void q?.interrupt?.() // hentikan query long-lived lama (juga cegah interleave bila worker masih running)
-    } catch {
-      /* abaikan */
-    }
+    // hentikan query long-lived lama SAMPAI prosesnya mati (cegah interleave + kebocoran proses)
+    this.disposeQuery(q)
     this.inbox.clearQueue() // buang pesan topik lama yang masih ter-antri
     this.toolRows.clear() // korelasi tool_use lama tak relevan lagi
     this.history.length = 0 // bersihkan riwayat in-memory (row DB/UI tetap ada)
@@ -616,6 +673,28 @@ export class Session {
   }
 
   /**
+   * Dekorasi pesan keluar: reseed pasca-compact + NUDGE handover pra-compact.
+   *
+   * Nudge sengaja MENUMPANG giliran yang memang akan terjadi (bukan giliran tersendiri): konteks
+   * sudah dekat ambang, jadi satu giliran khusus untuk "tolong tulis checkpoint" berarti membayar
+   * ulang seluruh konteks besar itu hanya untuk sebuah file. Kalau model mengabaikannya, Grove
+   * tetap menulis versi deterministiknya sendiri saat compact — itulah sisi kedua strategi hibrida.
+   * Sesi LITE dilewati: ia memang dibeli untuk murah, dan jaring pengaman Grove sudah menutupinya.
+   */
+  private decorate(text: string, noNudge = false): string {
+    const t = this.withReseed(text)
+    if (noNudge || !this.checkpointNudge || this.meta.lite) return t
+    this.checkpointNudge = false
+    const pct = contextPercent(this.meta.ctxInput, this.meta.ctxWindow)
+    return (
+      `[GROVE] Konteks sesi ini sudah ${pct}% penuh dan akan segera DIPADATKAN (compact) — riwayat percakapan akan hilang. ` +
+      `SEBELUM mengerjakan permintaan di bawah, perbarui file handover-mu \`${handoverRel(this.meta.id)}\` ` +
+      `(Goal / Files Changed / Key Decisions / Current State / Next Steps, di bawah 2k karakter) supaya pekerjaan ini bisa dilanjutkan setelah compact. ` +
+      `Lakukan itu di giliran yang sama, jangan jadi balasan terpisah.\n\n---\n${t}`
+    )
+  }
+
+  /**
    * Awal satu giliran baru → reset pelacak laporan-final. Dipanggil di SETIAP jalur yang
    * mendorong pekerjaan baru (pesan user, tugas dari orkestrator, auto-check, resume).
    */
@@ -631,6 +710,7 @@ export class Session {
     this.lastCtxPersist = 0 // B3: giliran baru → usage pertama turn ini dipersist segera (angka ctx fresh)
     this.setAwaitingInput(false) // kerja baru masuk (user/parent menindak) → matikan kedip kuning
     this.doneMarked = false // ada tugas baru → tak lagi "tuntas" (status balik running/idle)
+    this.turnUsage = { input: 0, cacheRead: 0, cacheCreation: 0, output: 0 } // hitungan token turn baru
   }
 
   /** Dipanggil host saat worker memanggil report_to_parent dgn percent 100 → auto-report jangan dobel. */
@@ -716,7 +796,7 @@ export class Session {
     this.apiRetries = 0 // prompt baru → reset hitungan recycle
     this.limitStreak = 0 // prompt user baru → reset rantai pindah-akun akibat limit
     this.setApiStopped(false)
-    text = this.withReseed(text)
+    text = this.decorate(text)
     if (!this.started) {
       this.start()
       // start() dibatalkan (mis. akun tanpa token → cegah salah-billing): simpan pesan user supaya
@@ -749,10 +829,12 @@ export class Session {
    * Masuk konteks SDK sebagai giliran user, TAPI tidak direkam ke chat/DB agar UI tetap bersih —
    * yang tampil ke user cukup BALASAN root-nya. Start bila dormant (resume, konteks nyambung).
    */
-  injectAutoTask(text: string): void {
+  injectAutoTask(text: string, opts?: { noNudge?: boolean }): void {
     if (this.stopped) return
     this.beginTurn()
-    text = this.withReseed(text)
+    // noNudge: ping cache-warm menuntut balasan SATU KATA tanpa tool — menempelkan permintaan
+    // "tulis file handover" di situ hanya membuat instruksinya bertabrakan.
+    text = this.decorate(text, opts?.noNudge)
     if (!this.started) {
       this.start()
       if (!this.started) return // start dibatalkan (akun tanpa token) → jangan tandai running
@@ -777,7 +859,10 @@ export class Session {
   cacheWarm(): void {
     if (this.stopped) return
     this.record({ role: 'system', text: '🔄 Cache prefix di-refresh', ts: Date.now() })
-    this.injectAutoTask('[GROVE CACHE-WARM] Prefix cache refresh. Reply with exactly one word: OK — no tools, no analysis, no other text.')
+    this.injectAutoTask(
+      '[GROVE CACHE-WARM] Prefix cache refresh. Reply with exactly one word: OK — no tools, no analysis, no other text.',
+      { noNudge: true }
+    )
   }
 
   /** Saat app dibuka lagi: sesi yang tadinya kerja → resume konteks & dorong lanjut. */
@@ -824,6 +909,39 @@ export class Session {
     this.emit({ channel: 'chat:delta', payload: { id: this.meta.id, delta } })
   }
 
+  /**
+   * Catat file yang BENAR-BENAR ditulis/diedit (dari input tool_use). Jejak ini yang mengisi bagian
+   * "Files Changed" pada handover Grove — jauh lebih tepat daripada menebaknya dari teks percakapan.
+   * Dibatasi 60 entri terakhir supaya sesi panjang tak menumpuk memori.
+   */
+  private noteFileTouched(name?: string, input?: unknown): void {
+    if (!name) return
+    const i = (input ?? {}) as Record<string, unknown>
+    const add = (set: Set<string>, v: unknown, cap: number): void => {
+      if (typeof v !== 'string' || !v || set.has(v)) return
+      if (set.size >= cap) set.delete(set.values().next().value as string)
+      set.add(v)
+    }
+    if (['Edit', 'Write', 'MultiEdit', 'NotebookEdit'].includes(name)) {
+      add(this.filesTouched, i.file_path ?? i.path ?? i.notebook_path, 60)
+      return
+    }
+    // JEJAK PENJELAJAHAN — alasan kenapa ini dicatat: sesudah compact, transkrip hilang dan model
+    // TIDAK ingat apa yang sudah ia cari, jadi ia meng-Grep pola yang sama berulang-ulang di folder
+    // yang sama (terlihat jelas di panel LOG). Menuliskannya ke handover membuat sesi lanjutan tahu
+    // apa yang SUDAH dijelajahi, jadi ia melanjutkan alih-alih mengulang dari nol.
+    if (name === 'Read') add(this.filesRead, i.file_path ?? i.path, 40)
+    else if (name === 'Grep') {
+      const pat = typeof i.pattern === 'string' ? i.pattern : ''
+      const where = typeof i.path === 'string' ? ` in ${i.path}` : ''
+      add(this.searches, pat ? `Grep ${pat}${where}` : '', 30)
+    } else if (name === 'Glob') {
+      const pat = typeof i.pattern === 'string' ? i.pattern : ''
+      const where = typeof i.path === 'string' ? ` in ${i.path}` : ''
+      add(this.searches, pat ? `Glob ${pat}${where}` : '', 30)
+    }
+  }
+
   /** Simpan ke riwayat in-memory + DB + kirim ke UI. Kembalikan rowid DB. (Gambar tak dipersist.) */
   private record(m: ChatMessage): number {
     this.history.push(m)
@@ -833,6 +951,35 @@ export class Session {
     return rowId
   }
 
+  /**
+   * BUANG query lama SAMPAI PROSESNYA MATI.
+   *
+   * DIUKUR (test/proc-leak.ts, bukan dugaan): `interrupt()` hanya menghentikan GILIRAN — pada mode
+   * streaming-input subprocess CLI tetap hidup menunggu input berikutnya. Proses anak yang terhitung:
+   *   query hidup → +2 (claude.exe + conhost.exe) · setelah interrupt() → TETAP 2 · setelah return() → 0.
+   * Karena Grove mengganti query pada compact, ganti akun/model, reset worker, dan recycle blokir API,
+   * tiap kejadian itu dulu meninggalkan satu claude.exe ~200-250MB. Itulah "2 sesi tapi 7 proses
+   * Claude Code, RAM 2GB". `return()` mengakhiri async generator → SDK membereskan subprocess-nya.
+   *
+   * interrupt() TETAP dipanggil lebih dulu: ia menghentikan giliran yang sedang berjalan dengan rapi
+   * (dan pada CLI baru mengembalikan tanda terima), baru sesudahnya prosesnya ditutup.
+   */
+  private disposeQuery(q: ReturnType<typeof query> | null): void {
+    if (!q) return
+    void (async () => {
+      try {
+        await q.interrupt?.()
+      } catch {
+        /* query mungkin sudah mati — lanjut ke penutupan */
+      }
+      try {
+        await q.return?.(undefined as never)
+      } catch {
+        /* abaikan */
+      }
+    })()
+  }
+
   async stop(): Promise<void> {
     this.stopped = true
     if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null } // batalkan auto-retry yang tertunda
@@ -840,11 +987,9 @@ export class Session {
     this.interrupting = true // ditutup paksa → bukan "turn selesai wajar"
     this.setAwaitingInput(false) // sesi ditutup → kedip jangan nyangkut
     this.inbox.close()
-    try {
-      await this.q?.interrupt?.()
-    } catch {
-      /* abaikan */
-    }
+    const q = this.q
+    this.q = null
+    this.disposeQuery(q) // sesi ditutup → subprocess CLI ikut mati, bukan cuma turn-nya
     this.setStatus('done')
   }
 
@@ -886,7 +1031,8 @@ export class Session {
       // jadi jalur itu tetap jalan lewat cabang di bawah.
       if (this.interrupting || this.stopped) {
         /* disengaja — abaikan, jangan tandai error/transient/limit */
-      } else if (isApiBlock(raw)) this.apiBlockPending = true
+      } else if (isStaleSdkSession(raw)) this.staleSessionPending = true // transkrip lama tak ketemu → sesi bersih
+      else if (isApiBlock(raw)) this.apiBlockPending = true
       else if (isLimitError(raw)) this.limitHitPending = true // limit via exception → auto-switch (didahulukan)
       else if (isTransientError(raw) || this.transientSeen) this.transientPending = true // koneksi putus → auto-retry
       else {
@@ -899,6 +1045,11 @@ export class Session {
         this.setStatus('error')
       }
     } finally {
+      // JARING PENGAMAN PROSES: apa pun yang mengakhiri loop pesan (selesai, error, blokir API,
+      // limit), subprocess CLI-nya belum tentu mati — interrupt() terbukti meninggalkannya hidup.
+      // Membuangnya di sini menutup SEMUA jalur sekaligus, termasuk recycle blokir-API yang langsung
+      // start() query baru sesudahnya.
+      this.disposeQuery(myQ)
       // Reset state HANYA bila query yang berakhir ini MASIH query aktif sesi. resetForNewTask()/
       // compact/ganti-akun bisa SUDAH mengganti this.q dgn query BARU (start()-nya men-set
       // started=true & this.q=queryBaru). Tanpa guard ini, finally query LAMA meng-clobber
@@ -952,13 +1103,33 @@ export class Session {
     this.started = false
     const q = this.q
     this.q = null
-    try {
-      void q?.interrupt?.()
-    } catch {
-      /* abaikan */
-    }
+    this.disposeQuery(q) // interrupt SAJA meninggalkan proses CLI hidup (lihat disposeQuery)
     this.setStatus('idle')
     this.emitActivity('idle')
+  }
+
+  /**
+   * PULIHKAN sesi yang id SDK-nya tak dikenali di folder ini: lepas id lama (mulai percakapan bersih
+   * di folder sekarang) lalu ULANGI permintaan terakhir user. Tanpa ini, sesi terjebak — tiap pesan
+   * berikutnya gagal dengan error yang sama dan satu-satunya jalan keluar adalah Compact manual.
+   * Konteks percakapan lama memang hilang; itu konsekuensi jujur dari transkrip yang tak ditemukan.
+   */
+  private recoverStaleSession(): void {
+    this.meta.sdkSessionId = undefined
+    this.db.upsertSession(this.meta)
+    this.started = false
+    this.record({
+      role: 'system',
+      text:
+        '⟲ Percakapan lama tak ditemukan untuk folder kerja ini (biasanya karena folder sesi sempat berpindah). ' +
+        'Sesi dimulai bersih di folder sekarang dan permintaan terakhirmu diulang otomatis — konteks percakapan sebelumnya tidak terbawa.',
+      ts: Date.now()
+    })
+    if (this.lastUserPrompt) this.injectAutoTask(this.lastUserPrompt, { noNudge: true })
+    else {
+      this.setStatus('idle')
+      this.emitActivity('idle')
+    }
   }
 
   /** Blokir API terdeteksi → hentikan turn agar consume().finally menjalankan recycle. */
@@ -1436,6 +1607,7 @@ export class Session {
               detail: input,
               toolUseId: block.id
             })
+            this.noteFileTouched(block.name, block.input)
             if (block.id) this.toolRows.set(block.id, { rowId, input })
           }
         }
@@ -1464,8 +1636,10 @@ export class Session {
       }
       case 'result': {
         this.flushDelta() // B2: turn berakhir → keluarkan sisa token yang masih tertampung
+        this.reconcileTurnUsage(msg as { usage?: Record<string, number> })
         const r = msg as { subtype?: string; errors?: unknown[]; stop_reason?: string }
         const subtype = r.subtype
+        if (isStaleSdkSession(JSON.stringify(msg))) this.staleSessionPending = true
         if (isApiBlock(JSON.stringify(msg))) this.flagApiBlock() // blokir API terselip di result
         // Limit bisa muncul sbg result error (errors[]/stop_reason). JANGAN stringify seluruh msg
         // untuk isLimitError — field "usage"/"modelUsage" akan false-positive; cek yang spesifik saja.
@@ -1549,16 +1723,34 @@ export class Session {
         if (!this.transientPending && !this.apiBlockPending && !this.limitHitPending && !this.pendingCompactSeed) {
           this.flushQueued()
         }
+        // Id sesi SDK basi → mulai sesi bersih di folder SEKARANG lalu ulangi permintaan terakhir.
+        if (this.staleSessionPending && !this.stopped) {
+          this.staleSessionPending = false
+          this.recoverStaleSession()
+          break
+        }
         // Bila ada permintaan compact tertunda, padatkan konteks sekarang (turn sudah selesai).
         if (this.pendingCompactSeed) this.doCompact()
         else {
-          const pct = contextPercent(this.meta.ctxInput, this.meta.ctxWindow)
-          const { high, low } = compactThresholds(this.meta.role)
-          if (pct < low) {
+          // Keputusan (persen window ATAU plafon token) ada di wakePolicy.compactDecision — fungsi
+          // murni yang bisa diuji tanpa SDK, karena inilah jalur penentu biaya per giliran.
+          const d = compactDecision(this.meta.role, this.meta.ctxInput, this.meta.ctxWindow, this.compactArmed)
+          // Pra-compact: titipkan permintaan update handover ke giliran BERIKUTNYA (lihat decorate()).
+          if (d.nudge) this.checkpointNudge = true
+          if (d.relaxed) {
             // Turn berakhir lega → reset guard futility (compact sebelumnya benar memberi headroom).
             this.compactStreak = 0
             this.compactWarned = false
-          } else if (this.compactArmed && pct >= high) {
+          } else if (d.compact) {
+            if (d.byCeiling) {
+              // Persen masih terlihat lega (window besar) → katakan alasan sebenarnya, jangan bikin
+              // user mengira badge %-nya rusak.
+              this.record({
+                role: 'system',
+                text: `⟲ Konteks ${Math.round(this.meta.ctxInput / 1000)}k token melewati plafon biaya ${Math.round(compactThresholds(this.meta.role).ceiling / 1000)}k (badge % masih kecil karena window model ini besar). Dipadatkan supaya tiap panggilan tool berikutnya tak menagih ulang konteks sebesar itu.`,
+                ts: Date.now()
+              })
+            }
             if (this.compactStreak >= 2) {
               // Compact berulang tak menurunkan konteks → jangan loop; peringatkan SEKALI (anti-freeze + anti-spam).
               if (!this.compactWarned) {
@@ -1582,6 +1774,51 @@ export class Session {
     }
   }
 
+  /**
+   * REKONSILIASI TOKEN AKHIR-TURN — sumber kebenarannya pesan `result`, yang membawa TOTAL turn.
+   *
+   * Kenapa perlu: usage per-pesan tidak selalu lengkap. Untuk akun gateway (jembatan Anthropic→
+   * OpenAI), jumlah token keluaran baru diketahui gateway di chunk TERAKHIR, sementara protokol
+   * Anthropic menaruh usage pesan di awal — jadi `assistant.usage.output_tokens` selalu 0 dan
+   * riwayat pemakaian lokal mencatat 0 output selamanya (diprobe: assistant out=0 vs result out=54).
+   *
+   * Yang dicatat hanya SELISIHNYA terhadap yang sudah tercatat, jadi akun Claude — yang usage
+   * per-pesannya memang sudah benar — tidak terhitung dua kali (selisihnya nol).
+   */
+  private reconcileTurnUsage(msg: { usage?: Record<string, number> }): void {
+    const u = msg.usage
+    if (!u) return
+    // Sesi gateway: angka di `result` pun campuran (CLI menjumlahkan taksiran message_start dengan
+    // angka akhir). Untuk mereka, jembatan yang melaporkan angka nyata — jangan dicatat dua kali.
+    if (!this.host.perMessageUsageReliable(this.meta.id)) return
+    const total = {
+      input: u.input_tokens ?? 0,
+      cacheRead: u.cache_read_input_tokens ?? 0,
+      cacheCreation: u.cache_creation_input_tokens ?? 0,
+      output: u.output_tokens ?? 0
+    }
+    const missing = {
+      input: Math.max(0, total.input - this.turnUsage.input),
+      cacheRead: Math.max(0, total.cacheRead - this.turnUsage.cacheRead),
+      cacheCreation: Math.max(0, total.cacheCreation - this.turnUsage.cacheCreation),
+      output: Math.max(0, total.output - this.turnUsage.output)
+    }
+    if (!missing.input && !missing.cacheRead && !missing.cacheCreation && !missing.output) return
+    this.host.recordUsage(this.meta.id, missing)
+    this.turnUsage.input += missing.input
+    this.turnUsage.cacheRead += missing.cacheRead
+    this.turnUsage.cacheCreation += missing.cacheCreation
+    this.turnUsage.output += missing.output
+    if (missing.output) {
+      // Counter output di UI ikut dibetulkan (dulu diam di 0 untuk akun gateway).
+      this.tokensTotal += missing.output
+      this.emit({
+        channel: 'session:update',
+        payload: { id: this.meta.id, tokensTotal: this.tokensTotal, callUsage: missing }
+      })
+    }
+  }
+
   private applyUsage(usage?: Record<string, number>): void {
     if (!usage) return
     const ctxInput =
@@ -1590,14 +1827,25 @@ export class Session {
       (usage.cache_creation_input_tokens ?? 0)
     const ctxOutput = usage.output_tokens ?? 0
     if (ctxInput <= 0 && ctxOutput <= 0) return
-    // Catat pemakaian NYATA respons ini ke riwayat lokal (per jam/akun) → bisa dicek boros/normal.
-    this.host.recordUsage(this.meta.id, {
-      input: usage.input_tokens ?? 0,
-      cacheRead: usage.cache_read_input_tokens ?? 0,
-      cacheCreation: usage.cache_creation_input_tokens ?? 0,
-      output: ctxOutput
-    })
     this.lastApiActivity = Date.now()
+    // BIAYA: hanya dicatat bila angka per-pesan memang bisa dipercaya. Untuk akun gateway, angka
+    // per-pesan cuma taksiran jembatan (gateway melaporkan token sebenarnya di akhir turn) — kalau
+    // ikut dicatat, input tercatat berlipat. Angka aslinya masuk lewat reconcileTurnUsage().
+    if (this.host.perMessageUsageReliable(this.meta.id)) {
+      const rec = {
+        input: usage.input_tokens ?? 0,
+        cacheRead: usage.cache_read_input_tokens ?? 0,
+        cacheCreation: usage.cache_creation_input_tokens ?? 0,
+        output: ctxOutput
+      }
+      this.host.recordUsage(this.meta.id, rec)
+      this.turnUsage.input += rec.input
+      this.turnUsage.cacheRead += rec.cacheRead
+      this.turnUsage.cacheCreation += rec.cacheCreation
+      this.turnUsage.output += rec.output
+    }
+    // UKURAN KONTEKS (badge %, ambang compact) tetap diperbarui untuk SEMUA provider — untuk gateway
+    // ini taksiran, tapi taksiran ukuran jauh lebih berguna daripada 0 (tanpa itu auto-compact mati).
     this.meta.ctxInput = ctxInput
     this.meta.ctxOutput = ctxOutput
     this.tokensTotal += ctxOutput
@@ -1627,7 +1875,10 @@ export class Session {
         }
       }
     })
-    // Hysteresis: begitu konteks NYATA turun < LOW, persenjatai ulang auto-compact (boleh memicu lagi nanti).
-    if (contextPercent(ctxInput, this.meta.ctxWindow) < compactThresholds(this.meta.role).low) this.compactArmed = true
+    // Hysteresis: begitu konteks NYATA turun < LOW **dan** di bawah plafon token, persenjatai ulang
+    // auto-compact. Syarat plafon ikut di sini supaya pada window besar (persen selalu terlihat
+    // kecil) hysteresis tak langsung menyala lagi begitu selesai memadatkan.
+    const th = compactThresholds(this.meta.role)
+    if (contextPercent(ctxInput, this.meta.ctxWindow) < th.low && ctxInput < th.ceiling) this.compactArmed = true
   }
 }

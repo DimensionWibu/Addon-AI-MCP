@@ -1,6 +1,6 @@
 {
   "name": "grove",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Grove — orchestrator multi-agent Claude Code",
   "author": "Grove",
   "type": "module",
@@ -17,7 +17,17 @@
     "dist": "electron-vite build && electron-builder --win",
     "dist:dir": "electron-vite build && electron-builder --win --dir",
     "test:accounts": "esbuild test/account-resolution.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/acct.mjs && electron .tmp/acct.mjs",
-    "test:wake": "tsx test/wake-cost.ts && esbuild test/wake-integration.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/wake.mjs && electron .tmp/wake.mjs"
+    "test:wake": "tsx test/wake-cost.ts && esbuild test/wake-integration.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/wake.mjs && electron .tmp/wake.mjs",
+    "test:credit": "tsx test/credit-usage.ts",
+    "test:ctxcost": "tsx test/ctx-cost.ts",
+    "test:worker": "esbuild test/new-worker.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/nw.mjs && electron .tmp/nw.mjs",
+    "test:triple": "electron-vite build && esbuild test/triple-click.ts --bundle --platform=node --format=esm --external:electron --outfile=.tmp/tc.mjs && electron .tmp/tc.mjs",
+    "test:handover": "tsx test/handover.ts && esbuild test/handover-integration.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/hoi.mjs && electron .tmp/hoi.mjs",
+    "test:dzax": "tsx test/dzax-live.ts",
+    "test:leak": "tsx test/proc-leak.ts",
+    "test:typing": "electron-vite build && esbuild test/typing-perf.ts --bundle --platform=node --format=esm --external:electron --outfile=.tmp/perf.mjs && electron .tmp/perf.mjs",
+    "test:cwd": "esbuild test/cwd-persist.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/cwd.mjs && electron .tmp/cwd.mjs",
+    "test:lock": "tsx test/db-lock.ts"
   },
   "build": {
     "appId": "com.grove.orchestrator",

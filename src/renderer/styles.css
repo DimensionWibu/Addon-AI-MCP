@@ -377,8 +377,41 @@ body.reordering .node { cursor: grabbing; }
 .chat { min-width: 0; }
 #chat-head { display: flex; align-items: center; gap: 8px; }
 #chat-title { color: var(--accent); font-weight: 700; text-transform: none; letter-spacing: 0; }
-.chat-log { flex: 1; overflow: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
-.msg { max-width: 100%; align-self: stretch; white-space: pre-wrap; word-break: break-word; background: none; border-radius: 0; padding: 1px 0; }
+/* Pembungkus relatif → tombol "ke bawah" mengambang di atas log tanpa mengubah tata letaknya. */
+.chat-log-wrap { flex: 1; min-height: 0; position: relative; display: flex; }
+.chat-log {
+  flex: 1; overflow: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 6px;
+  /* Chrome "scroll anchoring" menggeser sendiri posisi gulir saat DOM tumbuh — pada log chat yang
+     terus bertambah, itu melawan kendali auto-scroll kita (pandangan melompat ke bawah padahal user
+     sedang membaca di atas). Gulir di sini diatur eksplisit oleh scrollChatToBottom(). */
+  overflow-anchor: none;
+  /* ISOLASI LAYOUT — penyebab kolom chat terasa berat. Tiap ketikan memanggil autoGrow() yang
+     MEMBACA scrollHeight textarea; pembacaan itu memaksa layout SINKRON, dan tanpa containment
+     browser menghitung ulang SELURUH chat-log (ratusan pesan + blok tool). Diukur di
+     test/typing-perf.ts: 400 pesan → 46 ms per ketikan. `contain` memutus rantai itu: isi chat-log
+     tak lagi ikut dihitung saat composer di-layout. */
+}
+.chat-jump {
+  position: absolute; right: 18px; bottom: 12px; z-index: 5; cursor: pointer;
+  background: var(--panel-2); color: var(--accent); border: 1px solid var(--accent);
+  border-radius: 14px; padding: 5px 12px; font-size: 11px; font-family: var(--mono);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+}
+.chat-jump:hover { background: var(--accent); color: #1a0f0a; }
+.chat-jump[hidden] { display: none; }
+.msg {
+  max-width: 100%; align-self: stretch; white-space: pre-wrap; word-break: break-word;
+  background: none; border-radius: 0; padding: 1px 0;
+  /* LEWATI LAYOUT PESAN DI LUAR LAYAR. Terukur (test/typing-perf.ts, 400 pesan): tanpa ini, SATU
+     ketikan di composer memaksa seluruh kolom chat di-layout ulang — 42 ms per ketikan, bahkan bila
+     JS tidak melakukan apa pun. Ini satu-satunya yang menghilangkan biaya itu.
+     KONSEKUENSINYA (pernah jadi bug): tinggi item yang belum dirender hanyalah TAKSIRAN, jadi
+     scrollHeight bergeser saat item benar-benar dirender → "gulir ke paling bawah" meleset. Itu
+     ditangani di scrollChatToBottom() yang MENGENDAPKAN posisi beberapa frame. Taksiran dibuat
+     realistis (80px ≈ tinggi pesan tipikal) supaya koreksinya kecil. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 80px;
+}
 .msg.user { color: var(--accent); font-weight: 600; }
 .msg.user::before { content: '❯ '; color: var(--accent); }
 .msg.assistant { color: var(--text); margin: 4px 0; }
@@ -496,6 +529,11 @@ form.editing-queue textarea { border-color: var(--accent); }
   padding: 10px 12px; border-radius: 3px; outline: none; resize: none;
   font: 13px/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere;
   min-height: 84px; max-height: 320px; overflow-y: auto;
+  /* Tinggi textarea diurus MESIN LAYOUT, bukan JS. Kombinasi terbaik yang terukur
+     (test/typing-perf.ts, 400 pesan markdown): field-sizing + content-visibility pada pesan →
+     16,65 ms/ketikan alias lantai vsync, kerja sinkron 0,06 ms. Tanpa content-visibility ia justru
+     buruk (44 ms), dan mengukur sendiri lewat JS juga lebih mahal (8 ms). Keduanya harus berpasangan. */
+  field-sizing: content;
 }
 .chat-form textarea::placeholder { color: #5a5a5a; }
 .chat-form textarea:focus { border-color: var(--accent); }
@@ -516,7 +554,8 @@ form.editing-queue textarea { border-color: var(--accent); }
 .logpanel-head:hover { color: var(--accent); }
 .logpanel-head .log-caret { color: var(--accent); font-size: 10px; width: 10px; }
 .logpanel-head .log-hint { margin-left: auto; text-transform: none; letter-spacing: 0; color: #5a5a5a; font-size: 10px; }
-.log-tree { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 6px 8px; display: flex; flex-direction: column; gap: 4px; }
+.log-tree {
+  contain: layout paint style; flex: 1 1 auto; min-height: 0; overflow: auto; padding: 6px 8px; display: flex; flex-direction: column; gap: 4px; }
 .log-tree[hidden] { display: none; }
 .log-turn { border-left: 2px solid var(--accent); background: var(--panel-2); border-radius: 3px; }
 .log-turn-head { display: flex; align-items: baseline; gap: 6px; padding: 5px 8px; cursor: pointer; }

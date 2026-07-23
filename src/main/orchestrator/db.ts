@@ -225,6 +225,13 @@ export class Board {
          ctx_input, ctx_output, ctx_window, order_index, account_id, lite, effort, created_at, updated_at)
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(id) DO UPDATE SET
+         -- cwd WAJIB ikut diperbarui: folder kerja BISA berubah (drop folder ke kartu sesi →
+         -- setSessionCwd). Dulu kolom ini tak ada di daftar UPDATE, jadi perubahan folder hanya
+         -- hidup di memori. Setelah restart, sesi kembali memakai folder LAMA sementara
+         -- sdk_session_id (yang ikut diperbarui) menunjuk percakapan milik folder BARU — Claude Code
+         -- menyimpan transkrip per folder project, jadi resume-nya gagal:
+         -- "No conversation found with session ID: …" dan sesi tak bisa dilanjut sama sekali.
+         cwd=excluded.cwd,
          sdk_session_id=excluded.sdk_session_id, title=excluded.title, model=excluded.model,
          status=excluded.status, ctx_input=excluded.ctx_input, ctx_output=excluded.ctx_output,
          ctx_window=excluded.ctx_window, order_index=excluded.order_index,
@@ -378,7 +385,9 @@ export class Board {
               ? ('cursor' as const)
               : r.provider === 'deepseek'
                 ? ('deepseek' as const)
-                : ('claude' as const),
+                : r.provider === 'dzax'
+                  ? ('dzax' as const)
+                  : ('claude' as const),
       model: r.or_model == null ? undefined : String(r.or_model),
       baseUrl: r.base_url == null ? undefined : String(r.base_url),
       createdAt: Number(r.created_at)

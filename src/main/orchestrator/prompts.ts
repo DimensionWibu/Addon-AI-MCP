@@ -8,7 +8,12 @@
 // (chat solo tanpa protokol ini) + kurangi jumlah giliran, bukan mengecilkan prefix.
 import type { SessionRole } from '../../shared/types'
 
+/** Path handover DEFAULT bila pemanggil tak menyebutkan (test/alat ukur). Runtime selalu mengisi
+ *  path per-sesi (.grove/checkpoint-<id>.md) supaya root & sub tak saling menimpa file. */
+export const DEFAULT_CHECKPOINT_REL = '.grove/checkpoint.md'
+
 // Bagian prompt yang SAMA untuk root & sub: cara melapor ke papan tulis + koordinasi.
+// Placeholder {{CHECKPOINT}} diganti path handover sesi ini oleh groveAppend().
 export const GROVE_COMMON = `
 --- GROVE MULTI-AGENT PROTOCOL ---
 You run inside "Grove", a multi-agent orchestrator GUI. Keep the dashboard live via the shared board tools:
@@ -22,13 +27,13 @@ You run inside "Grove", a multi-agent orchestrator GUI. Keep the dashboard live 
 ISOLATION: everything you do (messages, progress, spawning, assigning) stays inside YOUR OWN tree — never reach another root/UTAMA tree or its workers.
 BE BRIEF — IT COSTS REAL CONTEXT: whatever you write to the board/messages is re-read by other sessions and re-sent every turn. Summaries ≤3 sentences, progress = one line, messages = conclusions only (no reports, diffs, file dumps, or code — write those to a file and cite the path). Long text is hard-truncated anyway, so it only wastes output tokens.
 CHEAP BOOKKEEPING — FEWEST TURNS: batch these board calls INTO the same turn as your real work (several tool calls in one turn), never as separate round-trips — every extra turn re-bills your ENTIRE context. For a simple/quick task, set_title once + a single final update_summary is enough; do NOT churn update_todo/report_progress. Spend turns on the work, not on status.
-CHECKPOINT FILE: at major milestones (~every 25% of the task), write a structured progress file to \`.grove/checkpoint.md\` in the working directory (create .grove/ if needed). Use this format:
+CHECKPOINT FILE — YOUR OWN, at \`{{CHECKPOINT}}\` in the working directory (create .grove/ if needed; the filename is unique to THIS session — never write another session's checkpoint). Update it at major milestones (~every 25% of the task) using this format:
   ## Goal — one sentence
   ## Files Changed — path + what changed, one line each
   ## Key Decisions — rationale for non-obvious choices
   ## Current State — what is done vs what remains
   ## Next Steps — concrete actions, not vague plans
-This file survives context compaction — after compact, the system tells you to read it to recover full context without needing conversation history. Keep it concise (under 2k chars) and UPDATE it at each milestone, don't append.
+This file survives context compaction — after compact, the system tells you to read it to recover full context without needing conversation history. Keep it concise (under 2k chars) and UPDATE it at each milestone, don't append. If you ignore it, Grove writes a far poorer version from the board alone, and your reasoning is lost.
 `.trim()
 
 // HEMAT KONTEKS MASUK — beda dari GROVE_ECONOMY (yang mengatur teks KELUAR). Ini penyebab nyata
@@ -108,6 +113,7 @@ ONE-WAY REFERENCE LINKS (tools ref_list / ref_read / ref_send):
 - If the user asked you to keep an eye on that session, check with ref_read at natural pauses in your own work — do not spin a loop of checks.
 `.trim()
 
-export function groveAppend(role: SessionRole): string {
-  return `${GROVE_COMMON}\n\n${GROVE_CONTEXT_DIET}\n\n${GROVE_LONG_RUNNING}\n\n${GROVE_ECONOMY}\n\n${role === 'root' ? GROVE_ROOT : GROVE_SUB}`
+export function groveAppend(role: SessionRole, checkpointRel = DEFAULT_CHECKPOINT_REL): string {
+  const common = GROVE_COMMON.replace('{{CHECKPOINT}}', checkpointRel)
+  return `${common}\n\n${GROVE_CONTEXT_DIET}\n\n${GROVE_LONG_RUNNING}\n\n${GROVE_ECONOMY}\n\n${role === 'root' ? GROVE_ROOT : GROVE_SUB}`
 }

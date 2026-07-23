@@ -25,10 +25,14 @@ export interface WakeTuning {
   rootStatusDebounceMs: number
   /** Interval auto-check berkala "udah sampe mana?". */
   loopIntervalMs: number
-  /** Interval ping cache-warm setelah auto-check berhenti (harus < TTL cache 1 jam). */
+  /** Seberapa sering kondisi cache-warm DIPERIKSA (bukan seberapa sering ping dikirim). */
   cacheWarmIntervalMs: number
   /** Anggap cache prefix stale bila tak ada aktivitas API selama ini. */
   cacheWarmStaleMs: number
+  /** Ping cache-warm BERUNTUN maksimal tanpa aktivitas nyata; setelahnya berhenti total. */
+  cacheWarmMaxPings: number
+  /** Konteks di bawah ini tak layak dihangatkan (hematannya tak sepadan satu giliran). */
+  cacheWarmMinCtx: number
   /** Auto-check beruntun tanpa perubahan sebelum beralih ke mode cache-warm. */
   idleCheckLimit: number
   /** Batas panjang satu baris ringkasan board yang disuntik ke ping. */
@@ -45,8 +49,20 @@ export const WAKE: WakeTuning = {
   priorityMs: 800,
   rootStatusDebounceMs: 60_000,
   loopIntervalMs: 10 * 60_000,
-  cacheWarmIntervalMs: 45 * 60_000,
-  cacheWarmStaleMs: 50 * 60_000,
+  // BUG BIAYA YANG DIPERBAIKI (angka lama: cek 45 mnt + stale 50 mnt): syarat stale baru terpenuhi
+  // pada pemeriksaan BERIKUTNYA, jadi ping nyata terjadi tiap ~90 menit — melewati TTL cache 1 jam.
+  // Akibatnya tiap ping justru membayar CACHE CREATION (1,25× harga input) atas SELURUH konteks,
+  // lalu cache-nya mati lagi sebelum ping berikutnya: kebalikan dari tujuannya, dan berulang
+  // selamanya pada sesi yang menganggur. Sekarang: periksa tiap 15 mnt, ping saat diam ≥40 mnt →
+  // ping paling lambat di menit ke-55, masih DI DALAM TTL, jadi yang dibayar cache-read (0,1×).
+  cacheWarmIntervalMs: 15 * 60_000,
+  cacheWarmStaleMs: 40 * 60_000,
+  // Sesi yang benar-benar ditinggalkan tak boleh membakar kuota tanpa batas: setelah 4 ping beruntun
+  // tanpa aktivitas NYATA (≈3 jam), cache-warm berhenti total. Menghangatkan lebih lama tak pernah
+  // impas — sekali bayar cache-creation saat user kembali jauh lebih murah daripada menghangatkan
+  // konteks besar seharian. Jatah ini pulih begitu ada tugas baru (enableLoop).
+  cacheWarmMaxPings: 4,
+  cacheWarmMinCtx: 20_000,
   idleCheckLimit: 3,
   boardLineMaxChars: 160,
   boardMaxChars: 1200
@@ -55,6 +71,11 @@ export const WAKE: WakeTuning = {
 /**
  * Ambang auto-compact per ROLE (ctx%).
  * - high = picu compact; low = ambang re-arm (hysteresis anti-thrash).
+ * - nudge = ambang PRA-compact: sekali lewat sini, giliran BERIKUTNYA disisipi permintaan agar model
+ *   memperbarui file handover-nya (.grove/checkpoint-<id>.md) selagi konteksnya masih utuh. Sengaja
+ *   MENUMPANG giliran yang memang akan terjadi — bukan giliran tersendiri — jadi biayanya cuma teks
+ *   instruksi, bukan satu putaran penuh atas konteks yang sedang besar. Kalau model tak menurut,
+ *   Grove tetap menulis versi deterministiknya sendiri saat compact (lihat handover.ts).
  * - ROOT sengaja JAUH lebih rendah (70/50): root adalah pihak yang paling sering dibangunkan, jadi
  *   tiap persen konteksnya dikalikan banyak giliran. Root juga butuh HEADROOM — kalau ia baru
  *   dipadatkan di 88%, tiap ping sisa hidupnya ditagih ~88% window. Compact root TIDAK memakai
@@ -62,14 +83,63 @@ export const WAKE: WakeTuning = {
  *   memadatkan lebih awal nyaris gratis.
  * - SUB tetap 88/70: worker menyimpan detail kerja yang mahal kalau hilang, dan ia jarang
  *   dibangunkan ulang → tak sepadan memadatkannya lebih awal.
+ *
+ * `ceiling` = PLAFON TOKEN ABSOLUT, penjaga kedua di samping persentase. Persen saja tidak cukup
+ * karena BIAYA satu giliran ditentukan jumlah token, bukan rasio terhadap window: pada model
+ * berjendela 1 juta (DeepSeek v4, varian Claude [1m]) ambang 70% baru memicu compact di ~700k, dan
+ * SETIAP panggilan tool sesudahnya menagih ulang konteks sebesar itu — di akun langganan Claude
+ * inilah yang membuat kuota membengkak diam-diam. Angkanya sengaja DI ATAS ambang persen untuk
+ * window 200k (root 70% = 140k, sub 88% = 176k), jadi perilaku sesi Claude biasa tidak berubah
+ * sama sekali; plafon ini hanya menggigit pada window besar.
  */
-export const COMPACT: Record<SessionRole, { high: number; low: number }> = {
-  root: { high: 70, low: 50 },
-  sub: { high: 88, low: 70 }
+export const COMPACT: Record<SessionRole, { high: number; low: number; nudge: number; ceiling: number }> = {
+  root: { high: 70, low: 50, nudge: 58, ceiling: 150_000 },
+  sub: { high: 88, low: 70, nudge: 76, ceiling: 250_000 }
 }
 
-export function compactThresholds(role: SessionRole): { high: number; low: number } {
+export function compactThresholds(role: SessionRole): {
+  high: number
+  low: number
+  nudge: number
+  ceiling: number
+} {
   return COMPACT[role] ?? COMPACT.sub
+}
+
+/** Apa yang harus dilakukan pada akhir sebuah giliran, dilihat dari ukuran konteks. */
+export interface CompactDecision {
+  /** Konteks lega → reset guard "compact berulang tak menolong". */
+  relaxed: boolean
+  /** Titipkan permintaan update handover ke giliran berikutnya (pra-compact). */
+  nudge: boolean
+  /** Padatkan sekarang. */
+  compact: boolean
+  /** Pemicunya PLAFON TOKEN, bukan persen — dipakai menjelaskan ke user kenapa badge % masih kecil. */
+  byCeiling: boolean
+}
+
+/**
+ * Keputusan compact akhir-giliran. Fungsi MURNI (di sini, bukan di Session) supaya bisa diuji tanpa
+ * SDK — inilah jalur yang menentukan biaya: salah sedikit, tiap panggilan tool menagih ulang konteks
+ * raksasa. Dua pemicu, sengaja OR: persen window (menjaga sesi tak mentok) dan plafon token
+ * (menjaga biaya per giliran, satu-satunya yang relevan pada model berjendela 1 juta).
+ */
+export function compactDecision(
+  role: SessionRole,
+  ctxInput: number,
+  ctxWindow: number,
+  armed: boolean
+): CompactDecision {
+  const { high, low, nudge, ceiling } = compactThresholds(role)
+  const pct = ctxWindow > 0 ? (ctxInput / ctxWindow) * 100 : 0
+  const overCeiling = ctxInput >= ceiling
+  const full = pct >= high || overCeiling
+  return {
+    relaxed: pct < low && !overCeiling,
+    nudge: !full && (pct >= nudge || ctxInput >= ceiling * 0.85),
+    compact: armed && full,
+    byCeiling: overCeiling && pct < high
+  }
 }
 
 /** Satu baris laporan yang ikut menentukan "apakah ada info baru". */

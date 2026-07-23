@@ -20,15 +20,23 @@
 import { readFileSync, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import type { UsageInfo, UsageUnavailable, UsageWindow } from '../shared/types'
+import type { AccountProvider, CreditInfo, UsageInfo, UsageUnavailable, UsageWindow } from '../shared/types'
+import { isSkinProvider, OPENROUTER_BASE_URL } from '../shared/types'
+import { fetchDeepseekBalance } from './deepseek'
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
 
-/** Identitas akun untuk fetch. id null = login utama; selain itu token WAJIB dari DB. */
+/**
+ * Identitas akun untuk fetch. id null = login utama; selain itu token WAJIB dari DB.
+ * `provider` menentukan KE MANA angkanya ditanyakan: akun Claude → endpoint OAuth Anthropic;
+ * akun API-key → API provider itu sendiri (lihat fetchCreditUsage). Tanpa field ini semua akun
+ * ditembak ke Anthropic dan key OpenRouter/DeepSeek selalu balas 401.
+ */
 export interface UsageAccount {
   id: string | null
   token: string | null
+  provider?: AccountProvider
 }
 
 export interface UsageResult {
@@ -170,9 +178,118 @@ async function fetchUsageFromHeaders(token: string): Promise<UsageResult> {
   }
 }
 
+// ---- kuota akun API-key (skin provider) ------------------------------------
+// Jendela 5-jam/7-hari itu milik LANGGANAN Claude. Akun API-key punya bentuk kuota lain: kredit
+// (OpenRouter) atau saldo (DeepSeek). Keduanya dibaca dari API providernya sendiri, lalu
+// dinormalkan ke CreditInfo supaya panel & watchdog ambang bisa memakainya seperti biasa.
+
+const OR_KEY_URL = `${OPENROUTER_BASE_URL}/v1/key`
+const OR_CREDITS_URL = `${OPENROUTER_BASE_URL}/v1/credits`
+
+/** Bungkus CreditInfo jadi UsageInfo (jendela ala-Claude sengaja dibiarkan null — memang tak ada). */
+function creditUsage(credit: CreditInfo): UsageInfo {
+  return {
+    fiveHour: { utilization: null, resetsAt: null },
+    sevenDay: { utilization: null, resetsAt: null },
+    credit,
+    fetchedAt: credit.fetchedAt
+  }
+}
+
+const num = (v: unknown): number | null => {
+  const n = typeof v === 'string' ? Number(v) : typeof v === 'number' ? v : NaN
+  return Number.isFinite(n) ? n : null
+}
+
+/**
+ * OpenRouter: GET /v1/key (limit & usage KEY ini) + GET /v1/credits (saldo AKUN). Dua-duanya
+ * dipakai karena key free-tier sering `limit: null` — utilisasi baru bisa dihitung jujur dari
+ * kredit akun. Kalau dua-duanya tak memberi batas, utilization tetap null (bukan 0 palsu).
+ */
+async function fetchOpenRouterCredit(token: string): Promise<UsageResult> {
+  const headers = { Authorization: `Bearer ${token}` }
+  let keyRes: Response
+  try {
+    keyRes = await fetch(OR_KEY_URL, { headers })
+  } catch {
+    return { usage: null, reason: 'error' }
+  }
+  if (!keyRes.ok) return { usage: null, reason: reasonFor(keyRes.status) }
+  const d = ((await keyRes.json().catch(() => ({}))) as { data?: Record<string, unknown> }).data ?? {}
+  // Saldo akun: gagal/ditolak di sini TIDAK membatalkan hasil — data key sudah cukup untuk UI.
+  const cred = await fetch(OR_CREDITS_URL, { headers })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((j) => ((j as { data?: Record<string, unknown> } | null)?.data ?? null))
+    .catch(() => null)
+
+  const keyLimit = num(d.limit)
+  const keyUsed = num(d.usage)
+  const totalCredits = cred ? num(cred.total_credits) : null
+  const totalUsage = cred ? num(cred.total_usage) : null
+  const used = keyUsed ?? totalUsage
+  const limit = keyLimit ?? totalCredits
+  const remaining = num(d.limit_remaining) ?? (limit != null && used != null ? limit - used : null)
+  const utilization = limit != null && limit > 0 && used != null ? Math.min(100, (used / limit) * 100) : null
+  const freeTier = d.is_free_tier === true
+  const rl = d.rate_limit as { requests?: number; interval?: string } | undefined
+  return {
+    usage: creditUsage({
+      provider: 'openrouter',
+      currency: 'USD',
+      used,
+      limit,
+      remaining,
+      utilization,
+      freeTier,
+      note:
+        utilization == null
+          ? `key ini tanpa batas kredit${freeTier ? ' (free tier)' : ''} — batasnya berupa rate-limit${rl?.requests ? ` ${rl.requests}/${rl.interval}` : ''}, jadi ambang persen tak bisa ditegakkan.`
+          : undefined,
+      fetchedAt: Date.now()
+    })
+  }
+}
+
+/**
+ * DeepSeek: saldo dari /user/balance (otoritatif). Tak ada "limit" → utilization sengaja null
+ * SELAMA saldo masih ada; saldo habis / akun tak bisa dipakai → 100% supaya auto-switch memicu.
+ */
+async function fetchDeepseekCredit(token: string): Promise<UsageResult> {
+  try {
+    const b = await fetchDeepseekBalance(token)
+    const dry = !b.available || b.total <= 0
+    return {
+      usage: creditUsage({
+        provider: 'deepseek',
+        currency: b.currency,
+        used: null,
+        limit: null,
+        remaining: b.total,
+        utilization: dry ? 100 : null,
+        note: dry
+          ? 'saldo DeepSeek habis / akun tak bisa dipakai.'
+          : 'DeepSeek melaporkan SALDO, bukan persen kuota — ambang persen menyala hanya saat saldo habis.',
+        fetchedAt: b.fetchedAt
+      })
+    }
+  } catch (e) {
+    // 401 dari DeepSeek berarti token salah; sisanya jaringan.
+    return { usage: null, reason: /401/.test(String(e)) ? 'unauthorized' : 'error' }
+  }
+}
+
+/** Kuota akun API-key. 'custom'/'cursor' = proxy milik user → tak ada endpoint kuota baku. */
+async function fetchCreditUsage(provider: AccountProvider, token: string): Promise<UsageResult> {
+  if (provider === 'openrouter') return fetchOpenRouterCredit(token)
+  if (provider === 'deepseek') return fetchDeepseekCredit(token)
+  return { usage: null, reason: 'unsupported' }
+}
+
 async function fetchUsageRaw(account: UsageAccount): Promise<UsageResult> {
   const token = readToken(account)
   if (!token) return { usage: null, reason: 'no-token' }
+  // Akun API-key TIDAK PERNAH menyentuh endpoint OAuth Anthropic (key-nya memang bukan token Claude).
+  if (isSkinProvider(account.provider)) return fetchCreditUsage(account.provider!, token)
   try {
     const res = await fetch(USAGE_URL, { headers: authHeaders(token) })
     // Semua kegagalan yang MASIH mungkin ditolong jalur header:
@@ -230,7 +347,8 @@ export async function fetchAccountEmail(account: UsageAccount): Promise<string |
   if (cached && (!cached.retry || cached.email)) return cached.email
 
   const token = readToken(account)
-  if (!token) {
+  // Akun API-key: /oauth/profile Anthropic mustahil melayaninya → jangan buang request tiap poll.
+  if (!token || isSkinProvider(account.provider)) {
     emailCache.set(key, { email: null, retry: false })
     return null
   }

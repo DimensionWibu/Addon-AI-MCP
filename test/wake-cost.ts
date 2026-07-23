@@ -70,14 +70,39 @@ eq('6. isi identik → skip wake', shouldSkipWake('sig', 'sig'), true)
 eq('6b. isi berbeda → tetap wake', shouldSkipWake('sig', 'sig2'), false)
 
 // 7. Ambang compact per role: root JAUH lebih awal daripada sub (FIX 5).
-eq('7. ambang root', compactThresholds('root'), { high: 70, low: 50 })
-eq('7b. ambang sub', compactThresholds('sub'), { high: 88, low: 70 })
+eq('7. ambang root', compactThresholds('root'), { high: 70, low: 50, nudge: 58, ceiling: 150_000 })
+eq('7b. ambang sub', compactThresholds('sub'), { high: 88, low: 70, nudge: 76, ceiling: 250_000 })
 check('7c. root dipadatkan lebih awal dari sub', COMPACT.root.high < COMPACT.sub.high)
+// 7d. Nudge handover HARUS di antara low & high: di bawah low ia terpicu saat konteks masih lega
+// (buang giliran), di atas/di high compact keburu jalan sebelum model sempat menulis checkpoint.
+check(
+  '7d. ambang nudge di antara low & high',
+  COMPACT.root.low < COMPACT.root.nudge &&
+    COMPACT.root.nudge < COMPACT.root.high &&
+    COMPACT.sub.low < COMPACT.sub.nudge &&
+    COMPACT.sub.nudge < COMPACT.sub.high
+)
 
 // 8. Invarian tuning: hysteresis (low < high) & jendela prioritas < jendela normal.
 check('8. hysteresis root & sub valid (low < high)', COMPACT.root.low < COMPACT.root.high && COMPACT.sub.low < COMPACT.sub.high)
 check('8b. priorityMs < coalesceMs < rootStatusDebounceMs', WAKE.priorityMs < WAKE.coalesceMs && WAKE.coalesceMs < WAKE.rootStatusDebounceMs)
 check('8c. cache-warm di bawah TTL cache 1 jam', WAKE.cacheWarmIntervalMs < 60 * 60_000)
+// 8d. INVARIAN BIAYA yang dulu dilanggar: ping cache-warm baru terjadi pada pemeriksaan PERTAMA
+// setelah syarat stale terpenuhi → jarak terburuknya stale + interval. Kalau itu melewati TTL 1 jam,
+// tiap ping membayar cache-creation (1,25×) lalu cache-nya mati lagi = lebih mahal daripada tidak
+// menghangatkan sama sekali. (Angka lama 50 + 45 = 95 menit → gagal di sini.)
+check(
+  '8d. ping cache-warm terburuk masih di dalam TTL 1 jam',
+  WAKE.cacheWarmStaleMs + WAKE.cacheWarmIntervalMs < 60 * 60_000,
+  `${(WAKE.cacheWarmStaleMs + WAKE.cacheWarmIntervalMs) / 60000} menit`
+)
+check('8e. cache-warm punya batas ping (bukan selamanya)', WAKE.cacheWarmMaxPings > 0 && WAKE.cacheWarmMaxPings <= 8)
+// 8f. Plafon token HARUS di atas ambang persen untuk window 200k, supaya sesi Claude biasa tidak
+// berubah perilakunya — plafon ini memang hanya untuk model berjendela besar.
+check(
+  '8f. plafon token tak mengubah sesi window 200k',
+  COMPACT.root.ceiling > 200_000 * (COMPACT.root.high / 100) && COMPACT.sub.ceiling > 200_000 * (COMPACT.sub.high / 100)
+)
 
 // ------------------------------------------------- B. REGRESI BIAYA (SIM) ---
 console.log('\n--- B. regresi biaya: LAMA vs BARU pada timeline yang sama ---')

@@ -17,6 +17,9 @@ release/
 npm-debug.log*
 .tmp*/
 
+# handover/checkpoint yang ditulis Grove ke working directory (state sesi, bukan kode)
+.grove/
+
 # env & secrets
 .env
 .env.*

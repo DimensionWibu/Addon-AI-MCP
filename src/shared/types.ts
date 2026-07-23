@@ -70,11 +70,15 @@ export interface InboxMessage {
  *  RESMI milik DeepSeek (https://api.deepseek.com/anthropic) — TANPA proxy lokal: cukup token, base URL
  *  konstanta, model deepseek-v4-pro/flash. CATATAN: sama seperti OpenRouter, model non-Claude bisa saja
  *  tak 100% patuh protokol tool Claude Code — uji dulu di satu sesi. */
-export type AccountProvider = 'claude' | 'openrouter' | 'custom' | 'cursor' | 'deepseek'
+/** 'dzax' = gateway ber-format OPENAI (DZAX / Belo Store, dan endpoint OpenAI-compatible lain).
+ *  Beda mendasar dari provider skin lain: mereka menyediakan endpoint ber-format Anthropic, DZAX
+ *  tidak. Karena itu Grove menjalankan jembatan penerjemah lokal (src/main/openaiBridge.ts) dan
+ *  ANTHROPIC_BASE_URL diarahkan ke sana, bukan ke gateway-nya langsung. */
+export type AccountProvider = 'claude' | 'openrouter' | 'custom' | 'cursor' | 'deepseek' | 'dzax'
 
 /** Provider "Anthropic Skin": Grove kirim format Anthropic, endpoint menerjemahkan; model akun WAJIB. */
 export function isSkinProvider(p?: AccountProvider): boolean {
-  return p === 'openrouter' || p === 'custom' || p === 'cursor' || p === 'deepseek'
+  return p === 'openrouter' || p === 'custom' || p === 'cursor' || p === 'deepseek' || p === 'dzax'
 }
 
 /**
@@ -255,6 +259,24 @@ export function isDeepSeekModel(model?: string | null): boolean {
   return !!model && /^deepseek[-/]/i.test(model)
 }
 
+/** Base URL DZAX (Belo Store). Jalur `/v1` = CROSS-PROVIDER routing — diuji 2026-07-23: jalur
+ *  per-family (`/kr/v1`, `/gl/v1`) menolak model dari family lain ("does not match provider prefix"),
+ *  sedangkan `/v1` menerima model apa pun yang diizinkan key. Jadi inilah default yang benar. */
+export const DZAX_BASE_URL_DEFAULT = 'https://code.dzax.cloud/v1'
+
+/** Saran model DZAX. Key hanya boleh memakai family-nya sendiri (kr/* atau gl/* atau cx/*) — daftar
+ *  model yang SAH untuk sebuah key bisa dilihat dari pesan error gateway saat model salah. */
+export const DZAX_MODEL_SUGGESTIONS: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'gl/glm-5.2', label: 'gl/glm-5.2 · GLM family' },
+  { id: 'gl/kimi-k3', label: 'gl/kimi-k3' },
+  { id: 'gl/kimi-k2.7-code', label: 'gl/kimi-k2.7-code · coding' },
+  { id: 'gl/deepseek-v4-pro', label: 'gl/deepseek-v4-pro' },
+  { id: 'gl/gpt-5.6-sol', label: 'gl/gpt-5.6-sol' },
+  { id: 'kr/claude-sonnet-5', label: 'kr/claude-sonnet-5 · Kiro family' },
+  { id: 'kr/claude-opus-4.8', label: 'kr/claude-opus-4.8' },
+  { id: 'cx/gpt-5.6-codex', label: 'cx/gpt-5.6-codex · Codex family' }
+]
+
 /** Base URL default untuk akun 'custom' (proxy lokal). Cuma prefill form — user boleh ganti.
  *  LiteLLM proxy default :4000; claude-code-router default :3456. */
 export const CUSTOM_BASE_URL_DEFAULT = 'http://localhost:4000'
@@ -403,6 +425,28 @@ export interface UsageWindow {
   resetsAt: string | null // ISO timestamp
 }
 
+/**
+ * Kuota akun ber-API-KEY (OpenRouter / DeepSeek). Bentuknya BUKAN jendela 5-jam/7-hari ala langganan
+ * Claude, melainkan KREDIT/SALDO — jadi dibawa terpisah, bukan dipaksa masuk ke UsageWindow.
+ *
+ * Diambil dari API provider ITU SENDIRI (OpenRouter /api/v1/key + /credits, DeepSeek /user/balance).
+ * Dulu semua akun ditembak ke endpoint OAuth Anthropic, termasuk yang key-nya OpenRouter → 401 dan
+ * UI bilang "token ditolak/kedaluwarsa" padahal tokennya sehat: pesan yang menyesatkan.
+ */
+export interface CreditInfo {
+  provider: AccountProvider
+  currency: string // 'USD' (OpenRouter selalu USD; DeepSeek bisa CNY)
+  used: number | null // total terpakai (null = provider tak melaporkannya)
+  limit: number | null // batas kredit key (null = tak berbatas / tak diketahui)
+  remaining: number | null // sisa kredit/saldo
+  /** Persen terpakai. null = TIDAK BISA dihitung jujur (mis. key free-tier tanpa batas kredit) →
+   *  ambang auto-switch memang tak bisa ditegakkan untuk akun itu, dan UI mengatakannya apa adanya. */
+  utilization: number | null
+  freeTier?: boolean
+  note?: string // penjelasan singkat untuk UI (mis. bentuk batas free-tier)
+  fetchedAt: number
+}
+
 export interface UsageInfo {
   fiveHour: UsageWindow
   sevenDay: UsageWindow
@@ -415,6 +459,8 @@ export interface UsageInfo {
     utilization: number | null
     currency: string | null
   }
+  /** Terisi HANYA untuk akun API-key (skin provider); jendela 5-jam/7-hari di atas dibiarkan null. */
+  credit?: CreditInfo
   fetchedAt: number
   stale?: boolean // true = fetch terakhir gagal, ini nilai last-good (token mungkin sedang refresh)
 }
@@ -425,6 +471,7 @@ export type UsageUnavailable =
   | 'scope' // 403: token `claude setup-token` tak punya scope user:profile (kasus paling umum)
   | 'unauthorized' // 401: token ditolak/kedaluwarsa
   | 'rate-limited' // 429
+  | 'unsupported' // provider ini memang tak punya endpoint kuota (proxy 'custom'/'cursor')
   | 'error' // jaringan/lainnya
 
 /**
@@ -501,6 +548,9 @@ export interface GroveApi {
   getPathForFile: (file: File) => string
   dropFolder: (path: string, title?: string) => Promise<SessionMeta>
   newChat: (title?: string) => Promise<SessionMeta>
+  /** Sub-worker BARU di bawah sesi `parentId` (klik 3× kartu sesi). Idle & tanpa tugas — nol token
+   *  sampai user mengirim pesan pertamanya. */
+  newWorker: (parentId: string, title?: string) => Promise<SessionMeta>
   pickFolder: () => Promise<SessionMeta | null>
   /** Kunci sesi yang SUDAH ADA ke folder project (drag-drop folder ke kartu sesi). */
   setSessionCwd: (id: string, path: string) => Promise<SessionMeta>
