@@ -203,6 +203,10 @@ export interface AccountsState {
   defaultSwitchPct: number
   /** Akun GLOBAL: dipakai pohon yang tak menentukan akunnya sendiri. null = belum diset. */
   defaultAccountId: string | null
+  /** Akun yang dipakai membaca GAMBAR untuk sesi yang modelnya buta gambar. null = otomatis. */
+  visionAccountId: string | null
+  /** Urutan prioritas akun untuk rotasi otomatis (terdepan = dicoba duluan). Kosong = pakai paket. */
+  accountOrder: string[]
   /** Model GLOBAL: dipakai sesi yang tak menentukan model sendiri. null = default SDK. */
   defaultModel: string | null
   /** Tingkat mikir GLOBAL: dipakai sesi yang tak menentukan sendiri. null = default model. */
@@ -592,6 +596,8 @@ export interface GroveApi {
   listReferences: (helperId: string) => Promise<Array<{ id: string; title: string; status: string; cwd: string }>>
   stopSession: (id: string) => Promise<void>
   stopAll: () => Promise<number>
+  /** Dorong SEMUA sesi menganggur untuk meneruskan pekerjaannya. Balikan = jumlah sesi yang didorong. */
+  resumeAll: () => Promise<number>
   reorderSessions: (orderedIds: string[]) => Promise<void>
   compactSession: (id: string) => Promise<void>
   setLoop: (id: string, enabled: boolean) => Promise<void>
@@ -617,6 +623,12 @@ export interface GroveApi {
   setDefaultSwitchPct: (pct: number) => Promise<void>
   /** Akun GLOBAL: dipakai semua pohon yang tak menentukan akunnya sendiri. */
   setDefaultAccount: (accountId: string | null) => Promise<void>
+  /** Akun pembaca GAMBAR (OCR) untuk sesi yang modelnya buta gambar. null = pilih otomatis. */
+  setVisionAccount: (accountId: string | null) => Promise<void>
+  /** Paksa SEMUA sesi memakai akun ini (menghapus pilihan per-sesi). Balikan = jumlah sesi berubah. */
+  applyAccountToAll: (accountId: string | null) => Promise<number>
+  /** Simpan urutan prioritas akun untuk rotasi otomatis. */
+  setAccountOrder: (ids: string[]) => Promise<void>
   /** Model GLOBAL: dipakai semua sesi yang tak menentukan model sendiri. */
   setDefaultModel: (model: string | null) => Promise<void>
   /** Model sebuah sesi (null = kembali mewarisi dari sesi utama / global). */

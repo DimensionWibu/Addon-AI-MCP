@@ -129,6 +129,11 @@ export class SessionManager implements GroveHost {
   private autoResume = false // saat app dibuka lagi, lanjutkan sesi yang tadinya kerja
   private defaultSwitchPct = DEFAULT_SWITCH_PCT // ambang untuk akun tanpa ambang sendiri
   private defaultAccountId: string | null = null // akun GLOBAL: dipakai pohon yang tak menentukan sendiri
+  /** Akun yang DIPILIH USER untuk membaca gambar (OCR). null = otomatis (urutan lama). */
+  private visionAccountId: string | null = null
+  /** URUTAN PRIORITAS akun untuk rotasi otomatis (id, terdepan = dicoba duluan). Kosong = pakai
+   *  ukuran paket seperti dulu. Diatur user lewat ⚙ Akun (tombol ▲▼). */
+  private accountOrder: string[] = []
   private defaultModel: string | null = null // model GLOBAL: dipakai sesi yang tak menentukan sendiri (null = default SDK)
   private defaultEffort: EffortSetting | null = null // tingkat mikir GLOBAL (null = default model)
   // Akun yang usage-nya terbukti TAK bisa dibaca (403 scope). Dipakai UI untuk jujur bilang
@@ -340,6 +345,8 @@ export class SessionManager implements GroveHost {
     const savedPct = Number(this.db.getSetting('defaultSwitchPct'))
     this.defaultSwitchPct = Number.isFinite(savedPct) && savedPct > 0 ? clampPct(savedPct) : DEFAULT_SWITCH_PCT
     this.defaultAccountId = this.db.getSetting('defaultAccountId') || null
+    this.visionAccountId = this.db.getSetting('visionAccountId') || null
+    this.accountOrder = (this.db.getSetting('accountOrder') || '').split(',').map((x) => x.trim()).filter(Boolean)
     this.defaultModel = this.db.getSetting('defaultModel') || null
     const savedEffort = this.db.getSetting('defaultEffort')
     this.defaultEffort = isEffort(savedEffort) ? savedEffort : null
@@ -372,6 +379,8 @@ export class SessionManager implements GroveHost {
       autoResume: this.autoResume,
       defaultSwitchPct: this.defaultSwitchPct,
       defaultAccountId: this.accountExists(this.defaultAccountId) ? this.defaultAccountId : null,
+      visionAccountId: this.accountExists(this.visionAccountId) ? this.visionAccountId : null,
+      accountOrder: [...this.accountOrder],
       defaultModel: this.defaultModel,
       defaultEffort: this.defaultEffort
     }
@@ -657,6 +666,9 @@ export class SessionManager implements GroveHost {
     const score = (a: Account): number => {
       // Akun yang BARU SAJA gagal membaca gambar ditaruh paling belakang: mengulanginya lebih dulu
       // hanya membuat user menunggu lagi (tiap percobaan menghabiskan satu giliran + batas waktunya).
+      // Pilihan user menang atas apa pun — TERMASUK atas cooldown kegagalan, supaya "akun OCR-ku
+      // yang ini" benar-benar dihormati dan tak diam-diam digeser Grove.
+      if (a.id === this.visionAccountId) return -1
       const failedAt = this.visionFailedAt.get(a.id) ?? 0
       if (Date.now() - failedAt < VISION_FAIL_COOLDOWN_MS) return 3
       if (a.id === this.defaultAccountId) return 0
@@ -712,6 +724,31 @@ export class SessionManager implements GroveHost {
     void this.sampleProcs()
     this.procTimer = setInterval(() => void this.sampleProcs(), intervalMs)
     this.procTimer.unref?.()
+  }
+
+  /**
+   * Akun khusus pembaca gambar. Tanpa ini Grove memakai akun GLOBAL lebih dulu — dan kalau akun itu
+   * kebetulan tak bisa membaca gambar (mis. kuota model habis), setiap gambar gagal dulu sebelum
+   * jatuh ke cadangan. Dengan setelan ini, akun yang kamu tahu bisa membaca gambar dipakai duluan.
+   */
+  /** Simpan urutan prioritas akun untuk rotasi otomatis (terdepan = dicoba duluan). */
+  setAccountOrder(ids: string[]): void {
+    const known = new Set(this.db.getAccounts().map((a) => a.id))
+    this.accountOrder = ids.filter((id) => known.has(id))
+    this.db.setSetting('accountOrder', this.accountOrder.join(','))
+    this.emitAccounts()
+  }
+
+  /** Peringkat akun menurut urutan pilihan user; yang tak terdaftar ditaruh setelahnya. */
+  private rank(a: Account): number {
+    const i = this.accountOrder.indexOf(a.id)
+    return i >= 0 ? i : 500 - (a.plan ?? 1) // tanpa urutan eksplisit → paket terbesar duluan (perilaku lama)
+  }
+
+  setVisionAccount(accountId: string | null): void {
+    this.visionAccountId = this.accountExists(accountId) ? accountId : null
+    this.db.setSetting('visionAccountId', this.visionAccountId ?? '')
+    this.emitAccounts()
   }
 
   /** GroveHost.noteVisionFailure — akun ini baru saja gagal membaca gambar → turunkan prioritasnya. */
@@ -864,6 +901,23 @@ export class SessionManager implements GroveHost {
   }
 
   /** Akun global: dipakai semua pohon yang tak menentukan akun sendiri. null = tidak ada. */
+  /**
+   * PAKSA seluruh sesi memakai satu akun. Beda dari akun GLOBAL yang hanya menjadi cadangan bagi sesi
+   * yang belum menentukan sendiri: ini menghapus pilihan per-sesi yang terlanjur menempel — termasuk
+   * hasil auto-switch saat limit — sehingga tak ada lagi sesi yang diam-diam menagih akun lain.
+   * accountId null = kosongkan pilihan tiap sesi (semuanya kembali mengikuti akun global).
+   */
+  applyAccountToAllSessions(accountId: string | null): number {
+    const id = this.accountExists(accountId) ? accountId : null
+    let n = 0
+    for (const s of [...this.sessions.values()]) {
+      if ((s.meta.accountId ?? null) === id) continue
+      this.setSessionAccount(s.meta.id, id)
+      n++
+    }
+    return n
+  }
+
   setDefaultAccount(accountId: string | null): void {
     // Rekam akun EFEKTIF tiap sesi SEBELUM berubah, lalu banding sesudahnya. Tanpa perbandingan ini
     // kita akan meng-interrupt query sesi yang akun efektifnya sebenarnya tak berubah (punya akun
@@ -1078,7 +1132,7 @@ export class SessionManager implements GroveHost {
       .getAccounts()
       .filter((a) => a.id !== currentKey && !this.isAccountLimited(a.id))
       .filter((a) => !sameProvider || (a.provider ?? 'claude') === sameProvider)
-      .sort((x, y) => (y.plan ?? 1) - (x.plan ?? 1))[0]
+      .sort((x, y) => this.rank(x) - this.rank(y))[0]
   }
 
   /**
@@ -1091,7 +1145,7 @@ export class SessionManager implements GroveHost {
       .getAccounts()
       .filter((a) => a.id !== currentKey)
       .filter((a) => !sameProvider || (a.provider ?? 'claude') === sameProvider)
-      .sort((x, y) => (y.plan ?? 1) - (x.plan ?? 1))[0]
+      .sort((x, y) => this.rank(x) - this.rank(y))[0]
   }
 
   /**
@@ -1790,6 +1844,30 @@ export class SessionManager implements GroveHost {
   /** Berapa sesi yang BENAR-BENAR sedang bekerja sekarang. Dipakai konfirmasi tutup jendela. */
   countRunning(): number {
     return [...this.sessions.values()].filter((s) => s.meta.status === 'running').length
+  }
+
+  /**
+   * LANJUTKAN SEMUA SESI: dorong tiap sesi yang sedang menganggur untuk meneruskan pekerjaannya dari
+   * titik terakhir. Dipakai setelah app dibuka/di-restart — auto-resume bawaan hanya menyentuh sesi
+   * yang berstatus 'running' saat app ditutup, sedangkan sesi yang sudah terlanjur idle (mis. turn-nya
+   * selesai atau terpotong) tetap diam sampai user mengetik.
+   *
+   * Sengaja MELEWATI sesi yang sedang running (jangan menyela) dan sesi yang sudah 'done'
+   * (tugasnya memang dinyatakan tuntas — membangunkannya cuma membakar token).
+   * Mengembalikan jumlah sesi yang didorong.
+   */
+  resumeAll(): number {
+    let n = 0
+    for (const s of this.sessions.values()) {
+      if (s.meta.status === 'running' || s.meta.status === 'done') continue
+      s.injectAutoTask(
+        '[GROVE] Lanjutkan pekerjaanmu dari titik terakhir. Kalau ada file handover .grove/checkpoint-*.md di folder kerja, baca itu dulu untuk memulihkan konteks. ' +
+          'Kalau tugasmu memang sudah selesai, cukup jawab SATU baris ringkas berisi status akhirnya — jangan mengulang pekerjaan yang sudah beres.',
+        { noNudge: true }
+      )
+      n++
+    }
+    return n
   }
 
   async stopAll(): Promise<number> {

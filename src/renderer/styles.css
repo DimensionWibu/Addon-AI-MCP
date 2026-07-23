@@ -656,3 +656,14 @@ form.editing-queue textarea { border-color: var(--accent); }
 .log-procs:empty { display: none; }
 .log-procs .lp-pid { color: var(--accent); }
 .log-procs .lp-mine { color: var(--text); font-weight: 700; }
+
+/* Tombol "lanjutkan semua" — senada Stop All tapi berwarna aman (bukan merah). */
+.resume-all-btn {
+  margin-left: 14px; align-self: center; background: transparent; color: var(--ok);
+  border: 1px solid var(--ok); border-radius: 3px; padding: 3px 10px; font-size: 11px;
+  cursor: pointer; font-family: var(--mono); letter-spacing: .3px;
+}
+.resume-all-btn:hover { background: rgba(143, 181, 115, .16); }
+
+/* Nomor prioritas rotasi akun di ⚙ Akun. */
+.ap-prio { flex: none; font-size: 9px; color: var(--text-dim); min-width: 22px; }

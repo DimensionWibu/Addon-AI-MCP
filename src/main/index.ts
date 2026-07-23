@@ -218,6 +218,14 @@ app.whenReady().then(async () => {
   manager.loadFromDisk() // muat session lama (dormant) agar history & context tetap terlihat
   registerIpc(manager)
   manager.startProcWatch() // pid & RAM tiap proses CLI → panel LOG
+  // GROVE_RESUME_ALL=1 → begitu app siap, semua sesi menganggur didorong meneruskan pekerjaannya.
+  // Berguna sesudah restart terencana; jeda singkat supaya jendela & event UI sudah siap menerima.
+  if (process.env.GROVE_RESUME_ALL === '1') {
+    setTimeout(() => {
+      const n = manager.resumeAll()
+      console.log(`[grove] Lanjutkan semua: ${n} sesi didorong meneruskan pekerjaan.`)
+    }, 6000)
+  }
   // Tray WAJIB ada begitu keep-alive menyala (termasuk di dev): tanpa ikon ini, jendela yang
   // ditutup meninggalkan proses yang cuma bisa dimatikan lewat Task Manager.
   if (KEEP_ALIVE) createTray()

@@ -71,7 +71,9 @@ let accounts: Account[] = [] // akun Claude tersimpan (tanpa token)
 let autoSwitch = false // pindah akun otomatis saat limit
 let autoResume = false // lanjutkan sesi yang tadi kerja saat app dibuka lagi
 let defaultSwitchPct = 90 // ambang untuk akun yang tak punya ambang sendiri
-let defaultAccountId: string | null = null // akun global (dipakai pohon yang tak menentukan sendiri)
+let defaultAccountId: string | null = null
+let visionAccountId: string | null = null // akun pembaca gambar (null = otomatis)
+let accountOrder: string[] = [] // urutan prioritas rotasi akun (kosong = pakai ukuran paket) // akun global (dipakai pohon yang tak menentukan sendiri)
 let defaultModel: string | null = null // model global (dipakai sesi yang tak menentukan sendiri)
 let defaultEffort: EffortSetting | null = null // tingkat mikir global (null = default model)
 let orModels: OpenRouterModel[] = [] // daftar model OpenRouter (dukung tools) untuk sesi ber-akun OR
@@ -2618,6 +2620,46 @@ function renderAccountsPanel(): void {
       .catch((e) => alert(`Gagal set akun global: ${String(e)}`))
   })
   panel.append(gSel)
+  // Akun global hanya jadi CADANGAN bagi sesi yang belum menentukan sendiri. Tombol ini memaksakan
+  // pilihan itu ke SEMUA sesi — termasuk yang akunnya terlanjur digeser auto-switch saat limit.
+  const applyAll = el('button', { class: 'ap-add' }, '↧ Terapkan akun ini ke SEMUA sesi')
+  applyAll.addEventListener('click', () => {
+    const target = gSel.value || null
+    const nama = target ? (accounts.find((a) => a.id === target)?.label ?? '?') : '(kosongkan → ikut global)'
+    void uiConfirm(`Paksa SEMUA sesi memakai akun "${nama}"? Pilihan akun per-sesi yang ada akan ditimpa.`, 'Ya, terapkan').then((ok) => {
+      if (!ok) return
+      void window.grove.applyAccountToAll(target).then((n) => {
+        appendChatMessage({ role: 'system', text: `↧ ${n} sesi dipindah ke akun "${nama}".`, ts: Date.now() })
+      })
+    })
+  })
+  panel.append(applyAll)
+
+  // AKUN PEMBACA GAMBAR (OCR). Sesi bermodel buta-gambar menitipkan gambarnya ke akun lain; tanpa
+  // setelan ini Grove memakai akun GLOBAL duluan, dan kalau akun itu tak bisa membaca gambar (mis.
+  // kuota modelnya habis) SETIAP gambar gagal dulu sebelum jatuh ke cadangan.
+  panel.append(el('div', { class: 'ap-head' }, 'Akun pembaca gambar (OCR)'))
+  const vSel = document.createElement('select')
+  vSel.className = 'ap-input'
+  vSel.title = 'Dipakai saat model sesi tak bisa melihat gambar. Pilih akun yang kamu tahu bisa (mis. langganan Claude).'
+  const vAuto = document.createElement('option')
+  vAuto.value = ''
+  vAuto.textContent = '— otomatis (urutan bawaan) —'
+  vSel.append(vAuto)
+  for (const a of accounts) {
+    if (a.provider === 'deepseek') continue // DeepSeek mengabaikan gambar diam-diam → jangan ditawarkan
+    const o = document.createElement('option')
+    o.value = a.id
+    o.textContent = `${a.label}${a.model ? ` · ${a.model.split(',')[0].trim()}` : ''}`
+    vSel.append(o)
+  }
+  vSel.value = visionAccountId ?? ''
+  vSel.addEventListener('change', () => {
+    void window.grove
+      .setVisionAccount(vSel.value || null)
+      .catch((e) => alert(`Gagal set akun gambar: ${String(e)}`))
+  })
+  panel.append(vSel)
 
   panel.append(el('div', { class: 'ap-head' }, 'Tersimpan'))
   if (!accounts.length) {
@@ -2666,8 +2708,25 @@ function renderAccountsPanel(): void {
       // Tombol ✎ — buka form ubah akun di tempat. Ini jalan satu-satunya untuk MELIHAT & mengoreksi
       // endpoint/model akun gateway tanpa harus menghapus lalu membuat ulang (yang menghilangkan
       // riwayat pemakaian akun itu).
+      // Urutan prioritas rotasi otomatis: yang di ATAS dicoba lebih dulu saat akun sekarang kena
+      // limit/ambang. Tanpa urutan eksplisit, Grove memakai ukuran paket seperti dulu.
+      const rankNo = accountOrder.indexOf(a.id)
+      const prio = el('span', { class: 'ap-prio', title: 'Prioritas rotasi otomatis (makin kecil, makin dulu dicoba)' }, rankNo >= 0 ? `#${rankNo + 1}` : '#–')
+      const move = (dir: -1 | 1): void => {
+        const ids = accountOrder.length ? [...accountOrder] : accounts.map((x) => x.id)
+        const from = ids.indexOf(a.id)
+        const at = from < 0 ? ids.length : from
+        if (from >= 0) ids.splice(from, 1)
+        const to = Math.max(0, Math.min(ids.length, at + dir))
+        ids.splice(to, 0, a.id)
+        void window.grove.setAccountOrder(ids)
+      }
+      const up = el('button', { class: 'ap-edit', title: 'Naikkan prioritas rotasi' }, '▲')
+      const down = el('button', { class: 'ap-edit', title: 'Turunkan prioritas rotasi' }, '▼')
+      up.addEventListener('click', () => move(-1))
+      down.addEventListener('click', () => move(1))
       const edit = el('button', { class: 'ap-edit', title: 'Ubah akun (endpoint, model, label, token)' }, '✎')
-      const row = el('div', { class: 'ap-item' }, el('span', { class: 'ap-label' }, a.label), provTag, planTag, edit, del)
+      const row = el('div', { class: 'ap-item' }, prio, el('span', { class: 'ap-label' }, a.label), provTag, planTag, up, down, edit, del)
       panel.append(row)
 
       const form = el('div', { class: 'ap-editbox' })
@@ -3361,6 +3420,8 @@ function onEvent(ev: GroveEvent): void {
       autoResume = ev.payload.autoResume
       defaultSwitchPct = ev.payload.defaultSwitchPct
       defaultAccountId = ev.payload.defaultAccountId
+      visionAccountId = ev.payload.visionAccountId
+      accountOrder = ev.payload.accountOrder ?? []
       defaultModel = ev.payload.defaultModel
       defaultEffort = ev.payload.defaultEffort
       syncGlobalModel()
@@ -3561,6 +3622,16 @@ async function init(): Promise<void> {
     node.lite = next || undefined // optimistis
     updateChatHeader()
     void window.grove.setLite(activeId, next).catch((err) => alert(`Gagal ganti mode: ${String(err)}`))
+  })
+
+  $('btn-resume-all').addEventListener('click', () => {
+    void window.grove.resumeAll().then((n) => {
+      appendChatMessage({
+        role: 'system',
+        text: n ? `▶ ${n} sesi didorong meneruskan pekerjaannya.` : '▶ Tak ada sesi menganggur yang perlu didorong.',
+        ts: Date.now()
+      })
+    })
   })
 
   $('btn-stop-all').addEventListener('click', () => {
@@ -3872,6 +3943,8 @@ async function init(): Promise<void> {
       autoResume = r.autoResume
       defaultSwitchPct = r.defaultSwitchPct
       defaultAccountId = r.defaultAccountId
+      visionAccountId = r.visionAccountId
+      accountOrder = r.accountOrder ?? []
       defaultModel = r.defaultModel
       defaultEffort = r.defaultEffort
       syncGlobalModel()

@@ -33,7 +33,9 @@
     "test:vision": "esbuild test/vision-bridge.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/vb.mjs && electron .tmp/vb.mjs",
     "test:procs": "tsx test/proc-watch.ts",
     "test:queue": "esbuild test/queue-compact.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/qc.mjs && electron .tmp/qc.mjs",
-    "test:reread": "tsx test/reread-guard.ts"
+    "test:reread": "tsx test/reread-guard.ts",
+    "test:vacct": "esbuild test/vision-account.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/va.mjs && electron .tmp/va.mjs",
+    "test:prio": "esbuild test/account-priority.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/ap.mjs && electron .tmp/ap.mjs"
   },
   "build": {
     "appId": "com.grove.orchestrator",

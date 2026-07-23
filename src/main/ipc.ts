@@ -102,6 +102,8 @@ export function registerIpc(manager: SessionManager): void {
   ipcMain.handle('grove:stopSession', (_e, { id }: { id: string }) => manager.stopSession(id))
 
   ipcMain.handle('grove:stopAll', () => manager.stopAll())
+  // Dorong semua sesi menganggur untuk meneruskan pekerjaannya (tombol ▶ Lanjutkan semua).
+  ipcMain.handle('grove:resumeAll', () => manager.resumeAll())
 
   ipcMain.handle('grove:reorder', (_e, { ids }: { ids: string[] }) => manager.reorderSessions(ids))
 
@@ -148,6 +150,13 @@ export function registerIpc(manager: SessionManager): void {
   ipcMain.handle('grove:setDefaultSwitchPct', (_e, { pct }: { pct: number }) => manager.setDefaultSwitchPct(pct))
   ipcMain.handle('grove:setDefaultAccount', (_e, { accountId }: { accountId: string | null }) =>
     manager.setDefaultAccount(accountId)
+  )
+  ipcMain.handle('grove:applyAccountToAll', (_e, { accountId }: { accountId: string | null }) =>
+    manager.applyAccountToAllSessions(accountId)
+  )
+  ipcMain.handle('grove:setAccountOrder', (_e, { ids }: { ids: string[] }) => manager.setAccountOrder(ids))
+  ipcMain.handle('grove:setVisionAccount', (_e, { accountId }: { accountId: string | null }) =>
+    manager.setVisionAccount(accountId)
   )
   ipcMain.handle('grove:setDefaultModel', (_e, { model }: { model: string | null }) =>
     manager.setDefaultModel(model)
