@@ -48,6 +48,14 @@ async function main(): Promise<void> {
   check('sesi 1 ikut pindah', mgr.resolveAccountId(r1.id), kecil.id)
   check('sesi 2 tetap benar', mgr.resolveAccountId(r2.id), kecil.id)
 
+  // Akun global OTOMATIS: ikut urutan prioritas, dan melewati akun yang sedang kena limit.
+  mgr.setDefaultAccount('auto')
+  mgr.setSessionAccount(r1.id, null) // kembali mengikuti global
+  check('global auto → akun prioritas teratas', mgr.resolveAccountId(r1.id), kecil.id)
+  ;(mgr as unknown as { markAccountLimited: (k: string) => void }).markAccountLimited(kecil.id)
+  check('akun teratas kena limit → turun ke berikutnya', mgr.resolveAccountId(r1.id), besar.id)
+  check('nilai auto terbaca di listAccounts', mgr.listAccounts().defaultAccountId, 'auto')
+
   // Urutan bertahan restart.
   b.flush()
   const b2 = new Board(dbPath)

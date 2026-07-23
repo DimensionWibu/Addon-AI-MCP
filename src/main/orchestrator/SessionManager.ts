@@ -66,6 +66,9 @@ function clampPct(pct: number): number {
 /** Selama ini, akun yang gagal membaca gambar tak dicoba duluan lagi. */
 const VISION_FAIL_COOLDOWN_MS = 10 * 60_000
 
+/** Nilai khusus akun global: pilih sendiri menurut urutan prioritas akun. */
+export const AUTO_ACCOUNT = 'auto'
+
 const DEFAULT_ACCT_KEY = '__default__' // penanda sesi yang memakai login CLI (bukan akun tersimpan)
 // COALESCE laporan worker → parent. Pemboros token DOMINAN bukan besar teksnya, melainkan JUMLAH
 // GILIRAN: tiap injectAutoTask membuat giliran baru yang menagih ULANG seluruh konteks parent yang
@@ -128,7 +131,9 @@ export class SessionManager implements GroveHost {
   private autoSwitch = false // pindah akun otomatis saat kena limit
   private autoResume = false // saat app dibuka lagi, lanjutkan sesi yang tadinya kerja
   private defaultSwitchPct = DEFAULT_SWITCH_PCT // ambang untuk akun tanpa ambang sendiri
-  private defaultAccountId: string | null = null // akun GLOBAL: dipakai pohon yang tak menentukan sendiri
+  /** Akun GLOBAL untuk pohon yang tak menentukan sendiri. Nilai khusus 'auto' = ikut URUTAN
+   *  PRIORITAS akun (lewati yang sedang kena limit) — mirip router yang memilih sendiri. */
+  private defaultAccountId: string | null = null
   /** Akun yang DIPILIH USER untuk membaca gambar (OCR). null = otomatis (urutan lama). */
   private visionAccountId: string | null = null
   /** URUTAN PRIORITAS akun untuk rotasi otomatis (id, terdepan = dicoba duluan). Kosong = pakai
@@ -378,7 +383,8 @@ export class SessionManager implements GroveHost {
       autoSwitch: this.autoSwitch,
       autoResume: this.autoResume,
       defaultSwitchPct: this.defaultSwitchPct,
-      defaultAccountId: this.accountExists(this.defaultAccountId) ? this.defaultAccountId : null,
+      defaultAccountId:
+        this.defaultAccountId === AUTO_ACCOUNT ? AUTO_ACCOUNT : this.accountExists(this.defaultAccountId) ? this.defaultAccountId : null,
       visionAccountId: this.accountExists(this.visionAccountId) ? this.visionAccountId : null,
       accountOrder: [...this.accountOrder],
       defaultModel: this.defaultModel,
@@ -516,13 +522,14 @@ export class SessionManager implements GroveHost {
    */
   resolveAccountId(sessionId: string): string | null {
     const s = this.sessions.get(sessionId)
-    if (!s) return this.accountExists(this.defaultAccountId) ? this.defaultAccountId : null
+    if (!s) return this.defaultAccountId === AUTO_ACCOUNT ? this.autoDefaultAccount() : this.accountExists(this.defaultAccountId) ? this.defaultAccountId : null
     if (this.accountExists(s.meta.accountId ?? null)) return s.meta.accountId as string
     // treeId = id sesi utama pohon ini (root: treeId = id-nya sendiri).
     const root = this.sessions.get(s.meta.treeId)
     if (root && root.meta.id !== s.meta.id && this.accountExists(root.meta.accountId ?? null)) {
       return root.meta.accountId as string
     }
+    if (this.defaultAccountId === AUTO_ACCOUNT) return this.autoDefaultAccount()
     return this.accountExists(this.defaultAccountId) ? this.defaultAccountId : null
   }
 
@@ -737,6 +744,17 @@ export class SessionManager implements GroveHost {
     this.accountOrder = ids.filter((id) => known.has(id))
     this.db.setSetting('accountOrder', this.accountOrder.join(','))
     this.emitAccounts()
+  }
+
+  /**
+   * Akun yang dipilih mode OTOMATIS: kandidat teratas menurut urutan prioritas yang MASIH bisa
+   * dipakai (belum ditandai kena limit). Kalau semuanya sedang limit, tetap ambil yang teratas —
+   * lebih baik mencoba daripada sesi mati total.
+   */
+  private autoDefaultAccount(): string | null {
+    const ordered = [...this.db.getAccounts()].sort((a, b) => this.rank(a) - this.rank(b))
+    if (!ordered.length) return null
+    return (ordered.find((a) => !this.isAccountLimited(a.id)) ?? ordered[0]).id
   }
 
   /** Peringkat akun menurut urutan pilihan user; yang tak terdaftar ditaruh setelahnya. */

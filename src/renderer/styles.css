@@ -71,8 +71,8 @@ button, input { font-family: var(--mono); }
 .ap-empty { color: var(--text-dim); font-size: 11px; }
 .ap-item { display: flex; align-items: center; gap: 8px; padding: 4px 0; min-width: 0; }
 /* Label & badge boleh menyusut/ellipsis; tombol aksi TIDAK pernah terdorong keluar panel. */
-.ap-item .ap-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ap-item .ap-prov { min-width: 0; overflow: hidden; text-overflow: ellipsis; max-width: 46%; }
+.ap-item .ap-label { flex: 1 1 auto; min-width: 74px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ap-item .ap-prov { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; max-width: 40%; }
 .ap-item .ap-edit, .ap-item .ap-del { flex: none; }
 .ap-label { flex: 1; color: var(--text); font-size: 12px; }
 .ap-del { background: transparent; color: var(--err); border: 1px solid var(--err); border-radius: 3px; cursor: pointer; font-size: 11px; padding: 0 7px; }
@@ -642,7 +642,7 @@ form.editing-queue textarea { border-color: var(--accent); }
 /* Tombol & form ubah akun (⚙ Akun → ✎). */
 .ap-edit {
   background: transparent; color: var(--text-dim); border: 1px solid var(--border); border-radius: 3px;
-  cursor: pointer; font-size: 11px; padding: 0 7px;
+  cursor: pointer; font-size: 10px; padding: 0 5px;
 }
 .ap-edit:hover { border-color: var(--accent); color: var(--accent); }
 .ap-editbox { border-left: 2px solid var(--accent); padding: 6px 0 8px 8px; margin: 2px 0 8px; }

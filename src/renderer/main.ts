@@ -2604,6 +2604,12 @@ function renderAccountsPanel(): void {
   gNone.value = ''
   gNone.textContent = '— tidak ada —'
   gSel.append(gNone)
+  // OTOMATIS: akun dipilih sendiri menurut URUTAN PRIORITAS di daftar bawah (#1, #2, …), melewati
+  // akun yang sedang kena limit. Jadi tak perlu menunjuk satu akun tetap.
+  const gAuto = document.createElement('option')
+  gAuto.value = 'auto'
+  gAuto.textContent = '⟳ otomatis — ikut urutan prioritas akun'
+  gSel.append(gAuto)
   for (const a of accounts) {
     const o = document.createElement('option')
     o.value = a.id
@@ -2726,7 +2732,8 @@ function renderAccountsPanel(): void {
       up.addEventListener('click', () => move(-1))
       down.addEventListener('click', () => move(1))
       const edit = el('button', { class: 'ap-edit', title: 'Ubah akun (endpoint, model, label, token)' }, '✎')
-      const row = el('div', { class: 'ap-item' }, prio, el('span', { class: 'ap-label' }, a.label), provTag, planTag, up, down, edit, del)
+      const labelEl = el('span', { class: 'ap-label', title: a.label }, a.label)
+      const row = el('div', { class: 'ap-item' }, prio, labelEl, provTag, planTag, up, down, edit, del)
       panel.append(row)
 
       const form = el('div', { class: 'ap-editbox' })
@@ -2754,6 +2761,26 @@ function renderAccountsPanel(): void {
         form.hidden = !form.hidden
         if (!form.hidden) fLabel.focus()
       })
+      // Simpan → baris ini diperbarui DI TEMPAT. Panel sengaja tidak di-render ulang selama fokus
+      // ada di dalamnya (itu akan menghapus form yang sedang kamu isi), jadi tanpa pembaruan
+      // setempat hasil edit baru terlihat setelah panel ditutup-buka. Ini yang bikin terasa "tidak
+      // realtime".
+      const applyRowVisual = (acc: Account): void => {
+        labelEl.textContent = acc.label
+        labelEl.title = acc.label
+        if (acc.provider === 'dzax') {
+          const ms = (acc.model ?? '').split(',').map((m) => m.trim()).filter(Boolean)
+          provTag.textContent = `OAI: ${ms[0] ?? '?'}${ms.length > 1 ? ` +${ms.length - 1}` : ''}`
+          provTag.title = [acc.baseUrl ?? DZAX_BASE_URL_DEFAULT, ...(ms.length ? ms : ['?'])].join(String.fromCharCode(10))
+        } else if (acc.provider === 'openrouter') {
+          provTag.textContent = `OR: ${acc.model?.split('/').pop() ?? '?'}`
+        } else if (acc.provider === 'deepseek') {
+          provTag.textContent = `DS: ${acc.model ?? DEEPSEEK_MODEL_DEFAULT}`
+        } else if (acc.provider === 'custom' || acc.provider === 'cursor') {
+          provTag.textContent = `${acc.provider === 'custom' ? 'GM' : 'CR'}: ${acc.model ?? '?'}`
+          provTag.title = `${acc.baseUrl ?? ''} · ${acc.model ?? ''}`
+        }
+      }
       save.addEventListener('click', () => {
         status.textContent = 'menyimpan…'
         void window.grove
@@ -2763,9 +2790,15 @@ function renderAccountsPanel(): void {
             model: fModel ? fModel.value : undefined,
             baseUrl: fUrl ? fUrl.value : undefined
           })
-          .then(() => {
+          .then((acc) => {
             fToken.value = ''
-            status.textContent = '✓ tersimpan — berlaku pada giliran berikutnya'
+            // Perbarui salinan lokal + tampilan baris, tanpa menutup form yang sedang dibuka.
+            const idx = accounts.findIndex((x) => x.id === a.id)
+            if (idx >= 0) accounts[idx] = acc
+            applyRowVisual(acc)
+            if (fModel) fModel.value = acc.model ?? ''
+            if (fUrl) fUrl.value = acc.baseUrl ?? ''
+            status.textContent = `✓ tersimpan ${new Date().toLocaleTimeString()} — berlaku pada giliran berikutnya`
           })
           .catch((e) => {
             status.textContent = `gagal: ${String(e)}`
