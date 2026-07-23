@@ -7,7 +7,7 @@
 //  B. CACHE-WARM — jadwal lama (cek 45 mnt, stale 50 mnt) membuat ping nyata jatuh tiap ~90 menit,
 //     yaitu SETELAH TTL cache 1 jam habis: tiap ping membayar cache-creation (1,25×) lalu cache-nya
 //     mati lagi. Lebih mahal daripada tidak menghangatkan sama sekali, dan berulang selamanya.
-import { COMPACT, WAKE, compactDecision } from '../src/main/orchestrator/wakePolicy'
+import { COMPACT, NO_CACHE_CEILING, WAKE, compactDecision } from '../src/main/orchestrator/wakePolicy'
 import { contextWindowFor } from '../src/main/orchestrator/contextWindows'
 
 let failed = 0
@@ -59,6 +59,26 @@ console.log(
     `${(after * CALLS) / 1e6}M BARU (hemat ${(saved / 1e6).toFixed(1)}M token)`
 )
 check('hemat > 5 juta token per turn mentok', saved > 5e6)
+
+// ------------------------------------- A2. provider TANPA cache (gateway OpenAI-compatible)
+// Di sana tiap token input ditagih PENUH tiap panggilan tool, jadi konteks harus dipadatkan jauh
+// lebih awal daripada provider ber-cache.
+const CLAUDE_W = 200_000
+check('tanpa cache: root 70k sudah COMPACT', compactDecision('root', 70_000, CLAUDE_W, true, true).compact === true)
+check('dengan cache: root 70k belum compact', compactDecision('root', 70_000, CLAUDE_W, true, false).compact === false)
+check('tanpa cache: sub 90k sudah COMPACT', compactDecision('sub', 90_000, CLAUDE_W, true, true).compact === true)
+check('tanpa cache: root 50k masih lega', compactDecision('root', 50_000, CLAUDE_W, true, true).compact === false)
+check(
+  'tanpa cache: pemicunya plafon (badge % masih kecil)',
+  compactDecision('root', 70_000, CLAUDE_W, true, true).byCeiling === true
+)
+{
+  // Dampak pada data NYATA user (98 request, rata-rata 119k input, tarif 1,5x).
+  const before = 119_000 * 1.5
+  const after = NO_CACHE_CEILING.root * 1.5
+  console.log(`   -> per request di gateway tanpa cache: ${(before / 1000).toFixed(0)}k -> maks ${(after / 1000).toFixed(0)}k token tertagih`)
+  check('plafon tanpa-cache memangkas >40% biaya per request', after < before * 0.6)
+}
 
 // ------------------------------------------------------------ B. cache-warm
 /** Simulasi jadwal: kapan ping cache-warm BENAR-BENAR terjadi, dan cache-nya masih hidup atau tidak. */

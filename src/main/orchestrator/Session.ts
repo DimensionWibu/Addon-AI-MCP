@@ -1734,7 +1734,13 @@ export class Session {
         else {
           // Keputusan (persen window ATAU plafon token) ada di wakePolicy.compactDecision — fungsi
           // murni yang bisa diuji tanpa SDK, karena inilah jalur penentu biaya per giliran.
-          const d = compactDecision(this.meta.role, this.meta.ctxInput, this.meta.ctxWindow, this.compactArmed)
+          const d = compactDecision(
+            this.meta.role,
+            this.meta.ctxInput,
+            this.meta.ctxWindow,
+            this.compactArmed,
+            !this.host.providerCachesPrompt(this.meta.id)
+          )
           // Pra-compact: titipkan permintaan update handover ke giliran BERIKUTNYA (lihat decorate()).
           if (d.nudge) this.checkpointNudge = true
           if (d.relaxed) {

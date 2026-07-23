@@ -97,6 +97,22 @@ export const COMPACT: Record<SessionRole, { high: number; low: number; nudge: nu
   sub: { high: 88, low: 70, nudge: 76, ceiling: 250_000 }
 }
 
+/**
+ * PLAFON UNTUK PROVIDER TANPA CACHE PROMPT (mis. gateway OpenAI-compatible seperti Shiteru/DZAX —
+ * diperiksa: balasannya tak punya field cached_tokens sama sekali).
+ *
+ * Seluruh tuning Grove yang lain berasumsi ada cache: konteks besar boleh dibiarkan karena
+ * pengirimannya ulang ditagih ~0,1x. Di gateway tanpa cache, SETIAP token input ditagih PENUH tiap
+ * panggilan tool — dan pada model bertarif kelipatan (Opus 4.8 = 1,5x) biayanya berlipat lagi.
+ * Diukur dari log nyata user: 98 request dalam 16 menit = 11,7 juta token input (rata-rata 119k) dan
+ * 17,6 juta token tertagih, sementara OUTPUT-nya cuma 53k (0,45%). Menjaga konteks di bawah 80k pada
+ * data yang sama memangkas ~37% tagihan.
+ */
+export const NO_CACHE_CEILING: Record<SessionRole, number> = {
+  root: 60_000,
+  sub: 80_000
+}
+
 export function compactThresholds(role: SessionRole): {
   high: number
   low: number
@@ -128,9 +144,14 @@ export function compactDecision(
   role: SessionRole,
   ctxInput: number,
   ctxWindow: number,
-  armed: boolean
+  armed: boolean,
+  noCache = false
 ): CompactDecision {
-  const { high, low, nudge, ceiling } = compactThresholds(role)
+  const t = compactThresholds(role)
+  const { high, low, nudge } = t
+  // Tanpa cache prompt, ukuran konteks berbanding LURUS dengan tagihan tiap panggilan tool → dipadatkan
+  // jauh lebih awal. Dengan cache, plafon longgar memang lebih murah daripada sering membangun ulang.
+  const ceiling = noCache ? Math.min(t.ceiling, NO_CACHE_CEILING[role] ?? t.ceiling) : t.ceiling
   const pct = ctxWindow > 0 ? (ctxInput / ctxWindow) * 100 : 0
   const overCeiling = ctxInput >= ceiling
   const full = pct >= high || overCeiling

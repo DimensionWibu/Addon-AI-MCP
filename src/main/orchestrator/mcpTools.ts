@@ -63,6 +63,11 @@ export interface GroveHost {
    * rekonsiliasi akhir-turn saja — kalau tidak, input tercatat berlipat.
    */
   perMessageUsageReliable(sessionId: string): boolean
+  /**
+   * Provider sesi ini memberi DISKON CACHE untuk prompt yang dikirim ulang?
+   * false = tiap token input ditagih penuh tiap panggilan → konteks harus dipadatkan jauh lebih awal.
+   */
+  providerCachesPrompt(sessionId: string): boolean
   /** Dipanggil Session saat turn gagal karena limit — untuk auto-switch akun bila aktif. */
   onLimitHit(sessionId: string): void
   /** Dipanggil Session saat ctx% ≥ ambang → auto-compact (padatkan konteks, cegah freeze). */

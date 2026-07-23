@@ -555,6 +555,11 @@ export class SessionManager implements GroveHost {
     return { env, model: this.resolveModel(sessionId), effort: this.resolveEffort(sessionId) }
   }
 
+  /** GroveHost.providerCachesPrompt — gateway OpenAI-compatible tak melaporkan cache sama sekali. */
+  providerCachesPrompt(sessionId: string): boolean {
+    return this.effectiveAccount(sessionId)?.provider !== 'dzax'
+  }
+
   /** GroveHost.perMessageUsageReliable — lihat kontraknya di mcpTools.ts. */
   perMessageUsageReliable(sessionId: string): boolean {
     return this.effectiveAccount(sessionId)?.provider !== 'dzax'
