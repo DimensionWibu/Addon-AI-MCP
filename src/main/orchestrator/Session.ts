@@ -219,6 +219,23 @@ function isLimitNotice(text: string): boolean {
  * ("model_not_allowed"), atau namanya tak dikenal. Retry model yang sama percuma; yang benar adalah
  * pindah ke model cadangan.
  */
+/**
+ * Panggilan Read ini HARUS dicegah? true bila: file itu sudah pernah dibaca sesi ini SEBELUM compact,
+ * dan sekarang diminta LAGI secara penuh (tanpa offset/limit). Dipisah jadi fungsi murni supaya bisa
+ * diuji tanpa SDK — inilah penjaga yang mencegah konteks menggelembung lagi tepat setelah dipadatkan.
+ */
+export function shouldBlockReread(
+  toolName: string | undefined,
+  toolInput: unknown,
+  readBeforeCompact: ReadonlySet<string>
+): boolean {
+  if (toolName !== 'Read') return false
+  const ti = (toolInput ?? {}) as Record<string, unknown>
+  const path = typeof ti.file_path === 'string' ? ti.file_path : ''
+  if (!path || !readBeforeCompact.has(path)) return false
+  return ti.offset == null && ti.limit == null // pembacaan SEBAGIAN selalu boleh
+}
+
 export function isModelRejected(raw: string): boolean {
   return /subscription_not_eligible|model_not_allowed|model_not_found|is not available|not allowed to use model|tidak diizinkan untuk key/i.test(raw)
 }
@@ -454,6 +471,9 @@ export class Session {
   private compactStreak = 0 // compact beruntun tanpa turn yang berakhir < LOW (guard anti-freeze; lihat limitStreak)
   private compactWarned = false // peringatan "konteks tetap penuh" sudah dikirim untuk streak ini (anti-spam)
   private lastCompactAt = 0 // kapan konteks terakhir dipadatkan (penentu "checkpoint model masih segar?")
+  /** File yang sudah dibaca SEBELUM compact terakhir — dipakai hook penjaga baca-ulang (lihat start()). */
+  private readonly readBeforeCompact = new Set<string>()
+  private blockedRereads = 0 // berapa kali baca-ulang penuh dicegah sejak compact (untuk nota sekali)
   private checkpointNudge = false // ctx lewat ambang pra-compact → giliran berikutnya minta model update handover
   /** File yang sesi ini TULIS/EDIT (jejak tool_use, bukan tebakan) → bahan "Files Changed" handover. */
   private readonly filesTouched = new Set<string>()
@@ -600,6 +620,47 @@ export class Session {
         // Sengaja TIDAK memakai [] (mode isolasi SDK): user memang menghendaki CLAUDE.md + memori —
         // yang tak diinginkan hanyalah memori LINTAS-PROJECT, dan itu sudah diatasi oleh cwd per-tree.
         settingSources: ['user', 'project', 'local'],
+        // PENJAGA BACA-ULANG SESUDAH COMPACT. Prompt saja terbukti tak cukup: begitu konteks
+        // dipadatkan, model cenderung MEMBACA ULANG SELURUH ISI file yang tadi sudah dibaca — dan
+        // setiap file besar yang masuk konteks ditagih ulang di SETIAP panggilan tool berikutnya.
+        // Hook ini menolak Read TANPA offset/limit atas file yang memang sudah pernah dibaca sesi
+        // ini sebelum compact, dan mengarahkan ke handover / pembacaan sempit. Baca file BARU, atau
+        // baca sebagian, tetap bebas — jadi kerja tak pernah terhenti karenanya.
+        hooks: {
+          PreToolUse: [
+            {
+              hooks: [
+                async (raw) => {
+                  const input = raw as { tool_name?: string; tool_input?: unknown }
+                  if (!shouldBlockReread(input.tool_name, input.tool_input, this.readBeforeCompact)) {
+                    return { continue: true }
+                  }
+                  this.blockedRereads++
+                  if (this.blockedRereads === 1) {
+                    // Beri tahu SEKALI per compact, supaya user tahu ini disengaja (bukan model macet).
+                    this.record({
+                      role: 'system',
+                      text: '🛡️ Baca-ulang file secara penuh dicegah setelah compact — model diarahkan ke handover / pembacaan sebagian. Ini menjaga konteks (dan tagihan tiap panggilan tool) tetap kecil.',
+                      ts: Date.now()
+                    })
+                  }
+                  return {
+                    continue: true,
+                    hookSpecificOutput: {
+                      hookEventName: 'PreToolUse' as const,
+                      permissionDecision: 'deny' as const,
+                      permissionDecisionReason:
+                        `File ini SUDAH kamu baca di sesi ini sebelum konteks dipadatkan, jadi membacanya ULANG secara penuh ` +
+                        `hanya menggelembungkan konteks (dan ditagih lagi di tiap panggilan berikutnya). ` +
+                        `Ambil temuannya dari handover ${handoverRel(this.meta.id)}; kalau memang butuh isi barunya, ` +
+                        `baca SEBAGIAN saja dengan offset/limit di sekitar bagian yang relevan, atau pakai Grep untuk menemukan barisnya.`
+                    }
+                  }
+                }
+              ]
+            }
+          ],
+        },
         // LITE → jangan pasang MCP grove: 13 skema tool (~1.5-2k token) tak ikut tiap request.
         ...(lite ? {} : { mcpServers: { grove: buildGroveServer(this.meta.id, this.host) } }),
         // Env provider sudah dirakit di getSessionLaunch (Claude → CLAUDE_CODE_OAUTH_TOKEN; OpenRouter
@@ -638,10 +699,13 @@ export class Session {
     // board saja terlalu miskin untuk melanjutkan pekerjaan nyata.
     const handover = this.host.beforeCompact(this.meta.id, summary)
     this.lastCompactAt = Date.now()
+    // Semua yang sudah dibaca sampai detik ini jadi acuan penjaga baca-ulang setelah compact.
+    for (const f of this.filesRead) this.readBeforeCompact.add(f)
+    this.blockedRereads = 0
     this.checkpointNudge = false // konteks sudah dipotong → nudge lama tak relevan
     this.interrupting = true // turn dipotong paksa → jangan dianggap "worker selesai"
     this.reseedText = handover
-      ? `${summary}\n\nHANDOVER: file \`${handover}\` di working directory berisi konteks detail (file yang sudah dibaca/diubah, pencarian yang sudah dijalankan, keputusan, langkah berikutnya). BACA file itu SEBELUM mulai bekerja. JANGAN mengulang pencarian atau pembacaan yang sudah tercatat di sana — lanjutkan dari temuannya; perbarui file yang sama saat ada kemajuan berarti.`
+      ? `${summary}\n\nHANDOVER: file \`${handover}\` di working directory berisi konteks detail (file yang sudah dibaca/diubah, pencarian yang sudah dijalankan, keputusan, langkah berikutnya). BACA file itu SEBELUM mulai bekerja. JANGAN mengulang pencarian atau pembacaan yang sudah tercatat di sana — lanjutkan dari temuannya. JANGAN membaca ulang file yang sudah pernah dibaca secara PENUH: kalau butuh isinya lagi, pakai Grep untuk menemukan barisnya lalu Read dengan offset/limit di sekitar situ (pembacaan penuh atas file yang sudah dibaca memang ditolak otomatis). Perbarui file handover yang sama saat ada kemajuan berarti.`
       : summary
     this.meta.sdkSessionId = undefined // start berikutnya FRESH (tanpa resume) → konteks lama dilepas
     this.resetCtx() // ctx% turun ke 0 seketika
