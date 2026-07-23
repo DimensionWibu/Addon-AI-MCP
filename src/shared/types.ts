@@ -600,6 +600,11 @@ export interface GroveApi {
     model?: string,
     baseUrl?: string
   ) => Promise<Account>
+  /** Ubah akun tersimpan. Field yang tak diisi tak disentuh; token kosong = token lama dipertahankan. */
+  updateAccount: (
+    id: string,
+    patch: { label?: string; token?: string; model?: string; baseUrl?: string; plan?: number | null }
+  ) => Promise<Account>
   deleteAccount: (id: string) => Promise<void>
   /** Ambang auto-switch akun ini; null → kembali ikut default global. */
   setAccountSwitchPct: (id: string, pct: number | null) => Promise<void>

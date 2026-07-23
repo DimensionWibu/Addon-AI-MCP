@@ -2628,9 +2628,55 @@ function renderAccountsPanel(): void {
                       `OAI: ${a.model ?? '?'}`
                     )
                   : el('span', {})
-      panel.append(
-        el('div', { class: 'ap-item' }, el('span', { class: 'ap-label' }, a.label), provTag, planTag, del)
-      )
+      // Tombol ✎ — buka form ubah akun di tempat. Ini jalan satu-satunya untuk MELIHAT & mengoreksi
+      // endpoint/model akun gateway tanpa harus menghapus lalu membuat ulang (yang menghilangkan
+      // riwayat pemakaian akun itu).
+      const edit = el('button', { class: 'ap-edit', title: 'Ubah akun (endpoint, model, label, token)' }, '✎')
+      const row = el('div', { class: 'ap-item' }, el('span', { class: 'ap-label' }, a.label), provTag, planTag, edit, del)
+      panel.append(row)
+
+      const form = el('div', { class: 'ap-editbox' })
+      form.hidden = true
+      const field = (labelText: string, value: string, ph: string): HTMLInputElement => {
+        const inp = document.createElement('input')
+        inp.className = 'ap-input'
+        inp.value = value
+        inp.placeholder = ph
+        form.append(el('div', { class: 'ap-sub' }, labelText), inp)
+        return inp
+      }
+      const fLabel = field('Label', a.label, 'nama akun')
+      const fToken = field('Token / API key', '', 'biarkan KOSONG = token lama dipertahankan')
+      fToken.type = 'password'
+      const skinAcc = a.provider !== 'claude'
+      const fModel = skinAcc ? field('Model (pisahkan koma = cadangan otomatis)', a.model ?? '', 'mis. claude-sonnet-5, glm-5.2') : null
+      const ownUrlAcc = a.provider === 'custom' || a.provider === 'cursor' || a.provider === 'dzax'
+      const fUrl = ownUrlAcc ? field('Endpoint (base URL, sampai /v1)', a.baseUrl ?? '', 'https://contoh.id/v1') : null
+      const save = el('button', { class: 'ap-add' }, 'Simpan perubahan')
+      const status = el('div', { class: 'ap-hint' }, '')
+      form.append(save, status)
+      panel.append(form)
+      edit.addEventListener('click', () => {
+        form.hidden = !form.hidden
+        if (!form.hidden) fLabel.focus()
+      })
+      save.addEventListener('click', () => {
+        status.textContent = 'menyimpan…'
+        void window.grove
+          .updateAccount(a.id, {
+            label: fLabel.value,
+            token: fToken.value || undefined,
+            model: fModel ? fModel.value : undefined,
+            baseUrl: fUrl ? fUrl.value : undefined
+          })
+          .then(() => {
+            fToken.value = ''
+            status.textContent = '✓ tersimpan — berlaku pada giliran berikutnya'
+          })
+          .catch((e) => {
+            status.textContent = `gagal: ${String(e)}`
+          })
+      })
 
       // Akun non-Claude (OpenRouter / custom-proxy) tak punya kuota gaya Claude → ambang tak relevan; lewati.
       if (a.provider !== 'claude') continue

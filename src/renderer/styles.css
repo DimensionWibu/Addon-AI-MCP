@@ -633,3 +633,12 @@ form.editing-queue textarea { border-color: var(--accent); }
 ::-webkit-scrollbar-thumb:hover { background: #444; }
 ::-webkit-scrollbar-track { background: var(--bg); }
 .ap-plan { font-size: 10px; color: var(--ok); border: 1px solid var(--ok); border-radius: 8px; padding: 0 6px; }
+
+/* Tombol & form ubah akun (⚙ Akun → ✎). */
+.ap-edit {
+  background: transparent; color: var(--text-dim); border: 1px solid var(--border); border-radius: 3px;
+  cursor: pointer; font-size: 11px; padding: 0 7px;
+}
+.ap-edit:hover { border-color: var(--accent); color: var(--accent); }
+.ap-editbox { border-left: 2px solid var(--accent); padding: 6px 0 8px 8px; margin: 2px 0 8px; }
+.ap-editbox[hidden] { display: none; }

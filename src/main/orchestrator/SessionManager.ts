@@ -400,6 +400,35 @@ export class SessionManager implements GroveHost {
     return { id, label: clean, plan, switchPct: pct, provider: prov, model: orModel, baseUrl: url, createdAt: now }
   }
 
+  /**
+   * Ubah akun tersimpan (label / token / model / base URL / paket). Field yang tak dikirim TIDAK
+   * disentuh — khususnya TOKEN: renderer tak pernah memegangnya, jadi form edit mengirimnya kosong
+   * kecuali user memang mengganti. Provider sengaja TIDAK bisa diubah di sini: mengganti jenis akun
+   * berarti token, base URL, dan arti model ikut berubah — lebih jujur dibuat akun baru.
+   */
+  updateAccount(
+    id: string,
+    patch: { label?: string; token?: string; model?: string; baseUrl?: string; plan?: number | null }
+  ): Account {
+    const acc = this.db.getAccounts().find((a) => a.id === id)
+    if (!acc) throw new Error('Akun tidak ditemukan')
+    const label = patch.label?.trim()
+    const token = patch.token?.trim()
+    const model = patch.model?.trim()
+    const baseUrl = patch.baseUrl?.trim()
+    const skin = isSkinProvider(acc.provider)
+    this.db.updateAccount(id, {
+      label: label || undefined,
+      token: token || undefined,
+      // Model & base URL hanya berlaku untuk provider ber-endpoint sendiri; string kosong = kosongkan.
+      model: skin && model !== undefined ? model : undefined,
+      baseUrl: (usesOwnBaseUrl(acc.provider) || acc.provider === 'dzax') && baseUrl !== undefined ? baseUrl : undefined,
+      plan: patch.plan === undefined ? undefined : patch.plan
+    })
+    this.emitAccounts()
+    return this.db.getAccounts().find((a) => a.id === id)!
+  }
+
   deleteAccount(id: string): void {
     this.db.deleteAccount(id)
     this.usageReadable.delete(id)

@@ -363,6 +363,32 @@ export class Board {
     this.run(`UPDATE accounts SET switch_pct=? WHERE id=?`, [pct, id])
   }
 
+  /**
+   * Ubah akun yang SUDAH ada. `token` undefined = biarkan token lama (renderer memang tak pernah
+   * menerima token, jadi form edit mengirim kosong bila user tak ingin menggantinya).
+   */
+  updateAccount(
+    id: string,
+    f: { label?: string; token?: string; provider?: string; model?: string | null; baseUrl?: string | null; plan?: number | null }
+  ): void {
+    const sets: string[] = []
+    const args: (string | number | null)[] = []
+    const put = (col: string, v: string | number | null | undefined): void => {
+      if (v === undefined) return
+      sets.push(`${col}=?`)
+      args.push(v)
+    }
+    put('label', f.label)
+    put('token', f.token)
+    put('provider', f.provider)
+    put('or_model', f.model)
+    put('base_url', f.baseUrl)
+    put('plan', f.plan)
+    if (!sets.length) return
+    args.push(id)
+    this.run(`UPDATE accounts SET ${sets.join(', ')} WHERE id=?`, args)
+  }
+
   deleteAccount(id: string): void {
     this.run(`DELETE FROM accounts WHERE id=?`, [id])
   }

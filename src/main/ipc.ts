@@ -135,6 +135,12 @@ export function registerIpc(manager: SessionManager): void {
       }
     ) => manager.addAccount(label, token, plan, switchPct, provider, model, baseUrl)
   )
+  // Ubah akun yang sudah ada (label/token/model/base URL). Token kosong = tidak diganti.
+  ipcMain.handle(
+    'grove:updateAccount',
+    (_e, { id, patch }: { id: string; patch: { label?: string; token?: string; model?: string; baseUrl?: string; plan?: number | null } }) =>
+      manager.updateAccount(id, patch)
+  )
   ipcMain.handle('grove:deleteAccount', (_e, { id }: { id: string }) => manager.deleteAccount(id))
   ipcMain.handle('grove:setAccountSwitchPct', (_e, { id, pct }: { id: string; pct: number | null }) =>
     manager.setAccountSwitchPct(id, pct)

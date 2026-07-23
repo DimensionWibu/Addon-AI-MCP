@@ -37,6 +37,8 @@ const api: GroveApi = {
     model?: string,
     baseUrl?: string
   ) => ipcRenderer.invoke('grove:addAccount', { label, token, plan, switchPct, provider, model, baseUrl }),
+  updateAccount: (id: string, patch: { label?: string; token?: string; model?: string; baseUrl?: string; plan?: number | null }) =>
+    ipcRenderer.invoke('grove:updateAccount', { id, patch }),
   deleteAccount: (id: string) => ipcRenderer.invoke('grove:deleteAccount', { id }),
   setAccountSwitchPct: (id: string, pct: number | null) =>
     ipcRenderer.invoke('grove:setAccountSwitchPct', { id, pct }),
