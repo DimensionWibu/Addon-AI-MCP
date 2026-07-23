@@ -479,6 +479,8 @@ export class Session {
   private qidSeq = 1
   /** Waktu terakhir API merespons (dari applyUsage). Dipakai SessionManager untuk tahu kapan cache perlu di-warm. */
   lastApiActivity = 0
+  /** Kapan query (subprocess CLI) sesi ini terakhir dinyalakan — dasar pemetaan pid di procWatch. */
+  queryStartedAt = 0
 
   constructor(
     meta: SessionMeta,
@@ -551,6 +553,7 @@ export class Session {
       this.host.onAccountMissing(this.meta.id)
       return
     }
+    this.queryStartedAt = Date.now() // proses CLI lahir sesaat setelah ini → dipakai memetakan pid
     this.q = query({
       prompt: this.inbox,
       options: {

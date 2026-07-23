@@ -217,6 +217,7 @@ app.whenReady().then(async () => {
   managerRef = manager
   manager.loadFromDisk() // muat session lama (dormant) agar history & context tetap terlihat
   registerIpc(manager)
+  manager.startProcWatch() // pid & RAM tiap proses CLI → panel LOG
   // Tray WAJIB ada begitu keep-alive menyala (termasuk di dev): tanpa ikon ini, jendela yang
   // ditutup meninggalkan proses yang cuma bisa dimatikan lewat Task Manager.
   if (KEEP_ALIVE) createTray()

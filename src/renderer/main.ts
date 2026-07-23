@@ -3394,6 +3394,31 @@ function onEvent(ev: GroveEvent): void {
       renderUsage(ev.payload)
       break
     }
+    case 'procs:update': {
+      // Baris ringkas: total RAM + tiap proses (pid, RAM, sesi pemiliknya). Sesi yang sedang dibuka
+      // ditebalkan supaya "ini proses milik yang saya lihat" langsung kelihatan.
+      const box = document.getElementById('log-procs')
+      if (box) {
+        const { totalRamMb, procs } = ev.payload
+        box.textContent = ''
+        if (procs.length) {
+          box.append(`⚙ ${procs.length} proses CLI · ${totalRamMb} MB  `)
+          for (const p of procs) {
+            const own = p.sessionId === activeId
+            box.append(
+              el(
+                'span',
+                { class: own ? 'lp-mine' : '' },
+                ' · ',
+                el('span', { class: 'lp-pid' }, `pid ${p.pid}`),
+                ` ${p.ramMb}MB ${p.title ? clip1(p.title, 22) : '(tak terpetakan)'}`
+              )
+            )
+          }
+        }
+      }
+      break
+    }
     case 'session:removed': {
       applyRemoved(ev.payload.ids) // idempoten dgn confirmDelete; tangani hapus dari sumber lain
       break

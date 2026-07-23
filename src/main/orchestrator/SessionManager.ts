@@ -42,6 +42,7 @@ import { Board } from './db'
 import { Session } from './Session'
 import { handoverIsFresh, handoverPath, handoverRel, writeHandover } from './handover'
 import { bridgeBaseUrl, setBridgeUsageSink } from '../openaiBridge'
+import { listCliProcs } from '../procWatch'
 import { cap, CAP_MESSAGE, CAP_PROGRESS, type GroveHost } from './mcpTools'
 import { contextPercent, contextWindowFor } from './contextWindows'
 import { WAKE, reportSignature, shouldSkipWake } from './wakePolicy'
@@ -138,6 +139,9 @@ export class SessionManager implements GroveHost {
   private readonly creditWarned = new Set<string>()
   /** Akun yang baru saja GAGAL jadi jembatan gambar → jangan dicoba duluan lagi untuk sementara. */
   private readonly visionFailedAt = new Map<string, number>()
+  /** pid subprocess CLI → sessionId (hasil pemetaan waktu-mulai di sampleProcs). */
+  private readonly pidOwner = new Map<number, string>()
+  private procTimer: NodeJS.Timeout | null = null
 
   constructor(
     private readonly db: Board,
@@ -666,6 +670,48 @@ export class SessionManager implements GroveHost {
         return built ? { id: acc.id, env: built.env, model: built.model, label: acc.label } : null
       })
       .filter((x): x is { id: string; env: Record<string, string>; model?: string; label: string } => x !== null)
+  }
+
+  /**
+   * PANTAU PROSES CLI: senaraikan proses anak Grove lalu petakan ke sesi berdasarkan waktu mulai
+   * query. Hasilnya dikirim ke UI (panel LOG) supaya pertanyaan "worker mana yang memakan RAM /
+   * proses mana yang harus dimatikan" bisa dijawab tanpa menebak lewat Task Manager.
+   *
+   * Pemetaan hanya dilakukan SEKALI per pid (disimpan di pidOwner) — sesudah itu tak berubah walau
+   * sesi lain start. Pid yang tak cocok ke sesi mana pun tetap ditampilkan apa adanya.
+   */
+  private async sampleProcs(): Promise<void> {
+    const procs = await listCliProcs()
+    const live = new Set(procs.map((p) => p.pid))
+    for (const pid of [...this.pidOwner.keys()]) if (!live.has(pid)) this.pidOwner.delete(pid)
+    // Kandidat sesi: yang query-nya memang sedang hidup, diurut dari yang paling baru start.
+    const sessions = [...this.sessions.values()].filter((x) => x.queryStartedAt > 0).sort((a, b) => b.queryStartedAt - a.queryStartedAt)
+    for (const proc of procs) {
+      if (this.pidOwner.has(proc.pid)) continue
+      // Sesi yang start PALING DEKAT sebelum proses ini lahir & belum punya proses lain.
+      const owner = sessions.find(
+        (x) => proc.startedAt >= x.queryStartedAt - 3000 && ![...this.pidOwner.entries()].some(([, sid]) => sid === x.meta.id)
+      )
+      if (owner) this.pidOwner.set(proc.pid, owner.meta.id)
+    }
+    this.emit({
+      channel: 'procs:update',
+      payload: {
+        totalRamMb: procs.reduce((n, p) => n + p.ramMb, 0),
+        procs: procs.map((p) => {
+          const sid = this.pidOwner.get(p.pid)
+          return { pid: p.pid, ramMb: p.ramMb, sessionId: sid, title: sid ? this.sessions.get(sid)?.meta.title : undefined }
+        })
+      }
+    })
+  }
+
+  /** Nyalakan pemantauan proses berkala (dipanggil sekali dari main). */
+  startProcWatch(intervalMs = 20_000): void {
+    if (this.procTimer) return
+    void this.sampleProcs()
+    this.procTimer = setInterval(() => void this.sampleProcs(), intervalMs)
+    this.procTimer.unref?.()
   }
 
   /** GroveHost.noteVisionFailure — akun ini baru saja gagal membaca gambar → turunkan prioritasnya. */

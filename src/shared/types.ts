@@ -541,6 +541,11 @@ export type GroveEvent =
       // inline, lalu ikut basi tiap kali ada field baru (bug: renderer tak melihat field itu).
       payload: AccountsState
     }
+  /** Proses CLI yang hidup + pemetaannya ke sesi (best-effort, lihat procWatch.ts). */
+  | {
+      channel: 'procs:update'
+      payload: { totalRamMb: number; procs: Array<{ pid: number; ramMb: number; sessionId?: string; title?: string }> }
+    }
   | { channel: 'session:removed'; payload: { ids: string[] } }
   | { channel: 'session:activity'; payload: { id: string; activity: string } }
   | { channel: 'usage:update'; payload: UsageSnapshot }

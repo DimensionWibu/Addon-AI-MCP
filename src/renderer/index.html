@@ -104,6 +104,9 @@
             <span>REQUEST MENTAH</span>
             <span class="log-hint" id="log-hint">belum ada</span>
           </div>
+          <!-- Proses CLI yang hidup + pemetaannya ke sesi (pid & RAM) — menjawab "worker mana yang
+               memakan RAM / proses mana yang harus dimatikan" tanpa membuka Task Manager. -->
+          <div class="log-procs" id="log-procs" title="Proses CLI milik Grove. Pemetaan ke sesi berdasarkan waktu mulai query (best-effort)."></div>
           <div class="log-tree" id="log-tree"></div>
         </div>
       </section>

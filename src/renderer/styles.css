@@ -647,3 +647,12 @@ form.editing-queue textarea { border-color: var(--accent); }
 .ap-edit:hover { border-color: var(--accent); color: var(--accent); }
 .ap-editbox { border-left: 2px solid var(--accent); padding: 6px 0 8px 8px; margin: 2px 0 8px; }
 .ap-editbox[hidden] { display: none; }
+
+/* Baris proses CLI di panel LOG. */
+.log-procs {
+  padding: 4px 10px; font-size: 10px; color: var(--text-dim); border-bottom: 1px solid var(--border);
+  white-space: nowrap; overflow-x: auto;
+}
+.log-procs:empty { display: none; }
+.log-procs .lp-pid { color: var(--accent); }
+.log-procs .lp-mine { color: var(--text); font-weight: 700; }
