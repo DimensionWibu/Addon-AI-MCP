@@ -31,7 +31,8 @@
     "test:model": "esbuild test/model-fallback.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/mf.mjs && electron .tmp/mf.mjs",
     "test:acctedit": "esbuild test/account-edit.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/ae.mjs && electron .tmp/ae.mjs",
     "test:vision": "esbuild test/vision-bridge.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/vb.mjs && electron .tmp/vb.mjs",
-    "test:procs": "tsx test/proc-watch.ts"
+    "test:procs": "tsx test/proc-watch.ts",
+    "test:queue": "esbuild test/queue-compact.ts --bundle --platform=node --format=esm --external:electron --external:sql.js --outfile=.tmp/qc.mjs && electron .tmp/qc.mjs"
   },
   "build": {
     "appId": "com.grove.orchestrator",

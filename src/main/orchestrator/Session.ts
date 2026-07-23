@@ -1831,9 +1831,23 @@ export class Session {
           cleanEnd ? { finalText: this.turnText || this.lastAssistantText } : undefined
         )
         this.turnText = '' // sudah dipakai → bersihkan agar turn berikutnya mulai bersih
+        // KEPUTUSAN COMPACT DIHITUNG DULU — sebelum antrian dilepas.
+        // Dulu antrian dilepas lebih dulu: pesan user terkirim, lalu compact langsung MEMOTONG query
+        // yang baru saja menerimanya. Akibatnya pesan itu tampil di chat tapi tak pernah dijawab —
+        // "konteks penuh, sesudah compact kok tidak dilanjut". Sekarang: padatkan dulu, baru pesan
+        // antrian dikirim ke sesi yang sudah lega (lengkap dengan reseed ringkasan).
+        const decision = compactDecision(
+          this.meta.role,
+          this.meta.ctxInput,
+          this.meta.ctxWindow,
+          this.compactArmed,
+          !this.host.providerCachesPrompt(this.meta.id)
+        )
+        const willCompact = !!this.pendingCompactSeed || (decision.compact && this.compactStreak < 2)
         // Pesan user yang tertahan selama turn berjalan → kirim SEKARANG (satu per turn). Ditunda bila
-        // turn ini akan di-retry/di-recycle/kena limit: pesan user tak boleh nyelip di tengah pemulihan.
-        if (!this.transientPending && !this.apiBlockPending && !this.limitHitPending && !this.pendingCompactSeed) {
+        // turn ini akan di-retry/di-recycle/kena limit/dipadatkan: pesan user tak boleh nyelip di
+        // tengah pemulihan, dan tak boleh terkirim tepat sebelum konteksnya dipotong.
+        if (!this.transientPending && !this.apiBlockPending && !this.limitHitPending && !willCompact) {
           this.flushQueued()
         }
         // Model ditolak gateway → pindah ke model cadangan akun lalu ulangi permintaan terakhir.
@@ -1849,17 +1863,13 @@ export class Session {
           break
         }
         // Bila ada permintaan compact tertunda, padatkan konteks sekarang (turn sudah selesai).
-        if (this.pendingCompactSeed) this.doCompact()
-        else {
-          // Keputusan (persen window ATAU plafon token) ada di wakePolicy.compactDecision — fungsi
+        if (this.pendingCompactSeed) {
+          this.doCompact()
+          this.flushQueued() // pesan yang menunggu dilanjutkan di konteks yang sudah dipadatkan
+        } else {
+          // Keputusan (persen window ATAU plafon token) dari wakePolicy.compactDecision — fungsi
           // murni yang bisa diuji tanpa SDK, karena inilah jalur penentu biaya per giliran.
-          const d = compactDecision(
-            this.meta.role,
-            this.meta.ctxInput,
-            this.meta.ctxWindow,
-            this.compactArmed,
-            !this.host.providerCachesPrompt(this.meta.id)
-          )
+          const d = decision
           // Pra-compact: titipkan permintaan update handover ke giliran BERIKUTNYA (lihat decorate()).
           if (d.nudge) this.checkpointNudge = true
           if (d.relaxed) {
@@ -1889,6 +1899,9 @@ export class Session {
             } else {
               // Auto-compact: konteks mendekati penuh → minta orkestrator padatkan (cegah freeze).
               this.host.notifyHighContext(this.meta.id)
+              // Konteks sudah lega → baru pesan yang menunggu dilepas, supaya ia dijawab (dengan
+              // reseed ringkasan) alih-alih terpotong compact seperti dulu.
+              this.flushQueued()
             }
           }
         }
