@@ -41,9 +41,11 @@ export interface GroveHost {
   /** Akun efektif sesi ini bisa melihat gambar? (DeepSeek mengabaikan gambar diam-diam → false) */
   sessionSeesImages(sessionId: string): boolean
   /** Env+model akun yang bisa melihat gambar, untuk menjembatani gambar milik sesi yang buta gambar. */
-  getVisionLaunch(): { env: Record<string, string>; model?: string; label: string } | null
+  getVisionLaunch(): { id: string; env: Record<string, string>; model?: string; label: string } | null
   /** Semua kandidat jembatan gambar, terurut — dicoba berurutan saat yang pertama limit/gagal. */
-  getVisionLaunches(): Array<{ env: Record<string, string>; model?: string; label: string }>
+  getVisionLaunches(): Array<{ id: string; env: Record<string, string>; model?: string; label: string }>
+  /** Akun ini gagal membaca gambar → jangan dijadikan kandidat pertama untuk sementara. */
+  noteVisionFailure(accountId: string): void
   /** Sesi ini punya referensi satu-arah? Menentukan dipasang/tidaknya tool ref_* (hemat skema token). */
   hasReferences(sessionId: string): boolean
   /** Sesi-sesi yang boleh DIBANTU sesi ini (tautan satu arah; target tak punya akses balik). */

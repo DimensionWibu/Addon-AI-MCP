@@ -415,6 +415,17 @@ export class AsyncMessageQueue implements AsyncIterable<SDKUserMessage> {
   }
 }
 
+/** Batas tunggu SATU akun jembatan gambar. Lewat ini, akun itu ditinggal & lanjut ke berikutnya. */
+const VISION_TIMEOUT_MS = 75_000
+
+/** Janji yang MENOLAK setelah ms tertentu — dipakai membatasi tunggu per akun jembatan. */
+function rejectAfter(ms: number, label: string): Promise<never> {
+  return new Promise((_r, reject) => {
+    const t = setTimeout(() => reject(new Error(`tak ada jawaban dalam ${Math.round(ms / 1000)} detik`)), ms)
+    t.unref?.()
+  })
+}
+
 export class Session {
   readonly meta: SessionMeta
   private readonly inbox = new AsyncMessageQueue()
@@ -1336,26 +1347,40 @@ export class Session {
         }
       })
         let failure = ''
-        for await (const m of q as AsyncIterable<Record<string, unknown>>) {
-          if (String(m.type) === 'assistant') {
-            const blocks = (m.message as { content?: Array<{ type: string; text?: string }> })?.content ?? []
-            for (const b of blocks) {
-              if (b.type === 'text' && b.text) {
-                // Limit datang sebagai TEKS asisten ("You've hit your session limit · resets …"),
-                // bukan exception → tanpa cek ini, "limit" ikut jadi "deskripsi" gambar.
-                if (isLimitNotice(b.text) || isTransientError(b.text)) failure = b.text
-                else desc += b.text
+        const started = Date.now()
+        // BATAS WAKTU PER AKUN. Tanpa ini, satu akun yang menggantung (token bermasalah, gateway
+        // lambat, antrian upstream) menahan SELURUH rantai — pernah terukur ~10 menit dari tempel
+        // gambar sampai ada jawaban. Lewat batas: query dibuang (prosesnya ikut mati) lalu lanjut.
+        const consume = async (): Promise<void> => {
+          for await (const m of q as AsyncIterable<Record<string, unknown>>) {
+            if (String(m.type) === 'assistant') {
+              const blocks = (m.message as { content?: Array<{ type: string; text?: string }> })?.content ?? []
+              for (const b of blocks) {
+                if (b.type === 'text' && b.text) {
+                  // Limit datang sebagai TEKS asisten ("You've hit your session limit · resets …"),
+                  // bukan exception → tanpa cek ini, "limit" ikut jadi "deskripsi" gambar.
+                  if (isLimitNotice(b.text) || isTransientError(b.text)) failure = b.text
+                  else desc += b.text
+                }
               }
             }
-          }
-          if (String(m.type) === 'result') {
-            const r = m as { subtype?: string; errors?: unknown[] }
-            if (r.subtype && r.subtype !== 'success') {
-              failure ||= `${r.subtype}${Array.isArray(r.errors) && r.errors.length ? `: ${String(r.errors[0])}` : ''}`
+            if (String(m.type) === 'result') {
+              const r = m as { subtype?: string; errors?: unknown[] }
+              if (r.subtype && r.subtype !== 'success') {
+                failure ||= `${r.subtype}${Array.isArray(r.errors) && r.errors.length ? `: ${String(r.errors[0])}` : ''}`
+              }
+              break
             }
-            break
           }
         }
+        try {
+          await Promise.race([consume(), rejectAfter(VISION_TIMEOUT_MS, vision.label)])
+        } finally {
+          // Query jembatan SELALU dibuang — termasuk saat kena batas waktu, supaya tak meninggalkan
+          // proses CLI yang menggantung (lihat disposeQuery).
+          this.disposeQuery(q)
+        }
+        this.emitActivity(`🖼️ ${vision.label} · ${Math.round((Date.now() - started) / 1000)}s`)
         if (failure) throw new Error(failure)
         if (desc.trim()) {
           usedLabel = vision.label
@@ -1364,6 +1389,7 @@ export class Session {
         throw new Error('deskripsi kosong')
       } catch (e) {
         desc = ''
+        this.host.noteVisionFailure(vision.id) // jangan dicoba duluan lagi pada gambar berikutnya
         const why = String(e)
         const limited = isLimitNotice(why) || isLimitError(why)
         const more = candidates.indexOf(vision) < candidates.length - 1

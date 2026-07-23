@@ -62,6 +62,9 @@ function clampPct(pct: number): number {
   if (!Number.isFinite(pct)) return DEFAULT_SWITCH_PCT
   return Math.min(SWITCH_PCT_MAX, Math.max(SWITCH_PCT_MIN, Math.round(pct)))
 }
+/** Selama ini, akun yang gagal membaca gambar tak dicoba duluan lagi. */
+const VISION_FAIL_COOLDOWN_MS = 10 * 60_000
+
 const DEFAULT_ACCT_KEY = '__default__' // penanda sesi yang memakai login CLI (bukan akun tersimpan)
 // COALESCE laporan worker → parent. Pemboros token DOMINAN bukan besar teksnya, melainkan JUMLAH
 // GILIRAN: tiap injectAutoTask membuat giliran baru yang menagih ULANG seluruh konteks parent yang
@@ -133,6 +136,8 @@ export class SessionManager implements GroveHost {
   // Akun API-key yang kreditnya sudah menembus ambang TAPI tak punya akun se-provider untuk
   // dipindahi → diperingatkan SEKALI (poll 5 menit; tanpa ini nota yang sama muncul terus).
   private readonly creditWarned = new Set<string>()
+  /** Akun yang baru saja GAGAL jadi jembatan gambar → jangan dicoba duluan lagi untuk sementara. */
+  private readonly visionFailedAt = new Map<string, number>()
 
   constructor(
     private readonly db: Board,
@@ -521,6 +526,62 @@ export class SessionManager implements GroveHost {
   }
 
   /**
+   * ENV + MODEL untuk sebuah AKUN — SATU tempat untuk semua jalur.
+   *
+   * Dulu perakitan env ditulis dua kali (jalur sesi & jalur jembatan gambar), dan yang kedua tak ikut
+   * diperbarui saat provider gateway ditambahkan: akun gateway diarahkan ke base URL OpenRouter
+   * dengan token gateway → "401 Missing Authentication header", lalu Grove mencoba akun berikutnya
+   * satu per satu sampai bermenit-menit. Sekarang keduanya memanggil fungsi ini.
+   *
+   * `preferModel` dipakai jalur sesi (override model per-sesi); tanpa itu dipakai kandidat pertama.
+   */
+  private accountEnv(
+    acc: Account,
+    preferModel?: string
+  ): { env: Record<string, string>; model?: string } | null {
+    const token = this.db.getAccountToken(acc.id)
+    if (!token) return null
+    const env: Record<string, string> = { ...process.env } as Record<string, string>
+    if (acc.provider === 'dzax') {
+      const cands = modelCandidates(acc.model)
+      const model = (preferModel && cands.includes(preferModel) ? preferModel : cands[0]) || DZAX_MODEL_SUGGESTIONS[0].id
+      const bridge = bridgeBaseUrl(acc.baseUrl || DZAX_BASE_URL_DEFAULT, model)
+      if (!bridge) return null // jembatan belum menyala → lebih baik gagal terang-terangan
+      env.ANTHROPIC_BASE_URL = bridge
+      env.ANTHROPIC_AUTH_TOKEN = token
+      delete env.ANTHROPIC_API_KEY
+      delete env.CLAUDE_CODE_OAUTH_TOKEN
+      env.ANTHROPIC_MODEL = model
+      env.ANTHROPIC_DEFAULT_OPUS_MODEL = model
+      env.ANTHROPIC_DEFAULT_SONNET_MODEL = model
+      env.ANTHROPIC_DEFAULT_HAIKU_MODEL = model
+      env.ANTHROPIC_SMALL_FAST_MODEL = model
+      return { env, model }
+    }
+    if (isSkinProvider(acc.provider)) {
+      env.ANTHROPIC_BASE_URL = skinBaseUrl(acc.provider, acc.baseUrl)
+      env.ANTHROPIC_AUTH_TOKEN = token
+      delete env.ANTHROPIC_API_KEY
+      delete env.CLAUDE_CODE_OAUTH_TOKEN
+      if (acc.provider === 'deepseek') {
+        const main = acc.model || DEEPSEEK_MODEL_DEFAULT
+        const fast = main.replace(/-pro$/, '-flash')
+        env.ANTHROPIC_MODEL = main
+        env.ANTHROPIC_DEFAULT_OPUS_MODEL = main
+        env.ANTHROPIC_DEFAULT_SONNET_MODEL = main
+        env.ANTHROPIC_DEFAULT_HAIKU_MODEL = fast
+        env.ANTHROPIC_SMALL_FAST_MODEL = fast
+      }
+      return { env, model: acc.model }
+    }
+    env.CLAUDE_CODE_OAUTH_TOKEN = token
+    delete env.ANTHROPIC_API_KEY
+    delete env.ANTHROPIC_AUTH_TOKEN
+    delete env.ANTHROPIC_BASE_URL
+    return { env }
+  }
+
+  /**
    * GroveHost.getSessionLaunch — semua yang dibutuhkan query untuk sesi ini: token + env provider
    * (Claude vs OpenRouter) + model efektif. null = tak ada akun → sesi tak boleh jalan.
    * Env provider dibangun DI SINI supaya Session tak perlu tahu detail tiap provider.
@@ -530,59 +591,18 @@ export class SessionManager implements GroveHost {
   ): { env: Record<string, string>; model?: string; effort?: EffortSetting } | null {
     const acc = this.effectiveAccount(sessionId)
     if (!acc) return null
-    const token = this.db.getAccountToken(acc.id)
-    if (!token) return null
-    const env: Record<string, string> = { ...process.env } as Record<string, string>
-    if (acc.provider === 'dzax') {
-      // GATEWAY BER-FORMAT OPENAI: CLI tak bisa bicara langsung ke sana. Arahkan ke jembatan lokal
-      // (openaiBridge) yang menerjemahkan Anthropic ⇄ OpenAI; tujuan upstream & model default
-      // dikodekan di path jembatan, token diteruskan apa adanya lewat header.
-      // Field model boleh berisi beberapa id dipisah koma (daftar cadangan) → pakai yang pertama,
-      // kecuali sesi ini sudah punya override sendiri (mis. hasil pindah otomatis saat model ditolak).
-      const sessionModel = this.resolveModel(sessionId)
-      const model = (sessionModel && modelCandidates(acc.model).includes(sessionModel) ? sessionModel : modelCandidates(acc.model)[0]) || DZAX_MODEL_SUGGESTIONS[0].id
-      const bridge = bridgeBaseUrl(acc.baseUrl || DZAX_BASE_URL_DEFAULT, model, sessionId)
-      if (!bridge) return null // jembatan belum menyala → lebih baik sesi berhenti daripada salah kirim
-      env.ANTHROPIC_BASE_URL = bridge
-      env.ANTHROPIC_AUTH_TOKEN = token
-      delete env.ANTHROPIC_API_KEY
-      delete env.CLAUDE_CODE_OAUTH_TOKEN
-      // Jalur internal CLI memanggil model per-KELAS (haiku untuk judul, sonnet/opus untuk sub-agent);
-      // nama alias itu tak ada di gateway → petakan semuanya ke model akun ini.
-      env.ANTHROPIC_MODEL = model
-      env.ANTHROPIC_DEFAULT_OPUS_MODEL = model
-      env.ANTHROPIC_DEFAULT_SONNET_MODEL = model
-      env.ANTHROPIC_DEFAULT_HAIKU_MODEL = model
-      env.ANTHROPIC_SMALL_FAST_MODEL = model
-    } else if (isSkinProvider(acc.provider)) {
-      // "Anthropic Skin": Claude Code kirim format Anthropic, endpoint yang menerjemahkan.
-      // openrouter/deepseek → base URL tetap milik providernya; custom/cursor → base URL akun (proxy).
-      env.ANTHROPIC_BASE_URL = skinBaseUrl(acc.provider, acc.baseUrl)
-      env.ANTHROPIC_AUTH_TOKEN = token
-      delete env.ANTHROPIC_API_KEY // AUTH_TOKEN yang jadi bearer; API_KEY bisa bentrok
-      delete env.CLAUDE_CODE_OAUTH_TOKEN // jangan sampai malah dipakai token Claude
-      if (acc.provider === 'deepseek') {
-        // Claude Code punya jalur INTERNAL yang memanggil model per-KELAS (haiku untuk ringkasan
-        // judul/topik, sonnet/opus untuk sub-agent) — nama alias itu tak ada di DeepSeek → 400/404
-        // di tengah sesi. Petakan ketiganya ke model DeepSeek yang dipakai akun ini supaya seluruh
-        // jalur CLI tetap hidup. (Kelas "cepat" sengaja ke -flash bila ada, biar tak boros.)
-        const main = acc.model || DEEPSEEK_MODEL_DEFAULT
-        const fast = main.replace(/-pro$/, '-flash')
-        env.ANTHROPIC_MODEL = main
-        env.ANTHROPIC_DEFAULT_OPUS_MODEL = main
-        env.ANTHROPIC_DEFAULT_SONNET_MODEL = main
-        env.ANTHROPIC_DEFAULT_HAIKU_MODEL = fast
-        env.ANTHROPIC_SMALL_FAST_MODEL = fast // nama lama (CLI versi sebelumnya)
-      }
-    } else {
-      // Claude: token OAuth langganan. ANTHROPIC_* dibuang supaya tak mengalahkan token ini.
-      env.CLAUDE_CODE_OAUTH_TOKEN = token
-      delete env.ANTHROPIC_API_KEY
-      delete env.ANTHROPIC_AUTH_TOKEN
-      delete env.ANTHROPIC_BASE_URL
+    // Perakitan env ada di accountEnv() — dipakai bersama jalur jembatan gambar supaya keduanya tak
+    // pernah lagi berbeda perlakuan untuk provider yang sama.
+    const built = this.accountEnv(acc, this.resolveModel(sessionId))
+    if (!built) return null
+    return {
+      env: built.env,
+      // Akun gateway/skin memaksa model akun; akun Claude memakai rantai model sesi → utama → global.
+      model: built.model ?? this.resolveModel(sessionId),
+      effort: this.resolveEffort(sessionId)
     }
-    return { env, model: this.resolveModel(sessionId), effort: this.resolveEffort(sessionId) }
   }
+
 
   /**
    * GroveHost.nextModelCandidate — pindah ke model cadangan akun (daftar dipisah koma di field model).
@@ -628,37 +648,33 @@ export class SessionManager implements GroveHost {
    * Urutan: akun GLOBAL dulu (yang biasa dipakai user) → akun dengan kuota TERBACA & masih di bawah
    * ambangnya → sisanya. Akun tanpa token dilewati.
    */
-  getVisionLaunches(): Array<{ env: Record<string, string>; model?: string; label: string }> {
+  getVisionLaunches(): Array<{ id: string; env: Record<string, string>; model?: string; label: string }> {
     const accts = this.db.getAccounts().filter((a) => providerSeesImages(a.provider))
     const score = (a: Account): number => {
+      // Akun yang BARU SAJA gagal membaca gambar ditaruh paling belakang: mengulanginya lebih dulu
+      // hanya membuat user menunggu lagi (tiap percobaan menghabiskan satu giliran + batas waktunya).
+      const failedAt = this.visionFailedAt.get(a.id) ?? 0
+      if (Date.now() - failedAt < VISION_FAIL_COOLDOWN_MS) return 3
       if (a.id === this.defaultAccountId) return 0
-      return a.usageReadable === false ? 2 : 1 // kuota tak terbaca (token bermasalah) → paling belakang
+      return a.usageReadable === false ? 2 : 1 // kuota tak terbaca (token bermasalah) → belakang
     }
     return this.accountsWithStatus()
       .filter((a) => accts.some((x) => x.id === a.id))
       .sort((a, b) => score(a) - score(b))
-      .map((acc): { env: Record<string, string>; model?: string; label: string } | null => {
-        const token = this.db.getAccountToken(acc.id)
-        if (!token) return null
-        const env: Record<string, string> = { ...process.env } as Record<string, string>
-        if (isSkinProvider(acc.provider)) {
-          env.ANTHROPIC_BASE_URL = skinBaseUrl(acc.provider, acc.baseUrl)
-          env.ANTHROPIC_AUTH_TOKEN = token
-          delete env.ANTHROPIC_API_KEY
-          delete env.CLAUDE_CODE_OAUTH_TOKEN
-        } else {
-          env.CLAUDE_CODE_OAUTH_TOKEN = token
-          delete env.ANTHROPIC_API_KEY
-          delete env.ANTHROPIC_AUTH_TOKEN
-          delete env.ANTHROPIC_BASE_URL
-        }
-        return { env, model: isSkinProvider(acc.provider) ? acc.model : undefined, label: acc.label }
+      .map((acc): { id: string; env: Record<string, string>; model?: string; label: string } | null => {
+        const built = this.accountEnv(acc)
+        return built ? { id: acc.id, env: built.env, model: built.model, label: acc.label } : null
       })
-      .filter((x): x is { env: Record<string, string>; model?: string; label: string } => x !== null)
+      .filter((x): x is { id: string; env: Record<string, string>; model?: string; label: string } => x !== null)
+  }
+
+  /** GroveHost.noteVisionFailure — akun ini baru saja gagal membaca gambar → turunkan prioritasnya. */
+  noteVisionFailure(accountId: string): void {
+    this.visionFailedAt.set(accountId, Date.now())
   }
 
   /** Kandidat jembatan gambar TERBAIK (null = tak ada akun yang bisa melihat gambar). */
-  getVisionLaunch(): { env: Record<string, string>; model?: string; label: string } | null {
+  getVisionLaunch(): { id: string; env: Record<string, string>; model?: string; label: string } | null {
     return this.getVisionLaunches()[0] ?? null
   }
 
