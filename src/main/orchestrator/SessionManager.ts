@@ -37,9 +37,10 @@ import {
   skinBaseUrl,
   usesOwnBaseUrl
 } from '../../shared/types'
-import type { EffortSetting } from '../../shared/types'
+import type { AutoRule, AutoRuleAction, EffortSetting } from '../../shared/types'
 import { Board } from './db'
-import { Session } from './Session'
+import { DEFAULT_AUTO_RULES, matchAutoRule as matchRuleIn, parseRules, sanitizeRules } from './autoRules'
+import { MAX_TRANSIENT_RETRIES, Session } from './Session'
 import { handoverIsFresh, handoverPath, handoverRel, writeHandover } from './handover'
 import { bridgeBaseUrl, setBridgeUsageSink } from '../openaiBridge'
 import { listCliProcs } from '../procWatch'
@@ -130,6 +131,8 @@ export class SessionManager implements GroveHost {
   private readonly pinnedAccount = new Map<string, string | null>() // sessionId → accountId pilihan user
   private autoSwitch = false // pindah akun otomatis saat kena limit
   private autoResume = false // saat app dibuka lagi, lanjutkan sesi yang tadinya kerja
+  /** Aturan kata-kunci buatan user (panel Setting) — jaring kedua di atas deteksi bawaan Session. */
+  private autoRules: AutoRule[] = []
   private defaultSwitchPct = DEFAULT_SWITCH_PCT // ambang untuk akun tanpa ambang sendiri
   /** Akun GLOBAL untuk pohon yang tak menentukan sendiri. Nilai khusus 'auto' = ikut URUTAN
    *  PRIORITAS akun (lewati yang sedang kena limit) — mirip router yang memilih sendiri. */
@@ -345,6 +348,23 @@ export class SessionManager implements GroveHost {
       .filter((m) => m.status === 'running')
       .map((m) => m.id)
     this.db.normalizeStaleStatuses()
+    this.loadSettings()
+    // Pin akun pilihan user TAHAN RESTART: tanpa ini restorePinnedAccounts() kehilangan target dan
+    // sesi yang tadi sempat di-auto-switch (mis. ke akun login utama) nyangkut di sana selamanya.
+    for (const p of this.db.getAllSessionPins()) this.pinnedAccount.set(p.sessionId, p.accountId)
+    for (const meta of this.db.getAllSessions()) {
+      if (this.sessions.has(meta.id)) continue
+      this.registerSession(meta, { emit: false, start: false })
+    }
+    // Reconnect: bila diaktifkan, lanjutkan sesi-sesi yang tadi kerja (resume konteks + dorong lanjut).
+    if (this.autoResume) for (const id of wasWorking) this.sessions.get(id)?.autoResume()
+  }
+
+  /**
+   * Baca SEMUA setelan dari DB ke memori. Dipisah dari loadFromDisk supaya bisa dipanggil ULANG
+   * setelah import config — tanpa itu, nilai hasil import baru terpakai setelah app di-restart.
+   */
+  private loadSettings(): void {
     this.autoSwitch = this.db.getSetting('autoSwitch') === '1'
     this.autoResume = this.db.getSetting('autoResume') === '1'
     const savedPct = Number(this.db.getSetting('defaultSwitchPct'))
@@ -355,15 +375,127 @@ export class SessionManager implements GroveHost {
     this.defaultModel = this.db.getSetting('defaultModel') || null
     const savedEffort = this.db.getSetting('defaultEffort')
     this.defaultEffort = isEffort(savedEffort) ? savedEffort : null
-    // Pin akun pilihan user TAHAN RESTART: tanpa ini restorePinnedAccounts() kehilangan target dan
-    // sesi yang tadi sempat di-auto-switch (mis. ke akun login utama) nyangkut di sana selamanya.
-    for (const p of this.db.getAllSessionPins()) this.pinnedAccount.set(p.sessionId, p.accountId)
-    for (const meta of this.db.getAllSessions()) {
-      if (this.sessions.has(meta.id)) continue
-      this.registerSession(meta, { emit: false, start: false })
+    const savedRules = this.db.getSetting('autoRules')
+    // null = belum pernah disimpan → beri contoh bawaan sebagai titik mulai. String '[]' berarti user
+    // MEMANG mengosongkan daftarnya; jangan diam-diam menghidupkan lagi contoh-contohnya.
+    this.autoRules = savedRules == null ? DEFAULT_AUTO_RULES.map((r) => ({ ...r })) : parseRules(savedRules)
+  }
+
+  // ---- aturan otomatis (panel Setting) ---------------------------------------
+
+  getAutoRules(): AutoRule[] {
+    return this.autoRules.map((r) => ({ ...r }))
+  }
+
+  /** Simpan aturan. Balikan = daftar yang BENAR-BENAR dipakai (sudah dibersihkan & dipotong). */
+  setAutoRules(rules: AutoRule[]): AutoRule[] {
+    this.autoRules = sanitizeRules(rules)
+    this.db.setSetting('autoRules', JSON.stringify(this.autoRules))
+    return this.getAutoRules()
+  }
+
+  /** GroveHost.matchAutoRule — dipanggil Session untuk tiap error/balasan yang tak dikenali bawaan. */
+  matchAutoRule(text: string): { label: string; action: AutoRuleAction } | null {
+    const hit = matchRuleIn(text, this.autoRules)
+    return hit ? { label: hit.label, action: hit.action } : null
+  }
+
+  // ---- export / import config & akun -----------------------------------------
+
+  /** Isi file config: setelan + aturan otomatis. TOKEN AKUN TIDAK IKUT (itu file terpisah). */
+  exportConfigData(): Record<string, unknown> {
+    return {
+      kind: 'grove-config',
+      version: 1,
+      exportedAt: Date.now(),
+      settings: this.db.getAllSettings(),
+      autoRules: this.getAutoRules()
     }
-    // Reconnect: bila diaktifkan, lanjutkan sesi-sesi yang tadi kerja (resume konteks + dorong lanjut).
-    if (this.autoResume) for (const id of wasWorking) this.sessions.get(id)?.autoResume()
+  }
+
+  /**
+   * Terapkan file config. Setelan yang menunjuk ID AKUN (default/vision/urutan) hanya diambil bila
+   * akunnya memang ada di PC ini — kalau tidak, sesi akan menunjuk akun hantu dan gagal jalan.
+   */
+  importConfigData(raw: unknown): { settings: number; rules: number } {
+    const obj = (raw ?? {}) as { settings?: Record<string, unknown>; autoRules?: unknown }
+    const known = new Set(this.db.getAccounts().map((a) => a.id))
+    let settings = 0
+    for (const [k, v] of Object.entries(obj.settings ?? {})) {
+      if (typeof v !== 'string') continue
+      if (k === 'autoRules') continue // ditangani lewat jalur aturan di bawah
+      if ((k === 'defaultAccountId' || k === 'visionAccountId') && v && v !== AUTO_ACCOUNT && !known.has(v)) continue
+      if (k === 'accountOrder') {
+        const kept = v.split(',').map((x) => x.trim()).filter((x) => known.has(x))
+        this.db.setSetting(k, kept.join(','))
+        settings++
+        continue
+      }
+      this.db.setSetting(k, v)
+      settings++
+    }
+    const rules = sanitizeRules(obj.autoRules)
+    if (Array.isArray(obj.autoRules)) this.db.setSetting('autoRules', JSON.stringify(rules))
+    this.loadSettings() // berlaku SEKARANG, bukan menunggu app di-restart
+    this.emitAccounts()
+    return { settings, rules: rules.length }
+  }
+
+  /**
+   * Isi file akun. `withTokens` = ikutkan token → file itu RAHASIA (siapa pun yang memegangnya bisa
+   * memakai akunmu). Tanpa token file tetap berguna untuk memindahkan label/model/base-URL, hanya
+   * saja tiap akun harus diisi tokennya lagi di tempat tujuan.
+   */
+  exportAccountsData(withTokens: boolean): Record<string, unknown> {
+    const accounts = this.db.getAccounts().map((a) => ({
+      label: a.label,
+      provider: a.provider,
+      model: a.model,
+      baseUrl: a.baseUrl,
+      plan: a.plan,
+      switchPct: a.switchPct,
+      ...(withTokens ? { token: this.db.getAccountToken(a.id) ?? '' } : {})
+    }))
+    return { kind: 'grove-accounts', version: 1, exportedAt: Date.now(), withTokens, accounts }
+  }
+
+  /** Gabungkan akun dari file: label+provider yang SAMA = diperbarui, sisanya ditambah. */
+  importAccountsData(raw: unknown): { added: number; updated: number } {
+    const obj = (raw ?? {}) as { accounts?: unknown }
+    if (!Array.isArray(obj.accounts)) return { added: 0, updated: 0 }
+    let added = 0
+    let updated = 0
+    for (const item of obj.accounts) {
+      if (!item || typeof item !== 'object') continue
+      const a = item as Record<string, unknown>
+      const label = typeof a.label === 'string' ? a.label.trim() : ''
+      if (!label) continue
+      const provider = typeof a.provider === 'string' ? (a.provider as AccountProvider) : 'claude'
+      const token = typeof a.token === 'string' ? a.token : ''
+      const model = typeof a.model === 'string' ? a.model : undefined
+      const baseUrl = typeof a.baseUrl === 'string' ? a.baseUrl : undefined
+      const plan = typeof a.plan === 'number' ? a.plan : undefined
+      const switchPct = typeof a.switchPct === 'number' ? a.switchPct : undefined
+      const existing = this.db.getAccounts().find((x) => x.label === label && (x.provider ?? 'claude') === provider)
+      if (existing) {
+        // Token kosong (file diekspor tanpa token) → JANGAN menimpa token yang sudah ada di sini.
+        this.db.updateAccount(existing.id, {
+          label,
+          token: token || undefined,
+          provider,
+          model: model ?? null,
+          baseUrl: baseUrl ?? null,
+          plan: plan ?? null
+        })
+        if (switchPct !== undefined) this.db.setAccountSwitchPct(existing.id, switchPct)
+        updated++
+      } else {
+        this.db.addAccount(randomUUID(), label, token, Date.now(), plan, switchPct, provider, model, baseUrl)
+        added++
+      }
+    }
+    this.emitAccounts()
+    return { added, updated }
   }
 
   // ---- akun (multi-account) -------------------------------------------------
@@ -1256,14 +1388,26 @@ export class SessionManager implements GroveHost {
     // menolong). Beri pesan jujur: tunggu/coba lagi.
     const prov = this.effectiveAccount(sessionId)?.provider
     if (isSkinProvider(prov)) {
+      // Kapasitas upstream itu SEMENTARA — biasanya longgar lagi dalam puluhan detik. Jadi Grove yang
+      // mencoba ulang sendiri (backoff, konteks sesi utuh) alih-alih menyuruh user mengirim pesan
+      // ulang manual. Saran "ganti model/akun" baru relevan kalau retry pun sudah menyerah.
+      const busyLabel =
+        prov === 'cursor'
+          ? 'Endpoint Cursor'
+          : prov === 'deepseek'
+            ? 'DeepSeek'
+            : prov === 'custom'
+              ? 'Endpoint proxy-mu'
+              : 'Model OpenRouter gratis'
+      if (s.retryProviderBusy(busyLabel)) return
       s.systemNote(
         prov === 'cursor'
-          ? '⚠️ Endpoint Cursor-mu membalas limit/penuh (free-tier Cursor punya batas request harian). Ini rate-limit provider, BUKAN kuota Claude. Tunggu sebentar lalu kirim lagi; kalau sering, kurangi jumlah worker atau pakai model Cursor yang limitnya lebih longgar.'
+          ? `⚠️ Endpoint Cursor-mu tetap membalas limit/penuh setelah ${MAX_TRANSIENT_RETRIES}× coba ulang otomatis (free-tier Cursor punya batas request harian). Ini rate-limit provider, BUKAN kuota Claude. Tunggu sebentar lalu kirim lagi; kalau sering, kurangi jumlah worker atau pakai model Cursor yang limitnya lebih longgar.`
           : prov === 'deepseek'
-            ? '⚠️ DeepSeek membalas limit/penuh (rate-limit atau saldo API habis). Ini batas provider DeepSeek, BUKAN kuota Claude. Tunggu sebentar lalu kirim lagi; kalau menetap, cek saldo di platform.deepseek.com atau kurangi jumlah worker paralel.'
+            ? `⚠️ DeepSeek tetap membalas limit/penuh setelah ${MAX_TRANSIENT_RETRIES}× coba ulang otomatis (rate-limit atau saldo API habis). Ini batas provider DeepSeek, BUKAN kuota Claude. Tunggu sebentar lalu kirim lagi; kalau menetap, cek saldo di platform.deepseek.com atau kurangi jumlah worker paralel.`
           : prov === 'custom'
-            ? '⚠️ Endpoint proxy-mu membalas limit/penuh (mis. Gemini free-tier 429 RESOURCE_EXHAUSTED — batas per-menit/per-hari). Ini rate-limit provider, BUKAN kuota Claude. Tunggu sebentar lalu kirim lagi; kalau sering, kurangi jumlah worker atau pakai model yang limitnya lebih longgar.'
-            : '⚠️ Model OpenRouter gratis sedang penuh di sisi provider (mis. NVIDIA "ResourceExhausted") — ini sementara, BUKAN kuota akunmu. Kirim lagi untuk coba ulang, atau klik-kanan kartu sesi → pilih model OpenRouter lain (mis. Ultra vs Super).'
+            ? `⚠️ Endpoint proxy-mu tetap membalas limit/penuh setelah ${MAX_TRANSIENT_RETRIES}× coba ulang otomatis (mis. Gemini free-tier 429 RESOURCE_EXHAUSTED — batas per-menit/per-hari). Ini rate-limit provider, BUKAN kuota Claude. Tunggu sebentar lalu kirim lagi; kalau sering, kurangi jumlah worker atau pakai model yang limitnya lebih longgar.`
+            : `⚠️ Model OpenRouter gratis masih penuh di sisi provider (mis. NVIDIA "ResourceExhausted") setelah ${MAX_TRANSIENT_RETRIES}× coba ulang otomatis — ini kapasitas provider, BUKAN kuota akunmu. Kirim lagi untuk coba ulang, atau klik-kanan kartu sesi → pilih model OpenRouter lain (mis. Ultra vs Super).`
       )
       s.markLimited()
       return

@@ -15,6 +15,7 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Board } from './db'
 import { buildGroveServer, type GroveHost } from './mcpTools'
+import { AUTO_ACTION_LABEL } from './autoRules'
 import { contextPercent, contextWindowFor } from './contextWindows'
 import { groveAppend, GROVE_REFERENCE } from './prompts'
 import { compactDecision, compactThresholds } from './wakePolicy'
@@ -171,8 +172,15 @@ function extractResultText(content: unknown): string {
 // (2s→4s→8s→16s→30s, total ~1 menit) karena gangguan provider (DeepSeek/OpenRouter penuh, 5xx,
 // koneksi drop di tengah stream) sering butuh lebih dari 4 detik untuk pulih — 3× backoff linear
 // dulu terlalu cepat menyerah dan memaksa user mengetik ulang.
-const MAX_TRANSIENT_RETRIES = 5
+export const MAX_TRANSIENT_RETRIES = 5
 const RETRY_BACKOFF_MS = [2000, 4000, 8000, 16000, 30000]
+// "Provider penuh" (OpenRouter gratis / DeepSeek sibuk / proxy kena rate-limit) beda watak dari
+// koneksi putus: kapasitas bersama baru longgar dalam hitungan puluhan detik, bukan 2 detik. Backoff
+// sendiri (5s→15s→30s→60s→60s, total ~2,8 menit) supaya percobaan ulangnya tidak sia-sia menabrak
+// antrian yang sama persis — dan tetap dibatasi MAX_TRANSIENT_RETRIES agar tak jadi loop abadi.
+const BUSY_BACKOFF_MS = [5000, 15000, 30000, 60000, 60000]
+/** Watak kegagalan yang memicu retry: koneksi putus vs kapasitas provider penuh. */
+type RetryKind = 'conn' | 'busy'
 // Ambang auto-compact (ctx%) ada di ./wakePolicy dan BEDA PER ROLE — root dipadatkan jauh lebih
 // awal (70/50 vs 88/70) karena root-lah yang paling sering dibangunkan, jadi tiap persen konteksnya
 // ditagih berkali-kali; compact root pun tak memakai giliran model. Lihat COMPACT di wakePolicy.ts.
@@ -463,6 +471,7 @@ export class Session {
   private transientPending = false // error koneksi transient (ECONNRESET/5xx) → auto-retry di akhir turn
   private staleSessionPending = false // id sesi SDK tak dikenali di folder ini → mulai sesi bersih & ulangi
   private modelRejectedPending = false // gateway menolak model ini → pindah ke model cadangan akun
+  private resendPending = false // aturan otomatis user beraksi "ulangi" → kirim ulang permintaan terakhir
   private contentFilterPending = false // penyaring konten MODEL yang menolak → ganti model, bukan cuma reset konteks
   private transientSeen = false // teks asisten menyebut error koneksi transient pada turn ini
   private transientRetries = 0 // retry transient beruntun tanpa turn sukses (guard anti-loop; reset saat sukses)
@@ -1146,7 +1155,10 @@ export class Session {
       }
       else if (isLimitError(raw)) this.limitHitPending = true // limit via exception → auto-switch (didahulukan)
       else if (isTransientError(raw) || this.transientSeen) this.transientPending = true // koneksi putus → auto-retry
-      else {
+      // Belum dikenali bawaan → beri kesempatan ke aturan kata kunci buatan user (panel Setting).
+      else if (this.applyAutoRule(raw)) {
+        /* aksinya dijalankan di blok finally di bawah */
+      } else {
         console.error(`[Session ${this.meta.id}] error:`, e)
         this.record({
           role: 'system',
@@ -1190,6 +1202,18 @@ export class Session {
         if (this.apiBlockPending && !this.stopped) {
           this.apiBlockPending = false
           this.handleApiBlock()
+        }
+        // Model ditolak lewat EXCEPTION (bukan pesan result) — mis. dari aturan user beraksi "ganti
+        // model". Jalur result menanganinya lebih dulu bila result-nya sempat datang; di sini hanya
+        // sisa kasus "query mati sebelum result".
+        if (this.modelRejectedPending && !this.stopped) {
+          this.modelRejectedPending = false
+          this.recoverRejectedModel()
+        }
+        // Aturan user beraksi "ulangi": kirim ulang PERSIS permintaan terakhir, konteks tetap utuh.
+        if (this.resendPending && !this.stopped) {
+          this.resendPending = false
+          if (this.lastUserPrompt) this.injectAutoTask(this.lastUserPrompt, { noNudge: true })
         }
       }
     }
@@ -1306,11 +1330,18 @@ export class Session {
    * Dibatasi MAX_TRANSIENT_RETRIES percobaan BERUNTUN tanpa turn sukses (counter direset saat sukses)
    * supaya tak jadi loop tak berujung saat upstream benar-benar down. Sesuai jelas dengan permintaan:
    * hanya untuk gangguan transient, BUKAN error fatal (auth/model — sudah disaring isTransientError).
+   *
+   * `kind` membedakan dua watak kegagalan:
+   *  - 'conn' — koneksi putus. Saat jatah habis, method ini sendiri yang menulis pesan menyerah.
+   *  - 'busy' — provider membalas penuh/rate-limit. Saat jatah habis method ini DIAM dan mengembalikan
+   *    false; pemanggil (onLimitHit) yang tahu providernya dan menulis saran yang tepat.
+   * Mengembalikan true bila retry benar-benar dijadwalkan.
    */
-  private scheduleTransientRetry(): void {
-    if (this.stopped) return
+  private scheduleTransientRetry(kind: RetryKind = 'conn', label = ''): boolean {
+    if (this.stopped) return false
     if (this.transientRetries >= MAX_TRANSIENT_RETRIES) {
       this.transientRetries = 0
+      if (kind === 'busy') return false // pesan akhir + markLimited jadi urusan pemanggil
       this.record({
         role: 'system',
         text: `🚫 Koneksi ke API putus ${MAX_TRANSIENT_RETRIES}× berturut selama ~1 menit (retry otomatis menyerah). Penyebab lazim: kapasitas provider sedang penuh (OpenRouter gratis / DeepSeek sibuk) atau jaringan lokal. Konteks sesi TIDAK hilang — kirim pesan apa saja untuk melanjutkan, atau klik-kanan kartu sesi → ganti model/akun.`,
@@ -1318,28 +1349,86 @@ export class Session {
       })
       this.setStatus('error')
       this.emitActivity('koneksi putus')
-      return
+      return false
     }
     this.transientRetries++
     const n = this.transientRetries
-    const delayMs = RETRY_BACKOFF_MS[Math.min(n - 1, RETRY_BACKOFF_MS.length - 1)] // 2s→4s→8s→16s→30s
+    const backoff = kind === 'busy' ? BUSY_BACKOFF_MS : RETRY_BACKOFF_MS
+    const delayMs = backoff[Math.min(n - 1, backoff.length - 1)]
+    const wait = Math.round(delayMs / 1000)
     this.record({
       role: 'system',
-      text: `🔁 Koneksi terputus (transient) — mencoba lagi otomatis (${n}/${MAX_TRANSIENT_RETRIES}) dalam ${Math.round(delayMs / 1000)}s…`,
+      text:
+        kind === 'busy'
+          ? `🔁 ${label} sedang penuh di sisi provider — dicoba ulang otomatis (${n}/${MAX_TRANSIENT_RETRIES}) dalam ${wait}s…`
+          : `🔁 Koneksi terputus (transient) — mencoba lagi otomatis (${n}/${MAX_TRANSIENT_RETRIES}) dalam ${wait}s…`,
       ts: Date.now()
     })
-    this.emitActivity('mencoba ulang koneksi…')
+    this.emitActivity(kind === 'busy' ? 'nunggu kapasitas provider…' : 'mencoba ulang koneksi…')
     if (this.retryTimer) clearTimeout(this.retryTimer)
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null
       if (this.stopped) return
       // injectAutoTask meng-start() ulang (resume) lalu mendorong lanjut dari titik terakhir.
       this.injectAutoTask(
-        '[GROVE] Koneksi ke API sempat terputus lalu tersambung lagi. LANJUTKAN pekerjaan dari titik terakhir — jangan mengulang dari awal. ' +
+        (kind === 'busy'
+          ? '[GROVE] Permintaan sebelumnya ditolak karena kapasitas provider sedang penuh; sekarang dicoba lagi. LANJUTKAN pekerjaan dari titik terakhir — jangan mengulang dari awal. '
+          : '[GROVE] Koneksi ke API sempat terputus lalu tersambung lagi. LANJUTKAN pekerjaan dari titik terakhir — jangan mengulang dari awal. ') +
           'PENTING: perintah terakhir mungkin SUDAH terlanjur jalan meski hasilnya tak sempat kembali. Sebelum menjalankan ulang apa pun yang berefek samping ' +
           '(request jaringan, tulis/hapus file, deploy), CEK dulu jejaknya (file output, log, state) dan lanjutkan dari sana — jangan menduplikasi pekerjaan.'
       )
     }, delayMs)
+    return true
+  }
+
+  /**
+   * Provider "skin" (OpenRouter gratis / DeepSeek / proxy Gemini-Cursor) membalas penuh atau
+   * rate-limit. Itu KAPASITAS UPSTREAM yang sifatnya sementara, bukan kuota akun — jadi diperlakukan
+   * seperti gangguan transient: Grove yang mencoba ulang sendiri dengan backoff, bukan menyuruh user
+   * mengetik ulang. Mengembalikan false bila jatah retry beruntun sudah habis (pemanggil yang
+   * memutuskan pesan akhirnya).
+   */
+  retryProviderBusy(label: string): boolean {
+    return this.scheduleTransientRetry('busy', label)
+  }
+
+  /**
+   * JARING KEDUA: teks error / balasan model yang TIDAK dikenali deteksi bawaan dicocokkan ke aturan
+   * kata kunci buatan user (panel Setting). Kalau cocok, flag aksinya di-set dan turn ini diperlakukan
+   * sebagai "sudah ditangani" — pemanggil tak perlu mencetak error generik.
+   *
+   * `interrupt` dipakai saat kecocokan datang dari TEKS asisten di tengah turn: turn harus dipotong
+   * dulu (pola yang sama dengan flagLimitHit/flagApiBlock) supaya aksinya dijalankan di akhir turn.
+   * Aturan sengaja diabaikan bila blokir API / limit sudah terdeteksi — penanganan bawaan itu lebih
+   * spesifik dan tak boleh ditimpa.
+   */
+  private applyAutoRule(text: string, interrupt = false): boolean {
+    if (this.apiBlockPending || this.limitHitPending || this.stopped) return false
+    const hit = this.host.matchAutoRule(text)
+    if (!hit) return false
+    this.systemNote(`⚙️ Aturan otomatis "${hit.label}" cocok → ${AUTO_ACTION_LABEL[hit.action]}.`)
+    switch (hit.action) {
+      case 'retry':
+        this.transientPending = true
+        break
+      case 'model':
+        this.modelRejectedPending = true
+        break
+      case 'account':
+        this.limitHitPending = true
+        break
+      case 'resend':
+        this.resendPending = true
+        break
+    }
+    if (interrupt) {
+      try {
+        void this.q?.interrupt?.()
+      } catch {
+        /* abaikan — turn akan berakhir sendiri */
+      }
+    }
+    return true
   }
 
   /**
@@ -1773,6 +1862,12 @@ export class Session {
             // "Connection to the API was lost (ECONNRESET)…" datang sebagai TEKS asisten dari CLI,
             // sedang result-nya cuma subtype generik → catat di sini supaya finally bisa auto-retry.
             else if (isTransientError(block.text)) this.transientSeen = true
+            // Pola BARU yang belum dikenal deteksi bawaan → aturan kata kunci buatan user. Turn
+            // dipotong (interrupt) supaya aksinya berjalan di akhir turn, bukan menunggu model selesai
+            // mengetik penjelasan error yang tak akan menolong.
+            else if (this.applyAutoRule(block.text, true)) {
+              /* aksi dijalankan di akhir turn */
+            }
           } else if (block.type === 'tool_use') {
             const input = formatToolDetail(block.name, block.input)
             const rowId = this.record({
@@ -1832,6 +1927,10 @@ export class Session {
           else if (!this.apiBlockPending && (isTransientError(errStr) || this.transientSeen)) {
             this.transientPending = true
           }
+          // Result gagal dengan pola yang tak dikenali bawaan → aturan kata kunci buatan user.
+          else if (this.applyAutoRule(errStr || String(subtype))) {
+            /* aksi dijalankan di akhir turn */
+          }
         }
         if (subtype === 'success') {
           this.limitStreak = 0 // turn sukses → rantai limit direset
@@ -1844,7 +1943,9 @@ export class Session {
           subtype !== 'success' &&
           !this.apiBlockPending &&
           !this.limitHitPending &&
-          !this.transientPending
+          !this.transientPending &&
+          !this.modelRejectedPending && // aturan user sudah menjadwalkan pindah model
+          !this.resendPending // aturan user sudah menjadwalkan kirim ulang
         ) {
           this.record({
             role: 'system',

@@ -133,6 +133,35 @@ export interface Account {
   createdAt: number
 }
 
+/**
+ * Aksi yang dijalankan Grove ketika sebuah aturan kata-kunci cocok dengan error / balasan model:
+ *  - `retry`   coba ulang otomatis dengan backoff, konteks sesi dipertahankan (paling aman)
+ *  - `model`   pindah ke model cadangan akun ini lalu ulangi permintaan terakhir
+ *  - `account` pindah akun (jalur yang sama dengan auto-switch saat kena limit)
+ *  - `resend`  kirim ulang PERSIS permintaan terakhir user (tanpa reset konteks)
+ */
+export type AutoRuleAction = 'retry' | 'model' | 'account' | 'resend'
+
+/** Satu aturan otomatis buatan user (panel Setting). Urutan daftar = prioritas, atas menang. */
+export interface AutoRule {
+  id: string
+  /** Nama bebas — dipakai di catatan chat saat aturan ini kena, jadi tulis yang bermakna. */
+  label: string
+  /** Kata kunci (cocok bila TERKANDUNG, tak peduli besar-kecil) atau pola regex bila `regex` true. */
+  pattern: string
+  regex?: boolean
+  action: AutoRuleAction
+  enabled: boolean
+}
+
+/** Hasil import config/akun — dilaporkan apa adanya ke user, bukan sekadar "berhasil". */
+export interface ImportResult {
+  file: string
+  accounts?: { added: number; updated: number }
+  rules?: number
+  settings?: number
+}
+
 /** Ringkasan token untuk satu jendela waktu. total = input mentah + cache + output (semua yang mengalir). */
 export interface UsageTokens {
   input: number // input "fresh" (non-cache) — paling mahal
@@ -329,6 +358,17 @@ export interface OpenRouterModel {
   context: number // panjang context (token)
   paramB: string // ukuran parameter mis. "120B" ('' bila tak diketahui)
   free: boolean // input & output $0
+}
+
+/**
+ * Hasil ambil daftar model dari endpoint yang diketik user di form tambah akun.
+ * `error` diisi HANYA saat gagal — sudah diringkas & sudah dibersihkan dari token, jadi aman
+ * ditampilkan apa adanya ke user. Daftar kosong tanpa alasan membuat user menebak-nebak, makanya
+ * balikannya bukan sekadar string[].
+ */
+export interface FetchModelsResult {
+  models: string[]
+  error?: string
 }
 
 /** Saran model OpenRouter gratis untuk dropdown (id persis dari openrouter.ai/api/v1/models). */
@@ -643,7 +683,7 @@ export interface GroveApi {
   /** Model yang bisa dipakai akun gateway: gabungan daftar milik akun + hasil GET <base>/models. */
   listGatewayModels: (accountId: string) => Promise<string[]>
   /** Fetch daftar model langsung dari endpoint OpenAI-compatible (tanpa akun tersimpan). Untuk form tambah akun. */
-  fetchModelsFromUrl: (token: string, baseUrl: string) => Promise<string[]>
+  fetchModelsFromUrl: (token: string, baseUrl: string) => Promise<FetchModelsResult>
   /** Daftar model OpenRouter (mendukung tools) untuk dropdown; freeOnly default true. */
   listOpenRouterModels: (freeOnly?: boolean) => Promise<OpenRouterModel[]>
   /** Riwayat pemakaian token tercatat di PC ini (jam/hari/minggu + tren) untuk cek boros/normal. */
@@ -659,6 +699,18 @@ export interface GroveApi {
   refreshUsage: () => Promise<UsageSnapshot>
   /** Beri tahu main sesi mana yang sedang dipilih; balikan = snapshot cache akun itu (tanpa nunggu fetch). */
   setUsageSession: (sessionId: string | null) => Promise<UsageSnapshot>
+  /** Aturan kata-kunci otomatis (panel Setting). Urutan array = prioritas. */
+  getAutoRules: () => Promise<AutoRule[]>
+  /** Simpan aturan; balikan = daftar yang BENAR-BENAR tersimpan setelah dibersihkan. */
+  setAutoRules: (rules: AutoRule[]) => Promise<AutoRule[]>
+  /** Tulis seluruh setelan + aturan ke file JSON pilihan user. null = dialog dibatalkan. */
+  exportConfig: () => Promise<string | null>
+  /** Muat setelan + aturan dari file JSON. null = dialog dibatalkan. */
+  importConfig: () => Promise<ImportResult | null>
+  /** Tulis daftar akun ke file JSON pilihan user. `withTokens` = ikutkan token (file jadi RAHASIA). */
+  exportAccounts: (withTokens: boolean) => Promise<string | null>
+  /** Muat akun dari file JSON (digabung: label+provider sama = diperbarui, sisanya ditambah). */
+  importAccounts: () => Promise<ImportResult | null>
   onEvent: (cb: (ev: GroveEvent) => void) => () => void
 }
 

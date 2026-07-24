@@ -1,6 +1,6 @@
 // Preload: jembatan aman renderer ↔ main (contextIsolation ON).
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
-import type { GroveApi, GroveEvent, ImageAttachment } from '../shared/types'
+import type { AutoRule, GroveApi, GroveEvent, ImageAttachment } from '../shared/types'
 
 const api: GroveApi = {
   // Electron 32+: File.path dihapus; pakai webUtils.getPathForFile.
@@ -65,6 +65,12 @@ const api: GroveApi = {
   deleteSession: (id: string) => ipcRenderer.invoke('grove:deleteSession', { id }),
   getSnapshot: () => ipcRenderer.invoke('grove:getSnapshot'),
   getChat: (id: string) => ipcRenderer.invoke('grove:getChat', { id }),
+  getAutoRules: () => ipcRenderer.invoke('grove:getAutoRules'),
+  setAutoRules: (rules: AutoRule[]) => ipcRenderer.invoke('grove:setAutoRules', { rules }),
+  exportConfig: () => ipcRenderer.invoke('grove:exportConfig'),
+  importConfig: () => ipcRenderer.invoke('grove:importConfig'),
+  exportAccounts: (withTokens: boolean) => ipcRenderer.invoke('grove:exportAccounts', { withTokens }),
+  importAccounts: () => ipcRenderer.invoke('grove:importAccounts'),
   refreshUsage: () => ipcRenderer.invoke('grove:refreshUsage'),
   setUsageSession: (sessionId: string | null) => ipcRenderer.invoke('grove:setUsageSession', { sessionId }),
   onEvent: (cb: (ev: GroveEvent) => void) => {

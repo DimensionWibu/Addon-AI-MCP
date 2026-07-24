@@ -429,6 +429,12 @@ export class Board {
     const r = this.all(`SELECT value FROM settings WHERE key=?`, [key])[0]
     return r ? String(r.value) : null
   }
+  /** SEMUA setelan (untuk export config). Token akun TIDAK ada di sini — itu tabel terpisah. */
+  getAllSettings(): Record<string, string> {
+    const out: Record<string, string> = {}
+    for (const r of this.all(`SELECT key, value FROM settings`)) out[String(r.key)] = String(r.value)
+    return out
+  }
   setSetting(key: string, value: string): void {
     this.run(`INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, [
       key, value

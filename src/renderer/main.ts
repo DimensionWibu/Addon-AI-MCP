@@ -1,5 +1,7 @@
 import type {
   Account,
+  AutoRule,
+  AutoRuleAction,
   BoardEntry,
   ChatMessage,
   CreditInfo,
@@ -2903,7 +2905,14 @@ function renderAccountsPanel(): void {
   fetchModelBtn.addEventListener('click', async () => {
     const p = prov.value
     const t = token.value.trim()
-    const bUrl = baseUrl.value.trim()
+    // dzax boleh dibiarkan kosong: pakai default gateway, PERSIS seperti saat akun disimpan.
+    const bUrl = baseUrl.value.trim() || (p === 'dzax' ? DZAX_BASE_URL_DEFAULT : '')
+    // Syarat dicek SEBELUM tombol masuk keadaan memuat — kalau tidak, label '⏳' tertinggal.
+    if (p !== 'openrouter') {
+      if (!t) return alert('Isi token/API key dulu.')
+      if (!bUrl) return alert('Isi base URL dulu.')
+    }
+    let ok = false
     fetchModelBtn.textContent = '⏳ Mengambil…'
     fetchModelBtn.disabled = true
     try {
@@ -2912,15 +2921,12 @@ function renderAccountsPanel(): void {
         // OpenRouter: pakai endpoint khusus (sudah ada, filter model yg support tools)
         const list = await window.grove.listOpenRouterModels(false)
         ids = list.map((m) => m.id)
+        if (!ids.length) return alert('Daftar model OpenRouter tak terbaca — periksa koneksi internet, lalu coba lagi.')
       } else {
-        // dzax/custom/cursor: fetch dari {baseUrl}/models
-        if (!t) { alert('Isi token/API key dulu.'); return }
-        if (!bUrl) { alert('Isi base URL dulu.'); return }
-        ids = await window.grove.fetchModelsFromUrl(t, bUrl)
-      }
-      if (!ids.length) {
-        alert('Tidak ada model ditemukan. Periksa token & base URL.')
-        return
+        // dzax/custom/cursor: fetch dari {baseUrl}/models. Gagal → tampilkan ALASANNYA, jangan diam.
+        const r = await window.grove.fetchModelsFromUrl(t, bUrl)
+        ids = r.models
+        if (!ids.length) return alert(`Gagal ambil model dari ${bUrl}\n\n${r.error ?? 'Endpoint tak mengembalikan model apa pun.'}`)
       }
       // Isi datalist dengan hasil fetch
       datalist.textContent = ''
@@ -2932,11 +2938,12 @@ function renderAccountsPanel(): void {
       // Set value ke model pertama bila field masih kosong
       if (!orModel.value) orModel.value = ids[0]
       fetchModelBtn.textContent = `✓ ${ids.length} model`
+      ok = true
     } catch (e) {
       alert(`Gagal fetch model: ${String(e)}`)
-      fetchModelBtn.textContent = '🔍 Ambil daftar model'
     } finally {
       fetchModelBtn.disabled = false
+      if (!ok) fetchModelBtn.textContent = '🔍 Ambil daftar model' // gagal/batal → jangan tertinggal '⏳'
     }
   })
   // Isi awal: saran statis (langsung ada). Lalu ganti dgn daftar LIVE (gratis + dukung tools) begitu
@@ -3115,6 +3122,250 @@ function renderAccountsPanel(): void {
       panel.append(el('div', { class: 'ap-hint' }, 'Sub-sesi pohon ini otomatis ikut akun sesi utama, kecuali diatur sendiri.'))
     }
   }
+
+  // ---- cadangan akun (export / import) --------------------------------------
+  // File ditulis & dibaca di MAIN-process; renderer cuma memicu dialognya, jadi token tak pernah
+  // mampir ke sini. Dua tombol export terpisah (bukan satu dialog ya/tidak) supaya user tak pernah
+  // salah pencet dan diam-diam menulis token ke file.
+  panel.append(el('div', { class: 'ap-head' }, 'Cadangan akun'))
+  const accNote = el('div', { class: 'ap-hint' }, '')
+  const setAccNote = (t: string): void => {
+    accNote.textContent = t
+  }
+  const doExportAcc = (withTokens: boolean): void => {
+    void window.grove
+      .exportAccounts(withTokens)
+      .then((p) => setAccNote(p ? `Tersimpan: ${p}` : 'Dibatalkan.'))
+      .catch((e) => setAccNote(`Gagal export: ${String(e)}`))
+  }
+
+  const expTok = el('button', { class: 'ap-fetch-models' }, '⭳ Export akun + TOKEN (file rahasia)')
+  expTok.addEventListener('click', () => {
+    void uiConfirm(
+      'File hasil export akan memuat TOKEN semua akun sebagai teks biasa. Siapa pun yang memegang file itu bisa memakai akunmu — simpan di tempat aman, jangan dikirim lewat chat/cloud terbuka. Lanjutkan?',
+      'Ya, ikutkan token'
+    ).then((ok) => {
+      if (ok) doExportAcc(true)
+    })
+  })
+  const expPlain = el('button', { class: 'ap-fetch-models' }, '⭳ Export akun TANPA token (aman dibagi)')
+  expPlain.addEventListener('click', () => doExportAcc(false))
+
+  const impAcc = el('button', { class: 'ap-fetch-models' }, '⭱ Import akun dari file JSON')
+  impAcc.addEventListener('click', () => {
+    void uiConfirm(
+      'Akun dengan label + provider yang SAMA akan diperbarui, selebihnya ditambah. Akun yang sudah ada di sini tidak akan dihapus. Lanjutkan?',
+      'Ya, import'
+    ).then((ok) => {
+      if (!ok) return
+      void window.grove
+        .importAccounts()
+        .then((res) => {
+          if (!res) return setAccNote('Dibatalkan.')
+          const a = res.accounts ?? { added: 0, updated: 0 }
+          // Panel digambar ulang (daftar akun berubah) → catatannya ikut hilang, jadi hasilnya
+          // dilaporkan ke chat supaya tetap terbaca.
+          appendChatMessage({
+            role: 'system',
+            text: `⭱ Import akun: ${a.added} ditambah, ${a.updated} diperbarui (dari ${res.file}).`,
+            ts: Date.now()
+          })
+          renderAccountsPanel()
+        })
+        .catch((e) => setAccNote(`Gagal import: ${String(e)}`))
+    })
+  })
+  panel.append(expTok, expPlain, impAcc, accNote)
+}
+
+// ---- Panel Setting: aturan otomatis + export/import config ------------------
+// Aturan = "kalau balasan/error memuat kata kunci X, lakukan Y". Gunanya: pola kegagalan provider
+// berubah terus (OpenRouter/proxy memunculkan kalimat error baru), dan user tak perlu menunggu
+// build baru untuk menanganinya.
+
+/** Salinan kerja aturan di panel — baru masuk DB saat tombol Simpan ditekan. */
+let draftRules: AutoRule[] = []
+
+const RULE_ACTIONS: Array<{ value: AutoRuleAction; text: string }> = [
+  { value: 'retry', text: 'Coba ulang otomatis (backoff)' },
+  { value: 'model', text: 'Ganti ke model cadangan' },
+  { value: 'account', text: 'Ganti akun' },
+  { value: 'resend', text: 'Ulangi permintaan terakhir' }
+]
+
+/** Buka panel Setting: ambil aturan TERBARU dari main (bukan cache lama) lalu gambar. */
+async function renderSettingsPanel(): Promise<void> {
+  draftRules = await window.grove.getAutoRules().catch(() => [])
+  drawSettingsPanel()
+}
+
+function drawSettingsPanel(note = ''): void {
+  const panel = $('settings-panel')
+  panel.textContent = ''
+  panel.append(el('div', { class: 'ap-title' }, 'SETTING'))
+
+  panel.append(el('div', { class: 'ap-head' }, 'Aturan otomatis (kata kunci → aksi)'))
+  panel.append(
+    el(
+      'div',
+      { class: 'ap-hint' },
+      'Kalau teks error / balasan model memuat kata kunci ini, Grove menjalankan aksinya sendiri — kamu tak perlu kirim ulang manual. Dicek SESUDAH deteksi bawaan; urutan atas = prioritas.'
+    )
+  )
+
+  const list = el('div', { class: 'sr-list' })
+  if (!draftRules.length) list.append(el('div', { class: 'ap-empty' }, 'Belum ada aturan.'))
+  draftRules.forEach((rule, i) => list.append(ruleRow(rule, i)))
+  panel.append(list)
+
+  const add = el('button', { class: 'ap-fetch-models' }, '+ Tambah aturan')
+  add.addEventListener('click', () => {
+    draftRules.push({
+      id: `rule-${Date.now()}-${draftRules.length}`,
+      label: '',
+      pattern: '',
+      regex: false,
+      action: 'retry',
+      enabled: true
+    })
+    drawSettingsPanel()
+  })
+  panel.append(add)
+
+  const save = el('button', { class: 'ap-add' }, '💾 Simpan aturan')
+  save.addEventListener('click', () => {
+    void window.grove
+      .setAutoRules(draftRules)
+      .then((saved) => {
+        // Balikan = daftar yang BENAR-BENAR tersimpan (baris tanpa kata kunci dibuang di main) →
+        // pakai itu, jangan biarkan panel memajang aturan yang sebenarnya tak aktif.
+        const dropped = draftRules.length - saved.length
+        draftRules = saved
+        drawSettingsPanel(
+          `Tersimpan: ${saved.length} aturan${dropped > 0 ? ` (${dropped} baris tanpa kata kunci dibuang)` : ''}.`
+        )
+      })
+      .catch((e) => drawSettingsPanel(`Gagal menyimpan: ${String(e)}`))
+  })
+  panel.append(save)
+
+  panel.append(el('div', { class: 'ap-head' }, 'Config (setelan + aturan)'))
+  const exp = el('button', { class: 'ap-fetch-models' }, '⭳ Export config ke file JSON')
+  exp.addEventListener('click', () => {
+    void window.grove
+      .exportConfig()
+      .then((p) => drawSettingsPanel(p ? `Config tersimpan: ${p}` : 'Dibatalkan.'))
+      .catch((e) => drawSettingsPanel(`Gagal export: ${String(e)}`))
+  })
+  const imp = el('button', { class: 'ap-fetch-models' }, '⭱ Import config dari file JSON')
+  imp.addEventListener('click', () => {
+    void uiConfirm(
+      'Setelan di file akan MENIMPA setelan yang sekarang (termasuk daftar aturan otomatis). Akun tidak ikut tersentuh. Lanjutkan?',
+      'Ya, import'
+    ).then((ok) => {
+      if (!ok) return
+      void window.grove
+        .importConfig()
+        .then(async (res) => {
+          if (!res) return drawSettingsPanel('Dibatalkan.')
+          draftRules = await window.grove.getAutoRules().catch(() => draftRules)
+          drawSettingsPanel(`${res.settings ?? 0} setelan & ${res.rules ?? 0} aturan dimuat dari ${res.file}.`)
+        })
+        .catch((e) => drawSettingsPanel(`Gagal import: ${String(e)}`))
+    })
+  })
+  panel.append(exp, imp)
+  panel.append(
+    el('div', { class: 'ap-hint' }, 'Akun TIDAK ikut di file config — ada tombol export/import sendiri di ⚙ Akun.')
+  )
+  if (note) panel.append(el('div', { class: 'ap-sub' }, note))
+}
+
+/** Satu baris aturan. Edit langsung mengubah draft; tombol Simpan yang menulisnya ke DB. */
+function ruleRow(rule: AutoRule, i: number): HTMLElement {
+  const on = document.createElement('input')
+  on.type = 'checkbox'
+  on.checked = rule.enabled
+  on.title = 'Aktif / nonaktif'
+  on.addEventListener('change', () => {
+    rule.enabled = on.checked
+  })
+
+  const label = document.createElement('input')
+  label.className = 'ap-input sr-lbl'
+  label.placeholder = 'Nama aturan (mis. OpenRouter penuh)'
+  label.value = rule.label
+  label.addEventListener('input', () => {
+    rule.label = label.value
+  })
+
+  const pat = document.createElement('input')
+  pat.className = 'ap-input sr-pat'
+  pat.placeholder = 'kata kunci yang dicari (mis. ResourceExhausted)'
+  pat.value = rule.pattern
+  pat.addEventListener('input', () => {
+    rule.pattern = pat.value
+  })
+
+  const rx = document.createElement('input')
+  rx.type = 'checkbox'
+  rx.checked = !!rule.regex
+  rx.title = 'Perlakukan kata kunci sebagai regex (kosong = cocok bila sekadar TERKANDUNG)'
+  rx.addEventListener('change', () => {
+    rule.regex = rx.checked
+  })
+
+  const act = document.createElement('select')
+  act.className = 'tools-sel sr-act'
+  for (const o of RULE_ACTIONS) {
+    const opt = document.createElement('option')
+    opt.value = o.value
+    opt.textContent = o.text
+    act.append(opt)
+  }
+  act.value = rule.action
+  act.addEventListener('change', () => {
+    rule.action = act.value as AutoRuleAction
+  })
+
+  const up = el('button', { class: 'sr-mini', title: 'Naikkan prioritas' }, '▲')
+  up.addEventListener('click', () => {
+    if (i === 0) return
+    ;[draftRules[i - 1], draftRules[i]] = [draftRules[i], draftRules[i - 1]]
+    drawSettingsPanel()
+  })
+  const down = el('button', { class: 'sr-mini', title: 'Turunkan prioritas' }, '▼')
+  down.addEventListener('click', () => {
+    if (i >= draftRules.length - 1) return
+    ;[draftRules[i + 1], draftRules[i]] = [draftRules[i], draftRules[i + 1]]
+    drawSettingsPanel()
+  })
+  const del = el('button', { class: 'ap-del', title: 'Hapus aturan' }, '×')
+  del.addEventListener('click', () => {
+    draftRules.splice(i, 1)
+    drawSettingsPanel()
+  })
+
+  return el(
+    'div',
+    { class: 'sr-row' },
+    el('label', { class: 'sr-on', title: 'Aktif' }, on),
+    el(
+      'div',
+      { class: 'sr-fields' },
+      label,
+      pat,
+      el(
+        'div',
+        { class: 'ap-row' },
+        act,
+        el('label', { class: 'sr-rx', title: 'Regex' }, rx, el('span', {}, 'regex')),
+        up,
+        down,
+        del
+      )
+    )
+  )
 }
 
 // ---- Panel Tools: diff checker + formatter (MURNI renderer / client-side) ----
@@ -3753,6 +4004,7 @@ async function init(): Promise<void> {
     $('usage-panel').classList.remove('show')
     $('acct-panel').classList.remove('show')
     $('tools-panel').classList.remove('show')
+    $('settings-panel').classList.remove('show')
     closeSessionMenu()
   })
   document.addEventListener('keydown', (e) => {
@@ -3798,6 +4050,16 @@ async function init(): Promise<void> {
     if (p.classList.toggle('show')) renderToolsPanel()
   })
   $('tools-panel').addEventListener('click', (e) => e.stopPropagation()) // klik di dalam panel jangan menutup
+
+  $('btn-settings').addEventListener('click', (e) => {
+    e.stopPropagation()
+    $('acct-panel').classList.remove('show') // panel top-bar saling eksklusif
+    $('tools-panel').classList.remove('show')
+    $('usage-panel').classList.remove('show')
+    const p = $('settings-panel')
+    if (p.classList.toggle('show')) void renderSettingsPanel()
+  })
+  $('settings-panel').addEventListener('click', (e) => e.stopPropagation()) // klik di dalam panel jangan menutup
 
   // Drag-reorder sidebar (dengar global agar terus terlacak walau kursor keluar node).
   document.addEventListener('pointermove', onDragMove)

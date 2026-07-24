@@ -4,7 +4,7 @@
 
 import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
-import type { BoardEntry, EffortSetting, InboxMessage, TodoItem } from '../../shared/types'
+import type { AutoRuleAction, BoardEntry, EffortSetting, InboxMessage, TodoItem } from '../../shared/types'
 
 /** Kontrak yang harus disediakan SessionManager ke tools (hindari circular import). */
 export interface GroveHost {
@@ -77,6 +77,12 @@ export interface GroveHost {
   nextModelCandidate(sessionId: string): string | null
   /** Dipanggil Session saat turn gagal karena limit — untuk auto-switch akun bila aktif. */
   onLimitHit(sessionId: string): void
+  /**
+   * Cocokkan teks (error / balasan model) ke ATURAN OTOMATIS buatan user di panel Setting.
+   * null = tak ada yang cocok. Dipakai Session sebagai jaring KEDUA, setelah deteksi bawaan —
+   * supaya pola kegagalan provider yang baru bisa ditangani tanpa menunggu build baru.
+   */
+  matchAutoRule(text: string): { label: string; action: AutoRuleAction } | null
   /** Dipanggil Session saat ctx% ≥ ambang → auto-compact (padatkan konteks, cegah freeze). */
   notifyHighContext(sessionId: string): void
   /**
