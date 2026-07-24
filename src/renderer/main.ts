@@ -2852,7 +2852,7 @@ function renderAccountsPanel(): void {
   for (const [v, t] of [
     ['claude', 'Claude (langganan)'],
     ['deepseek', 'DeepSeek (token saja)'],
-    ['dzax', 'Gateway OpenAI-compatible (raw / DZAX)'],
+    ['dzax', 'Raw API OpenAI-compatible (DZAX, gateway, dsb)'],
     ['openrouter', 'OpenRouter (key + model)'],
     ['custom', 'Gemini / Proxy (base-URL)'],
     ['cursor', 'Cursor (token free + proxy)']
@@ -2893,6 +2893,52 @@ function renderAccountsPanel(): void {
   orModel.placeholder = 'Model OpenRouter, mis. nvidia/nemotron-3-super-120b-a12b:free'
   const datalist = document.createElement('datalist')
   datalist.id = 'or-model-list'
+
+  // Tombol fetch model dari API endpoint (untuk dzax/custom/cursor saat token+baseUrl sudah diisi).
+  const fetchModelBtn = document.createElement('button')
+  fetchModelBtn.type = 'button'
+  fetchModelBtn.className = 'ap-fetch-models'
+  fetchModelBtn.textContent = '🔍 Ambil daftar model'
+  fetchModelBtn.title = 'Fetch model yang tersedia dari API endpoint menggunakan token di atas'
+  fetchModelBtn.addEventListener('click', async () => {
+    const p = prov.value
+    const t = token.value.trim()
+    const bUrl = baseUrl.value.trim()
+    fetchModelBtn.textContent = '⏳ Mengambil…'
+    fetchModelBtn.disabled = true
+    try {
+      let ids: string[] = []
+      if (p === 'openrouter') {
+        // OpenRouter: pakai endpoint khusus (sudah ada, filter model yg support tools)
+        const list = await window.grove.listOpenRouterModels(false)
+        ids = list.map((m) => m.id)
+      } else {
+        // dzax/custom/cursor: fetch dari {baseUrl}/models
+        if (!t) { alert('Isi token/API key dulu.'); return }
+        if (!bUrl) { alert('Isi base URL dulu.'); return }
+        ids = await window.grove.fetchModelsFromUrl(t, bUrl)
+      }
+      if (!ids.length) {
+        alert('Tidak ada model ditemukan. Periksa token & base URL.')
+        return
+      }
+      // Isi datalist dengan hasil fetch
+      datalist.textContent = ''
+      for (const id of ids) {
+        const o = document.createElement('option')
+        o.value = id
+        datalist.append(o)
+      }
+      // Set value ke model pertama bila field masih kosong
+      if (!orModel.value) orModel.value = ids[0]
+      fetchModelBtn.textContent = `✓ ${ids.length} model`
+    } catch (e) {
+      alert(`Gagal fetch model: ${String(e)}`)
+      fetchModelBtn.textContent = '🔍 Ambil daftar model'
+    } finally {
+      fetchModelBtn.disabled = false
+    }
+  })
   // Isi awal: saran statis (langsung ada). Lalu ganti dgn daftar LIVE (gratis + dukung tools) begitu
   // fetch selesai — id + ukuran param (B) + limit context, seperti diminta.
   const fillDatalist = (items: ReadonlyArray<{ value: string; text: string }>): void => {
@@ -2957,6 +3003,9 @@ function renderAccountsPanel(): void {
     // DeepSeek punya daftar model TERTUTUP → dropdown sendiri; provider skin lain tetap ketik-bebas.
     dsModel.style.display = p === 'deepseek' ? 'block' : 'none'
     orModel.style.display = skin && p !== 'deepseek' ? 'block' : 'none'
+    // Tombol fetch model: tampil untuk semua skin kecuali deepseek (model-nya sudah dropdown tertutup)
+    fetchModelBtn.style.display = skin && p !== 'deepseek' ? 'block' : 'none'
+    fetchModelBtn.textContent = '🔍 Ambil daftar model'
     orModel.placeholder =
       p === 'dzax'
         ? 'Model (boleh BEBERAPA dipisah koma = cadangan otomatis), mis. claude-sonnet-5, glm-5.2, kimi-k3'
@@ -3003,10 +3052,10 @@ function renderAccountsPanel(): void {
     const m = provider === 'deepseek' ? dsModel.value || DEEPSEEK_MODEL_DEFAULT : skin ? orModel.value.trim() : undefined
     const url = ownUrl ? baseUrl.value.trim() || (provider === 'dzax' ? DZAX_BASE_URL_DEFAULT : '') : undefined
     if (!l || !t) return alert('Isi label & token/key dulu.')
-    if (provider === 'openrouter' && !m) return alert('Isi id model OpenRouter (mis. nvidia/nemotron-3-super-120b-a12b:free).')
+    if (provider === 'openrouter' && !m) return alert('Pilih atau ketik id model OpenRouter — klik "Ambil daftar model" untuk melihat pilihan.')
     if (provider === 'cursor' && !m) return alert('Isi nama model Cursor yang dikenal proxy (mis. claude-3.5-sonnet).')
     if (provider === 'custom' && !m) return alert('Isi nama model yang dikenal proxy (mis. gemini-2.5-flash).')
-    if (provider === 'dzax' && !m) return alert('Isi model DZAX sesuai family key-mu (mis. gl/glm-5.2 atau kr/claude-sonnet-5).')
+    if (provider === 'dzax' && !m) return alert('Isi model sesuai key-mu — klik "Ambil daftar model" untuk melihat yang tersedia.')
     if (proxy && !url) return alert('Isi base URL proxy (mis. http://localhost:3000).')
     void window.grove
       .addAccount(l, t, p, undefined, provider, m, url)
@@ -3019,7 +3068,7 @@ function renderAccountsPanel(): void {
       })
       .catch((e) => alert(`Gagal tambah: ${String(e)}`))
   })
-  panel.append(prov, label, token, baseUrl, dsModel, orModel, datalist, hint, plan, add)
+  panel.append(prov, label, token, baseUrl, dsModel, orModel, fetchModelBtn, datalist, hint, plan, add)
   applyProvider() // set tampilan awal sesuai provider default (claude)
 
   const node = activeId ? nodes.get(activeId) : null

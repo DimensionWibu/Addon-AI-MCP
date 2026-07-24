@@ -194,6 +194,20 @@ export function registerIpc(manager: SessionManager): void {
     return [...new Set([...own, ...live])]
   })
 
+  // Fetch daftar model dari endpoint OpenAI-compatible apa pun, dengan token yang diberikan langsung.
+  // Dipakai form tambah akun SEBELUM akun disimpan (belum ada accountId).
+  ipcMain.handle('grove:fetchModelsFromUrl', async (_e, { token, baseUrl }: { token: string; baseUrl: string }) => {
+    try {
+      const base = baseUrl.replace(/\/+$/, '')
+      const res = await fetch(`${base}/models`, { headers: { Authorization: `Bearer ${token}` } })
+      if (!res.ok) return []
+      const j = (await res.json()) as { data?: Array<{ id?: string }> }
+      return (j.data ?? []).map((m) => String(m.id ?? '')).filter(Boolean)
+    } catch {
+      return []
+    }
+  })
+
   // Daftar model OpenRouter (live). Gagal jaringan → balikan [] supaya renderer fallback ke saran statis.
   ipcMain.handle('grove:listOpenRouterModels', async (_e, { freeOnly }: { freeOnly?: boolean }) => {
     try {

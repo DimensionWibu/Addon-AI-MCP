@@ -1636,6 +1636,13 @@ export class SessionManager implements GroveHost {
     if (!s) return
     if (s.meta.role === 'root') {
       this.compactSession(sessionId) // ringkasan dari seluruh board pohon
+      // Auto-compact → lanjutkan otomatis HANYA bila antrian kosong; kalau ada pesan user menunggu,
+      // flushQueued() (dipanggil setelah notifyHighContext di Session) yang akan melanjutkan.
+      if (s.listQueued().length === 0) {
+        s.injectAutoTask(
+          'Konteks baru saja dipadatkan otomatis (compact). BACA file handover di working directory, lalu LANJUTKAN pekerjaan dari titik terakhir — jangan mengulang dari awal.'
+        )
+      }
       return
     }
     // Sub: ringkasan dari board sub sendiri.
@@ -1649,6 +1656,13 @@ export class SessionManager implements GroveHost {
     const mem = this.db.addMemory(s.meta.treeId, sessionId, summary, Date.now())
     this.emit({ channel: 'memory:new', payload: mem })
     s.compactWith(summary)
+    // Auto-compact terjadi di tengah kerja → lanjutkan otomatis setelah konteks dipadatkan.
+    // (flushQueued() di Session sudah mengirim pesan user yang antri; ini untuk sesi yang antriannya kosong.)
+    if (s.listQueued().length === 0) {
+      s.injectAutoTask(
+        'Konteks baru saja dipadatkan otomatis (compact). BACA file handover di working directory, lalu LANJUTKAN pekerjaan dari titik terakhir — jangan mengulang dari awal.'
+      )
+    }
   }
 
   /**

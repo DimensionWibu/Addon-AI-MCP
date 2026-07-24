@@ -28,7 +28,7 @@ if /i "%GROVE_MODE%"=="dev" (
   echo [Grove] Mode STABIL — edit file sumber tidak akan mengganggu jendela yang terbuka.
 )
 
-:loop
+loop:
 echo [Grove] Menjalankan...
 call npm run %GROVE_SCRIPT%
 echo.

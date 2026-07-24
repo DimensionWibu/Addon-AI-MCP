@@ -642,6 +642,8 @@ export interface GroveApi {
   setLite: (id: string, lite: boolean) => Promise<void>
   /** Model yang bisa dipakai akun gateway: gabungan daftar milik akun + hasil GET <base>/models. */
   listGatewayModels: (accountId: string) => Promise<string[]>
+  /** Fetch daftar model langsung dari endpoint OpenAI-compatible (tanpa akun tersimpan). Untuk form tambah akun. */
+  fetchModelsFromUrl: (token: string, baseUrl: string) => Promise<string[]>
   /** Daftar model OpenRouter (mendukung tools) untuk dropdown; freeOnly default true. */
   listOpenRouterModels: (freeOnly?: boolean) => Promise<OpenRouterModel[]>
   /** Riwayat pemakaian token tercatat di PC ini (jam/hari/minggu + tren) untuk cek boros/normal. */

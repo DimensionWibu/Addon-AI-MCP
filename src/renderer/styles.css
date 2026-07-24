@@ -81,6 +81,9 @@ button, input { font-family: var(--mono); }
 .ap-token { resize: vertical; word-break: break-all; }
 .ap-add { width: 100%; background: var(--accent); color: #1a0e08; border: none; border-radius: 3px; padding: 6px; font-size: 12px; font-weight: 700; cursor: pointer; }
 .ap-add:hover { background: var(--accent-2); }
+.ap-fetch-models { width: 100%; background: transparent; color: var(--text-dim); border: 1px solid var(--border); border-radius: 3px; padding: 4px 7px; font-size: 11px; cursor: pointer; margin-bottom: 6px; text-align: left; }
+.ap-fetch-models:hover { border-color: var(--accent); color: var(--accent); }
+.ap-fetch-models:disabled { opacity: .5; cursor: wait; }
 .ap-row { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text); }
 .ap-row select { flex: 1; }
 /* Baris ambang per-akun + penanda jujur saat usage akun itu tak terbaca (403 tanpa scope user:profile). */
